@@ -1,0 +1,92 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 1dce730..644771f 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <mach/mach_time.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -48,6 +49,16 @@ taimen_wdt_thread(void *arg)
+ 	int reboot_s = 0;
+ 	PE_parse_boot_argn("taimenreboot", &reboot_s, sizeof(reboot_s));
+ 	IOLog("TAIMEN WDT: pet thread running\n");
++	{
++		extern void taimen_gic_dump(const char *tag);
++		for (int i = 0; i < 3; i++) {
++			uint64_t t0 = mach_absolute_time();
++			while (mach_absolute_time() - t0 < 19200000ULL * 3 / 2) {	/* 1.5 s busy wait, no timer needed */
++				wdt[TAIMEN_WDT_RST / 4] = 1;
++			}
++			taimen_gic_dump(i == 0 ? "pet thread +1.5s" : i == 1 ? "pet thread +3s" : "pet thread +4.5s");
++		}
++	}
+ 	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += TAIMEN_WDT_PET_S) {
+ 		wdt[TAIMEN_WDT_RST / 4] = 1;
+ 		IOLog("TAIMEN WDT: pet at %d s\n", t);
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index a6ad5f0..f300903 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -56,6 +56,32 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/* Bring-up diagnostics: GIC redistributor + CPU interface + timer state, from anywhere after pe_init_fiq. */
++static vm_offset_t taimen_gicr_pe_base;
++void
++taimen_gic_dump(const char *tag)
++{
++	vm_offset_t gicr_pe_base = taimen_gicr_pe_base;
++	if (!gicr_pe_base) {
++		printf("TAIMEN GIC [%s]: no redistributor yet\n", tag);
++		return;
++	}
++	uint64_t typer = gicr_read64(GICR_TYPER);
++	printf("TAIMEN GIC [%s]: frame %lu TYPER 0x%llx WAKER 0x%x ISENABLER0 0x%x ISPENDR0 0x%x ISACTIVER0 0x%x IPRIO[16-19] 0x%x ICFGR1 0x%x\n",
++	    tag, (unsigned long)((gicr_pe_base - gicr_base) / GICR_STRIDE), typer, gicr_read32(GICR_WAKER),
++	    gicr_read32(GICR_ISENABLER0), gicr_read32(0x10200), gicr_read32(0x10300), gicr_read32(GICR_IPRIORITYR0 + 0x10),
++	    gicr_read32(0x10c04));
++	printf("TAIMEN GIC [%s]: GICD_CTLR 0x%x ICC_IGRPEN1 0x%llx PMR 0x%llx RPR 0x%llx HPPIR1 0x%llx HPPIR0 0x%llx DAIF 0x%llx\n",
++	    tag, gicd_read32(GICD_CTLR), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"),
++	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"), __builtin_arm_rsr64("ICC_HPPIR0_EL1"),
++	    __builtin_arm_rsr64("DAIF"));
++	printf("TAIMEN GIC [%s]: CNTV_CTL 0x%llx CNTV_CVAL 0x%llx CNTVCT 0x%llx CNTP_CTL 0x%llx CNTKCTL 0x%llx\n",
++	    tag, __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"), __builtin_arm_rsr64("CNTVCT_EL0"),
++	    __builtin_arm_rsr64("CNTP_CTL_EL0"), __builtin_arm_rsr64("CNTKCTL_EL1"));
++}
++#endif
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
+@@ -66,8 +92,15 @@ find_gicr_pe_base()
+ 		vm_offset_t gicr_pe_base = gicr_base + offset;
+ 		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
+ 		uint32_t aff_value = (uint32_t) (gicr_typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		printf("TAIMEN GIC: frame %lu TYPER 0x%llx (aff 0x%x) WAKER 0x%x, want aff 0x%x\n",
++		    (unsigned long)(offset / GICR_STRIDE), gicr_typer, aff_value, gicr_read32(GICR_WAKER), phys_id);
++#endif
+ 
+ 		if (phys_id == aff_value) {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++			taimen_gicr_pe_base = gicr_pe_base;
++#endif
+ 			return gicr_pe_base;
+ 		}
+ 
+@@ -268,6 +301,9 @@ pe_init_fiq()
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	taimen_gic_dump("after enable");
++#endif
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
