@@ -409,3 +409,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   entry_pa 0x100429000) rc=0; `cpu=1 mpidr=0x1 came alive; SGI1 OK`, `2/2 CPUs initialized`. iOS ran the whole 180 s
   with no panic, ROOTFIX applied; the lock screen came ~20 s after the first log tick (30-45 s with cpus=1). CPU0
   still ~1554 MHz.
+- 2026-10-23 boot 38 (r42 = +0221 tap to wake; cpus=4, taimenhwscale=2, 300 s): CPU_ON rc=0 for 0x1-0x3, 4/4 CPUs,
+  SGI1 verified. 718 frames in 300 s, 0 timeouts, 0 DSI resets, geometry 3 throughout; 106 frames in 80-100 s and 171
+  in 100-120 s while the user used it (one core: 20 in 240 s). The user: "still very laggy, but way better, multiple
+  frames per second now".
+- 2026-10-23 **boot 39 (r42, cpus=8, 300 s): all 8 cores run**, the gold cluster included: CPU_ON rc=0 for 0x100-0x103,
+  each came alive within ~20 us, `8/8 CPUs initialized, SGI1 verified`; iOS ran the whole 300 s. **Tap to wake works**:
+  between 60 and 80 s iOS switched the display off, the next touch logged `touch on the dark panel: side button press` and the
+  display came back on. 207 frames in 300 s (little use). 0222 turns on the performance probe (sweetperf=1) to see the
+  gold cores' clock.
