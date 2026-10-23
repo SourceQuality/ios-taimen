@@ -28,7 +28,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 
 - /memory reg = 0x80000000 + 0xFE4C0000 (one range, ~4 GB). Linux `System RAM` ranges:
   80000000-857fffff, 88f00000-8aafffff, 95b00000-afffefff, b0200000-b0dfffff, b1000000-17e4bffff.
-- Splash framebuffer: `/reserved-memory/splash_region@9d600000`, reg 0x9d600000 + 0x2400000 (36 MiB), label
+- Splash framebuffer: `/reserved-memory/splash_region@9d600000`, but its `reg` is **0x9d400000** + 0x2400000 (36 MiB; the node name is misleading), label
   `cont_splash_mem`, status disabled in the Lineage DTB (so the kernel does not reserve it; ABL still draws there).
 - Ramdisk placed by ABL at 0xa0000000.
 
