@@ -354,3 +354,15 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   AppleCLCD's first present (no underflow in the early boot's memory traffic, so no reset), dumps to 0x3ff, and
   ROOTFIX updates / to read-write (kernel_mount MNT_UPDATE) first. IOPlatformUUID A9683613-3704-53F2-95D0-98A8FB574E78
   (synthetic ECID).
+- 2026-10-23 **boot 27 (r33 = +0212 no early kicks): the display path is clean.** No DSI reset at all, 5635 kicks /
+  5635 done / 0 timeouts, DSI0 0x000-0x3ff identical to the shim's dump (DSC settings at 0x2a8 included), panel memory
+  = Apple logo + progress bar. Whether the glass showed it is unconfirmed (the user was not sure). ROOTFIX's
+  kernel_mount(MNT_UPDATE) on / returned EFAULT (HFS local mount args are copied in; bsdinit_task runs as init).
+  0213: a kernel thread waits for launchd's read-write remount and writes then.
+- 2026-10-23 **boot 28 (r34 = +0213): ROOTFIX writes, then launchd dies.** Root read-write 4.2 s after launch, all
+  39 records written; `launchd_cache_loader` read launchd.plist 1.3 s later (so edits apply in the same boot), launchd
+  exited "No service cache", `SWEET PANIC: initproc exited`, PS_HOLD, reader (the panic path works). Cause:
+  vnode_open() does not truncate (O_TRUNC is the caller's job), the 792 KB plist overwrote the start of the 1.45 MB
+  original and kept its old binary-plist trailer. **The phone's launchd.plist is corrupt** until a ROOTFIX boot with
+  0214 (vnode_setsize to 0 first; remount polled every 50 ms) rewrites it: always boot with ROOTFIX now. The UFS ring
+  of a boot that dies this early still holds the previous boot's log; pstore has the new one.
