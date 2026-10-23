@@ -87,8 +87,112 @@ static void save(const char *why)
 
 extern char _end[];
 
+#ifdef LOGVIEW
+/*
+ * Log viewer: flashed to boot_a, so after XNU's PS_HOLD reset ABL boots this
+ * instead of Linux and the kernel's ramoops console zone (0xb0080000, written
+ * by sweet_early / the console mirror) is still intact. Shows the important
+ * lines first, then the tail, on screen; no USB needed. Stays up until the
+ * power key is held.
+ */
+#define PRZ_BASE	0xb0080000UL
+#define PRZ_SIZE	0x100000UL
+#define PRZ_SIG		0x43474244u
+static volatile uint8_t *lv_p;
+static uint32_t lv_start, lv_size;
+static char lv_ch(uint32_t i)		/* i-th oldest byte of the ring */
+{
+	uint32_t j = lv_start + i;
+	if (j >= lv_size)
+		j -= lv_size;
+	return (char)lv_p[12 + j];
+}
+static int lv_get(uint32_t off, uint32_t end, char *out, int cols)
+{
+	int n = 0;
+	for (uint32_t i = off; i < end && n < cols; i++) {
+		char c = lv_ch(i);
+		if (c == '\n')
+			break;
+		out[n++] = c;
+	}
+	out[n] = 0;
+	return n;
+}
+static int lv_has(const char *l, int n, const char *k)
+{
+	for (int i = 0; i < n; i++) {
+		int j = 0;
+		while (k[j] && i + j < n && l[i + j] == k[j])
+			j++;
+		if (!k[j])
+			return 1;
+	}
+	return 0;
+}
+static uint32_t lv_ls[8192];
+static void logview(void)
+{
+	lv_p = (volatile uint8_t *)PRZ_BASE;
+	uint32_t sig = rd32(PRZ_BASE);
+	lv_start = rd32(PRZ_BASE + 4);
+	lv_size = rd32(PRZ_BASE + 8);
+	if (lv_size > PRZ_SIZE - 12)
+		lv_size = PRZ_SIZE - 12;
+	if (lv_start >= lv_size)
+		lv_start = 0;
+	con_set_scale(2);
+	con_clear(0);
+	int cols = con_cols(), rows = con_rows();
+	char line[200];
+	if (cols > 199)
+		cols = 199;
+	con_line((sig ^ PRZ_SIG) ? "XNU LOG VIEW  (ring signature BAD)" : "XNU LOG VIEW  (ring signature ok)", cols, YELLOW);
+	/* line starts; when there are more lines than slots keep the newest */
+	uint32_t nl = 0;
+	lv_ls[nl++ % 8192] = 0;
+	for (uint32_t i = 0; i < lv_size; i++)
+		if (lv_ch(i) == '\n')
+			lv_ls[nl++ % 8192] = i + 1;
+	uint32_t base = nl > 8192 ? nl - 8192 : 0;
+	static const char keys[] = "panic\0PANIC\0BSD root\0SWEET UFS\0mount\0launchd\0TAIMEN RESET\0"
+	    "reached\0hfs\0exec\0Exception\0Fatal\0kernel trap\0";
+	int imp = rows / 3, shown = 0;
+	con_line("== key lines (first matches) ==", cols, GREEN);
+	for (uint32_t l = base; l + 1 < nl && shown < imp; l++) {
+		int len = lv_get(lv_ls[l % 8192], lv_ls[(l + 1) % 8192], line, cols);
+		for (const char *kq = keys; *kq; ) {
+			if (lv_has(line, len, kq)) {
+				con_line(line, len, WHITE);
+				shown++;
+				break;
+			}
+			while (*kq)
+				kq++;
+			kq++;
+		}
+	}
+	con_line("== tail ==", cols, GREEN);
+	uint32_t left = (uint32_t)(rows - 3 - shown);
+	uint32_t first = nl - 1 > base + left ? nl - 1 - left : base;
+	for (uint32_t l = first; l + 1 < nl; l++) {
+		int len = lv_get(lv_ls[l % 8192], lv_ls[(l + 1) % 8192], line, cols);
+		con_line(line, len, WHITE);
+	}
+	con_flush();
+	for (;;) {
+		delay_ms(5000);
+		con_flush();	/* keep the command-mode panel refreshed */
+	}
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
+#ifdef LOGVIEW
+	(void)dtb;
+	logview();
+#endif
 	log_printf("TAIMEN SHIM: stage 1 staged diag\n");
 	log_printf("dtb=%lx magic=%08x _end=%p mmfr0=%lx midr=%lx mpidr=%lx el=%lx sctlr=%lx cntfrq=%lu\n",
 		   dtb, rd32(dtb), _end, rsr("id_aa64mmfr0_el1"), rsr("midr_el1"), rsr("mpidr_el1"),

@@ -32,5 +32,9 @@ void con_flush(void);	/* show what was drawn (command-mode panels) */
 void con_skip(void);
 void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
+void con_set_scale(int s);
+int con_cols(void);
+int con_rows(void);
+void con_line(const char *s, int n, uint32_t fg);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
