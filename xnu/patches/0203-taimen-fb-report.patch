@@ -1,0 +1,80 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index dcb65d7..56541f4 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -40,6 +40,22 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void taimen_gic_dump(const char *tag);
+ extern "C" void taimen_thread_dump(const char *tag);
++extern "C" void sweet_fbcon_regs(uint32_t r[10]);
++extern "C" uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
++
++/* Three short lines: the on-screen log viewer shows 90 columns. */
++static void
++taimen_fb_report(int t)
++{
++	uint32_t r[10];
++
++	sweet_fbcon_regs(r);
++	IOLog("TAIMEN FB %d: kicks %llu done %llu timeout %llu INTR_EN 0x%x STS 0x%x\n",
++	    t, sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout, r[0], r[1]);
++	IOLog("TAIMEN FB %d: CTL0 LAYER 0x%x TOP 0x%x FLUSH 0x%x\n", t, r[2], r[3], r[4]);
++	IOLog("TAIMEN FB %d: VIG0 SIZE 0x%x SRC0 0x%x YSTR 0x%x DSI0 0x%x 0x%x\n",
++	    t, r[5], r[6], r[7], r[8], r[9]);
++}
+ 
+ #define TAIMEN_WDT_PA    0x17817000
+ #define TAIMEN_WDT_RST   0x04
+@@ -67,6 +83,9 @@ taimen_wdt_thread(void *arg)
+ 	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += TAIMEN_WDT_PET_S) {
+ 		wdt[TAIMEN_WDT_RST / 4] = 1;
+ 		IOLog("TAIMEN WDT: pet at %d s\n", t);
++		if (t % 20 == 0) {
++			taimen_fb_report(t);
++		}
+ 		if (t == 10 || t == 40) {
+ 			taimen_thread_dump(t == 10 ? "10s" : "40s");
+ 		}
+@@ -74,6 +93,7 @@ taimen_wdt_thread(void *arg)
+ 	}
+ 	IOLog("TAIMEN WDT: taimenreboot=%d reached: WDT EN 0x%x STS 0x%x BARK 0x%x BITE 0x%x; reset ladder follows\n",
+ 	    reboot_s, wdt[TAIMEN_WDT_EN / 4], wdt[0x0c / 4], wdt[TAIMEN_WDT_BARK / 4], wdt[TAIMEN_WDT_BITE / 4]);
++	taimen_fb_report(reboot_s);
+ 	IOSleep(500);
+ 	IOLog("TAIMEN RESET: PS_HOLD = 0\n");
+ 	IOSleep(300);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index fce5fb7..070cce1 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -947,6 +947,30 @@ sweet_fbcon_kick(bool force)
+ 	}
+ }
+ 
++/*
++ * TAIMEN FB report (SweetPlatformExpert.cpp): the MDP/DSI registers a
++ * kickoff depends on, 0 where nothing is mapped. The kernel's frames have
++ * never reached the taimen panel (boots 4-18); this shows whether the
++ * kickoffs are taken.
++ */
++void sweet_fbcon_regs(uint32_t r[10]);
++void
++sweet_fbcon_regs(uint32_t r[10])
++{
++	volatile uint32_t *k = fbcon_kickoff, *v = fbcon_vig0, *i = fbcon_intr, *d = fbcon_dsi;
++
++	r[0] = i ? i[-1] : 0;           /* MDP INTR_EN */
++	r[1] = i ? i[0] : 0;            /* MDP INTR_STATUS */
++	r[2] = k ? k[-7] : 0;           /* CTL0 LAYER(LM0) */
++	r[3] = k ? k[-2] : 0;           /* CTL0 TOP */
++	r[4] = k ? k[-1] : 0;           /* CTL0 FLUSH: pending bits until a frame starts */
++	r[5] = v ? v[0] : 0;            /* VIG0 SRC_SIZE */
++	r[6] = v ? v[0x14 / 4] : 0;     /* VIG0 SRC0_ADDR */
++	r[7] = v ? v[0x24 / 4] : 0;     /* VIG0 SRC_YSTRIDE0 */
++	r[8] = d ? d[0x08 / 4] : 0;     /* DSI0 STATUS0 */
++	r[9] = d ? d[0x110 / 4] : 0;    /* DSI0 INTR_CTRL */
++}
++
+ static void
+ fbcon_init(void)
+ {
