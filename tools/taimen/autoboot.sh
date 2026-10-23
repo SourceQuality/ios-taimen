@@ -25,9 +25,10 @@ reboot_s=$(echo "$*" | sed -n 's/.*taimenreboot=\([0-9]*\).*/\1/p')
 NO_ALERT=1 BOOT_WAIT=25 "$P/tools/taimen/boot-xnu.sh" "$kernel" "$out" "$@" > "$out/boot.log" 2>&1
 grep -E "warning|fastboot boot at|Booting" "$out/boot.log"
 rm -rf "$out/reader"
-# kernel start ~25 s after the fastboot boot, reset + ABL + reader + USB ~60 s
+# kernel start ~25 s after the fastboot boot, reset + ABL + reader + USB ~60 s, more under load
+# (boot 30: the drive came ~4 min after the deadline)
 if ! powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$P/tools/taimen/reader-pull.ps1")" \
-	-Dest "$(wslpath -w "$out/reader")" -Timeout $(( ${reboot_s:-300} + 240 )) | tr -d '\r'; then
+	-Dest "$(wslpath -w "$out/reader")" -Timeout $(( ${reboot_s:-300} + 600 )) | tr -d '\r'; then
 	say "no reader drive: the phone hung or the reader did not start"
 	"$P/tools/taimen/attention.sh" "Pixel 2 XL hung. Hold power and volume down for 10 seconds"
 	exit 3
