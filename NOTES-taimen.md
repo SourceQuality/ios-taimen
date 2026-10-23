@@ -344,3 +344,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   containers, ExtensionKit flag, SpringBoard/Setup prefs, and LastSystemVersion 20H392 in
   ByHost/com.apple.migration.<IOPlatformUUID>.plist to skip the data migration. r31 failed to build (no strstr in the
   kernel); r32 = 0210 fixed + 0211.
+- 2026-10-23 **boot 26 (r32 = +0210 fixed, +0211 repeated start; ROOTFIX blob; 5 min): TOUCH WORKS.** `chip id 00 36
+  70 01 00 64 20`, `fw 0x2064 config 0x228 main 0x2c`, sense on, polled on gpio125; the user's taps came in as `down 0
+  at 905,1734` / `up 0` etc. (panel pixels). ROOTFIX: every write failed with **EROFS** (error 30; ENOENT for files in
+  the dirs that could not be made): the root comes up read-only and launchd's boot tasks remount it later. The user saw
+  a **black panel** the whole run, although the panel memory (screenshot) held the Apple logo + progress bar with clean
+  borders (0208), the display was never powered off, and the DSI completed every transfer after the 2 early resets
+  (DSI0 0x000-0x1ff identical to the shim's afterwards; DSC settings live above). 0212: no frame is sent before
+  AppleCLCD's first present (no underflow in the early boot's memory traffic, so no reset), dumps to 0x3ff, and
+  ROOTFIX updates / to read-write (kernel_mount MNT_UPDATE) first. IOPlatformUUID A9683613-3704-53F2-95D0-98A8FB574E78
+  (synthetic ECID).
