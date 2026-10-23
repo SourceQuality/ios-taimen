@@ -14,8 +14,11 @@ args=${*:-}
 # ufsrw=1 (HFS+ journal replay, UFS console ring), cs_enforcement_disable=1 (4K pages vs the
 # 16K-signed cache), the userland switches dyld/launchd/watchdogd read from kern.bootargs;
 # sweetfb_noconsole=1: no kernel text over the GUI (the log reader brings the console back).
+# cpus=4: the silver cluster (boots 37-41: the gold cores run at 299 MHz, left there by ABL, and
+# 8 cores reach the lock screen at 35 s against 15 s with 4); taimenhwscale=2: QSEED3 full screen
+# (xnu 0218, boot 36). Later extra args override both (the last occurrence wins).
 if [ "${ROOT:-0}" = 1 ]; then
-	args="rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
+	args="cpus=4 taimenhwscale=2 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
 fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"

@@ -418,3 +418,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   between 60 and 80 s iOS switched the display off, the next touch logged `touch on the dark panel: side button press` and the
   display came back on. 207 frames in 300 s (little use). 0222 turns on the performance probe (sweetperf=1) to see the
   gold cores' clock.
+- 2026-10-23 boot 40 (r43 = +0222, cpus=8, sweetperf=1): no SWEET PERF line, because sweet_ufs.c starts none of the
+  Pixel 1 drivers on TAIMEN; 0223 starts the probe there. Otherwise a quiet 300 s (18 frames, no touches).
+- 2026-10-23 **boot 41 (r44 = +0223, cpus=8, sweetperf=1): the gold cores run at 299 MHz.** Per core (MIDR, MPIDR,
+  clock, memcpy of 4 MiB cached): silver 0x51af8014 0x0-0x3 at 1555 MHz, 0.4-1.3 GB/s; gold 0x51af8001 0x100-0x103
+  at **299 MHz**, 1.55 GB/s. ABL leaves the gold cluster there and nothing raises it. Lock screen (first "display on")
+  at 35 s with 8 cores (boots 39-41), 15 s with 4 (boot 38), 20 s with 2 (37), 30 s with 1 (36): the slow gold cores
+  hurt. SWEET TOP while iOS settles: 300-580 % in all, kernel_task 50-110 %, SpringBoard up to 118 %, backboardd up to
+  58 %, locationd/identityservicesd/healthd 30-55 %; idle after ~200 s. boot-xnu.sh ROOT=1 now defaults to cpus=4
+  taimenhwscale=2. Next: gold/silver/DDR clocks (docs/taimen-clocks-plan.md) and the GPU (docs/taimen-gpu-plan.md).
