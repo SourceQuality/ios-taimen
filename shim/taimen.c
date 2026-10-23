@@ -108,22 +108,37 @@ void shim_main(uint64_t dtb)
 	psci_reset();
 #endif
 	con_skip();
-	/* 0a. Does the ramoops console zone (0xb0080000) survive a reset AND an
-	 * Android boot in between? Log what is there, then leave a record of our
-	 * own (same layout as Linux persistent_ram: sig "DBGC", start, size, text).
-	 * If it survives, the kernel's early log can be rescued here next boot. */
-	{
-		volatile uint32_t *prz = (volatile uint32_t *)0xb0080000UL;
-		volatile uint8_t *txt = (volatile uint8_t *)0xb008000cUL;
+	/* 0a. Which ramoops zone survives a reset AND an Android boot in between?
+	 * Main console zone 0xb0080000 is Linux's own console (overwritten every
+	 * Android boot); the alt region 0xb0e00000 may be left alone. Log both,
+	 * dump up to 2 KB of a record we wrote earlier, then plant a new one in the
+	 * alt zone. If it survives, the kernel's early log can live there and be
+	 * rescued here on the next boot. */
+	for (int z = 0; z < 2; z++) {
+		uintptr_t base = z ? 0xb0e80000UL : 0xb0080000UL;
+		volatile uint32_t *prz = (volatile uint32_t *)base;
+		volatile uint8_t *txt = (volatile uint8_t *)(base + 12);
 		char snip[49];
 		for (int i = 0; i < 48; i++) {
 			uint8_t c = txt[i];
 			snip[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
 		}
 		snip[48] = 0;
-		log_printf("prz @b0080000: sig=%08x start=%u size=%u text=\"%s\"\n", prz[0], prz[1], prz[2], snip);
-		con_hex2("PRZ", "sig=", prz[0], "size=", prz[2]);
-		static const char msg[] = "TAIMEN SHIM was here\n";
+		log_printf("prz @%lx: sig=%08x start=%u size=%u text=\"%s\"\n", (unsigned long)base, prz[0], prz[1], prz[2], snip);
+		con_hex2(z ? "PRZalt" : "PRZ", "sig=", prz[0], "size=", prz[2]);
+		if (z && prz[0] == 0x43474244u && prz[2] <= 0x100000u - 12u) {
+			log_printf("--- alt zone record (%u bytes, first 2 KB):\n", prz[2]);
+			for (uint32_t i = 0; i < prz[2] && i < 2048; i++) {
+				uint8_t c = txt[i];
+				log_printf("%c", (c >= 0x20 && c < 0x7f) || c == '\n' ? (char)c : '.');
+			}
+			log_printf("\n--- end of alt zone record\n");
+		}
+	}
+	{
+		volatile uint32_t *prz = (volatile uint32_t *)0xb0e80000UL;
+		volatile uint8_t *txt = (volatile uint8_t *)0xb0e8000cUL;
+		static const char msg[] = "TAIMEN SHIM was here (alt zone)\n";
 		for (unsigned i = 0; msg[i]; i++)
 			txt[i] = (uint8_t)msg[i];
 		prz[1] = sizeof(msg) - 1;

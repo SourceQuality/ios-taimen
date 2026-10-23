@@ -36,5 +36,7 @@ done
 echo "+$(( $(date +%s)-t0 ))s: back in ${back:-nothing (hung? power key needed)}"
 if [ "$back" = "android" ]; then
 	echo "bootreason: $(timeout 5 adb shell getprop ro.boot.bootreason 2>/dev/null)"
-	"$P/tools/taimen/log-pull.sh" "$out/shim-log.txt" | sed -n '2,200p'
+	"$P/tools/taimen/log-pull.sh" "$out/shim-log.txt" | grep -E 'LOADER|saved|EXC|wdt' || true
+	echo "=== XNU log (previous boot's ramoops console zone, via /dev/access-ramoops):"
+	"$P/tools/taimen/xnu-log-pull.sh" "$out/xnu-log.txt" && cat "$out/xnu-log.txt"
 fi
