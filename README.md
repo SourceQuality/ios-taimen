@@ -55,8 +55,13 @@ Every step below is non-destructive until the root filesystem is written to `use
 3. **Kernel.** Run the `xnu` workflow with `machine_config=TAIMEN`; the artifact is `kernel.development.taimen`.
 4. **Payload.** `tools/mkadt.py taimen.adt --taimen`, then
    `tools/mkpayload.py kernel.development.taimen taimen.adt payload --l2block 0x200000 --cmdline "..."`.
-5. **iOS root** (later): the iPhone X 16.7.16 IPSW, built into an HFS+ image with `tools/mkiosroot.sh` and written to
-   `userdata`. Not yet exercised on this phone.
+5. **iOS root**: unzip the three images from the iPhone X 16.7.16 IPSW (OS root `087-86698-044.dmg`, SystemOS
+   cryptex `087-86593-047.dmg`, AppOS cryptex `087-86715-047.dmg`), have `apfs-fuse` on the PATH (built from
+   sgan81/apfs-fuse; it decompresses Apple's LZBITMAP files, which 7-Zip cannot), then
+   `tools/mkiosroot.sh OS.dmg SYSOS.dmg APPOS.dmg ios16-root.img 16G`. The script needs `sudo` for the loop mount
+   and the owner-preserving copy. Convert with `tools/img2simg.py` and `fastboot flash userdata` (erases Android).
+   Boot with `rd=ufsroot0` added to the boot-args (`tools/taimen/boot-xnu.sh KERNEL OUTDIR "rd=ufsroot0"`).
+   Not yet exercised on this phone.
 
 ## Repository layout (taimen additions)
 
