@@ -6,6 +6,11 @@
 #define FB_W		1080
 #define FB_H		1920
 #define FB_BPP		3		/* RGB888, YSTRIDE 0xca8 */
+#elif defined(TAIMEN)
+#define FB_BASE		0x9d400000UL	/* reserved-memory splash_region (reg, not the node name) */
+#define FB_W		1440
+#define FB_H		2880
+#define FB_BPP		3		/* assumed RGB888 like Pixel 1; stage-1 diag reads VIG0 SRC_FORMAT */
 #else
 #define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
 #define FB_W		1080

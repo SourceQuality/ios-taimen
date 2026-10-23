@@ -7,8 +7,17 @@
  */
 #include "pstore.h"
 
+#ifdef TAIMEN
+/*
+ * taimen ramoops: 2 MiB at 0xb0000000, record-size 0x20000 (4 dump zones),
+ * then the 1 MiB console zone at 0xb0080000, then 512K pmsg. No ECC.
+ */
+#define PRZ_BASE	0xb0080000UL
+#define PRZ_DATA_MAX	(0x100000UL - 12)
+#else
 #define PRZ_BASE	0x83540000UL
 #define PRZ_DATA_MAX	(0x80000UL - 12)
+#endif
 #define PRZ_SIG		0x43474244U	/* "DBGC" */
 
 #define PRZ_W(off)	(*(volatile uint32_t *)(PRZ_BASE + (off)))

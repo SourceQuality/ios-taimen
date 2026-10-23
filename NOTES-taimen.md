@@ -63,3 +63,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   not the 16K VMAPPLE-derived config that sailfish/sweet use. Qualcomm platform drivers come from sailfish,
   the page-size work from the S8 port. ABL / Pixel boot-image rules confirmed working for arbitrary kernels.
 - Phone kernel: 4.4.302-lineage (msm-4.4), so no userspace ID-register emulation; the probe is the only way to read TGran16.
+- 2026-10-22 shim 1 (`shim/taimen.c`, stage-1 diag: disable APSS WDT at 0x17817000, read MDSS/MDP/SSPP/CTL/INTF/PP
+  registers at 0xc9xxxxx, paint FB at 0x9d400000, CTL0 START kick, 20 s, PSCI reset): phone came back at +40 s with
+  `bootreason=watchdog`, i.e. a bite ~9 s after entry; ramoops console empty.
+- 2026-10-22 shim-min (`-DDIAG_MIN`: no WDT writes, no MDSS access, no CTL kick; paint + 10 s + PSCI reset):
+  `bootreason=reboot` at +44 s, exactly as written. So the entry, stack, FB writes and timer are fine and the
+  watchdog death is caused by the WDT write or the MDSS register access (bisect next). Ramoops console empty again:
+  **RAM at 0xb0080000 does not survive a PSCI SYSTEM_RESET through this bootloader** (or Linux reads another region).
+  Ramoops is not a log channel on taimen; use the screen now and the UFS log ring later.
+- Linux dmesg: `mdss version = 0x30000001`, `fb0: split_mode:1 left:720 right:720` (two LM/PP/DSC, one DSI),
+  `bootloader display is on`, DSI ctrl rev 0x20000000, PHY rev 0x3.

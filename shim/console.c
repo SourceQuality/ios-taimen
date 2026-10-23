@@ -30,7 +30,23 @@ static void put_px(int x, int y, uint32_t c)
 
 void con_flush(void)
 {
-#ifdef PIXEL1
+#ifdef TAIMEN
+	/*
+	 * Same command-mode kick as Pixel 1, at the MSM8998 MDSS base: clear
+	 * PING_PONG_0_DONE (INTR_CLEAR 0xc901018 bit 8), CTL0 START 0xc90201c,
+	 * wait for the done bit (INTR_STATUS 0xc901014), 100 ms cap.
+	 */
+	volatile uint32_t *intr = (volatile uint32_t *)0xc901014UL;
+	uint64_t t0, t, f;
+	intr[1] = 1u << 8;
+	__asm__ volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)0xc90201cUL = 1;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+	do {
+		__asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+	} while (!(intr[0] & (1u << 8)) && t - t0 < f / 10);
+#elif defined(PIXEL1)
 	/*
 	 * Command-mode panel, no autorefresh: MDP CTL0 START sends one frame
 	 * (TE wait + transfer, up to ~32 ms). Clear PING_PONG_0_DONE (MDP
