@@ -144,7 +144,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=(), l2block=0x2000000):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -153,7 +153,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
     # virt_base: 32MB (16K-granule L2 block) below the mach header, so start.s's
     # block mapping that starts at the header's block begins exactly at phys_base.
-    virt_base = text['vmaddr'] & ~(args.l2block - 1)
+    virt_base = text['vmaddr'] & ~(l2block - 1)
     kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
@@ -210,7 +210,7 @@ if __name__ == '__main__':
     ap.add_argument('--blob', action='append', default=[], metavar='NAME=FILE',
                     help='file for /chosen/memory-map NAME')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, [b.split('=', 1) for b in a.blob])
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, [b.split('=', 1) for b in a.blob], a.l2block)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
