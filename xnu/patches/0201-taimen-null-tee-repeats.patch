@@ -1,0 +1,64 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 291a546..c467155 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -189,6 +189,47 @@ sweet_null_tee(char *name, size_t len)
+ 	}
+ 	return false;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * TAIMEN: backboardd writes the same line once per frame (boot 17: 60 a second),
++ * which pushed the whole boot out of the 1 MiB log ring. An identical write from
++ * the same process is counted instead of printed; the count goes out every 600
++ * repeats and when the text changes.
++ */
++#include <kern/locks.h>
++#define SWEET_NULL_REPORT 600
++static LCK_GRP_DECLARE(sweet_null_grp, "sweet_null");
++static LCK_MTX_DECLARE(sweet_null_lock, &sweet_null_grp);
++static char sweet_null_last[256], sweet_null_last_name[32];
++static size_t sweet_null_last_len;
++static uint32_t sweet_null_reps;
++
++static bool
++sweet_null_repeat(const char *name, const char *buf, size_t len)
++{
++	bool same;
++
++	lck_mtx_lock(&sweet_null_lock);
++	same = len == sweet_null_last_len && strcmp(name, sweet_null_last_name) == 0 &&
++	    memcmp(buf, sweet_null_last, len) == 0;
++	if (same) {
++		if (++sweet_null_reps % SWEET_NULL_REPORT == 0) {
++			printf("|%s| (last line repeated %u times)\n", name, sweet_null_reps);
++		}
++	} else {
++		if (sweet_null_reps % SWEET_NULL_REPORT != 0) {
++			printf("|%s| (last line repeated %u times)\n", sweet_null_last_name, sweet_null_reps);
++		}
++		memcpy(sweet_null_last, buf, len);
++		sweet_null_last_len = len;
++		strlcpy(sweet_null_last_name, name, sizeof(sweet_null_last_name));
++		sweet_null_reps = 0;
++	}
++	lck_mtx_unlock(&sweet_null_lock);
++	return same;
++}
++#endif
+ #endif
+ 
+ int
+@@ -264,6 +305,11 @@ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ 					if (error) {
+ 						break;
+ 					}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++					if (sweet_null_repeat(name, buf, c)) {
++						continue;
++					}
++#endif
+ 					printf("|%s| %.*s%s", name, (int)c, buf,
+ 					    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
+ 					continue;
