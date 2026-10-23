@@ -9,8 +9,9 @@ dst=$T/transfer; mkdir -p "$dst" "$T/handoff"
 cdir=~/.claude/projects/$(dirname "$T" | tr / -)	# Claude Code project key of ~/Projects
 # handoff/: the patch-authoring xnu tree, Claude memory + transcripts of the Linux sessions
 if [ -n "$scratch" ] && [ -d "$scratch/xnu/.git" ]; then
-	git -C "$scratch/xnu" bundle create "$T/handoff/xnu-scratch.bundle" --all
-	tar -C "$scratch" -cf "$T/handoff/dxb.tar" dxb
+	# a tar, not a git bundle: the tree is a shallow clone, which bundles cannot carry
+	rm -f "$T/handoff/xnu-scratch.bundle" "$T/handoff/dxb.tar"
+	tar -C "$scratch" --zstd -cf "$T/handoff/xnu-scratch.tar.zst" xnu dxb
 fi
 rm -rf "$T/handoff/claude-memory"; cp -r "$cdir"/memory "$T/handoff/claude-memory" 2>/dev/null || true
 mkdir -p "$T/handoff/claude-transcripts"

@@ -41,7 +41,7 @@ On the old Linux laptop, `tools/windows/make-transfer-bundle.sh` writes
 
 | file | contents |
 | --- | --- |
-| `ios-taimen-private.tar.zst` | `backup/` (partition dumps, holds the serial/IMEI: keep private), `research/taimen/` (notes, TWRP images, live DT, photos), the small `research/ipsw-x/` parts plus `ios16-root-tail.simg`, `hw/`, `out/kernels/taimen-r22` and `out/taimen-xnu-r22`, the patch-authoring xnu tree (`xnu-scratch.bundle` + `dxb.tar`), and the Claude memory and transcript of the Linux sessions |
+| `ios-taimen-private.tar.zst` | `backup/` (partition dumps, holds the serial/IMEI: keep private), `research/taimen/` (notes, TWRP images, live DT, photos), the small `research/ipsw-x/` parts plus `ios16-root-tail.simg`, `hw/`, `out/kernels/taimen-r22` and `out/taimen-xnu-r22`, the patch-authoring xnu tree (`handoff/xnu-scratch.tar.zst`), and the Claude memory and transcript of the Linux sessions |
 | `ios16-root.simg` (optional, 12 GB) | the full iOS root image. Only needed to re-flash userdata from scratch; the root is on the phone already |
 | `SHA256SUMS` | checksums of the above |
 
@@ -69,8 +69,8 @@ cp ../handoff/CLAUDE.md .      # working rules for Claude (gitignored, stays loc
 The patch-authoring xnu tree (dxb + xnu-8796.141.3 + patches 0001-0200, one commit per patch):
 
 ```bash
-cd ~/Projects/ios-taimen && mkdir -p scratch && cd scratch
-git clone ../handoff/xnu-scratch.bundle xnu && tar -xf ../handoff/dxb.tar
+cd ~/Projects/ios-taimen && mkdir -p scratch
+tar --zstd -xf handoff/xnu-scratch.tar.zst -C scratch     # scratch/xnu, scratch/dxb
 ```
 
 ## 4. Check it end to end
