@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index c28e2a1..41b6204 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -177,8 +177,12 @@ taimen_psci_probe(void)
+ 			taimen_psci_ctx = ctx;
+ 		}
+ 	}
+-	uint64_t h = taimen_psci(0x84000000ULL, 0, 0, 0, true, TPSCI_THREAD);
+-	IOLog("TAIMEN PSCI [thread, hvc] VERSION -> %#llx%s\n", h, h == 0x84000000ULL ? " UNCHANGED" : "");
++	/* Boot 35: this hvc reset the phone (the hypervisor does not take PSCI over hvc). */
++	uint32_t hvc = 0;
++	if (PE_parse_boot_argn("taimenpscihvc", &hvc, sizeof(hvc)) && hvc) {
++		uint64_t h = taimen_psci(0x84000000ULL, 0, 0, 0, true, TPSCI_THREAD);
++		IOLog("TAIMEN PSCI [thread, hvc] VERSION -> %#llx%s\n", h, h == 0x84000000ULL ? " UNCHANGED" : "");
++	}
+ 	IOLog("TAIMEN PSCI: CPU_ON goes in context %s\n", taimen_psci_ctx >= 0 ? taimen_psci_ctx_name[taimen_psci_ctx] : "none");
+ }
+ #endif
