@@ -16,32 +16,31 @@ adb wait-for-device
 # TWRP (the boot slot during the root phase) has pstore but does not mount it
 adb shell 'mountpoint -q /sys/fs/pstore 2>/dev/null || mount -t pstore pstore /sys/fs/pstore 2>/dev/null; true' >/dev/null 2>&1 || true
 raw="$out.raw"
-if adb shell 'test -r /sys/fs/pstore/console-ramoops' 2>/dev/null; then
-	adb exec-out 'cat /sys/fs/pstore/console-ramoops' > "$raw"
-	src=/sys/fs/pstore/console-ramoops
-else
-	adb exec-out "dd if=/dev/access-ramoops bs=4096 skip=128 count=256 2>/dev/null" > "$raw" || true
-	src=/dev/access-ramoops
-fi
-python3 -I - "$raw" "$out" "$src" <<'EOF'
+# Both candidates: Linux's pstore record and the alt region; whichever holds the kernel's text wins.
+adb exec-out 'cat /sys/fs/pstore/console-ramoops 2>/dev/null' > "$raw.pstore" || true
+adb exec-out "dd if=/dev/access-ramoops bs=4096 skip=128 count=256 2>/dev/null" > "$raw.alt" || true
+python3 -I - "$raw.pstore" "$raw.alt" "$out" <<'EOF'
 import re, struct, sys
-b = open(sys.argv[1], 'rb').read()
-if sys.argv[3] != '/sys/fs/pstore/console-ramoops':
+def ring(b):
+    if len(b) < 12: return b''
     sig, start, size = struct.unpack_from('<3I', b, 0)
-    if bin((sig ^ 0x43474244) & 0xffffffff).count('1') > 2 or not (0 < size <= 0x100000 - 12):
-        print(f'no usable record in {sys.argv[3]} (sig {sig:#x}, size {size})'); sys.exit(1)
+    if bin((sig ^ 0x43474244) & 0xffffffff).count('1') > 2 or not (0 < size <= 0x100000 - 12): return b''
     data = b[12:12 + min(size, len(b) - 12)]
-    b = (data[start:] + data[:start]) if start < size else data
-b = b.replace(b'\r', b'')
-# XNU's part: from the shim/kernel markers up to Linux's "Booting Linux" line that follows it
-m = re.search(rb'(TAIMEN SHIM was here\n)?SWEET EARLY 0: start\.s entered', b)
-if not m:
-    print(f'no XNU log in {sys.argv[3]} ({len(b)} bytes)'); sys.exit(1)
-tail = b[m.start():]
-e = tail.find(b'Booting Linux on physical CPU')
-if e > 0:
-    tail = tail[:e]
-open(sys.argv[2], 'wb').write(tail)
-print(f'{sys.argv[2]}: {len(tail)} bytes of XNU log from {sys.argv[3]}')
+    return (data[start:] + data[:start]) if start < size else data
+cands = [('pstore', open(sys.argv[1], 'rb').read()), ('alt', ring(open(sys.argv[2], 'rb').read()))]
+best = (None, b'')
+for name, b in cands:
+    b = b.replace(b'\r', b'')
+    m = re.search(rb'(TAIMEN SHIM was here\n)?SWEET EARLY [01]: ', b)
+    if not m: continue
+    tail = b[m.start():]
+    e = tail.find(b'Booting Linux on physical CPU')
+    if e > 0: tail = tail[:e]
+    if len(tail) > len(best[1]): best = (name, tail)
+if not best[0]:
+    print('no XNU log in pstore or the alt region'); sys.exit(1)
+open(sys.argv[3], 'wb').write(best[1])
+print(f'{sys.argv[3]}: {len(best[1])} bytes of XNU log from {best[0]}')
 EOF
-rm -f "$raw"
+rm -f "$raw.pstore" "$raw.alt"
+
