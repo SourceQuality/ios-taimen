@@ -1,5 +1,5 @@
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 9c8cc7a..c6330ab 100644
+index 9c8cc7a..a6ad5f0 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -5,6 +5,7 @@
@@ -10,12 +10,19 @@ index 9c8cc7a..c6330ab 100644
  #include <kern/clock.h>
  #include <mach/mach_time.h>
  #include <machine/atomic.h>
-@@ -311,6 +312,24 @@ pe_init_fiq()
+@@ -311,6 +312,31 @@ pe_init_fiq()
  	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
  	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"),
  	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("DAIF"));
 +#if defined(ARM64_BOARD_CONFIG_TAIMEN)
-+	/* kprintf has no sink this early (serial_init comes later): the saved early log instead */
++	/* kprintf has no sink this early (serial_init comes later): the saved early log instead,
++	 * and printf too in case the early log is already disabled (console mirrors into it). */
++	printf("TAIMEN GIC: vtimer intid %u gicr_pe_base 0x%lx GICD_CTLR 0x%x GICD_TYPER 0x%x GICR_WAKER 0x%x GICR_TYPER 0x%x ISENABLER0 0x%x IGROUPR0 0x%x\n",
++	    sweet_vtimer_intid, (unsigned long)gicr_pe_base, gicd_read32(GICD_CTLR), gicd_read32(0x4), gicr_read32(GICR_WAKER),
++	    gicr_read32(GICR_TYPER), gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_IGROUPR0));
++	printf("TAIMEN GIC: ICC_SRE 0x%llx IGRPEN1 0x%llx PMR 0x%llx CTLR 0x%llx CNTV_CTL 0x%llx CNTFRQ 0x%llx DAIF 0x%llx\n",
++	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"),
++	    __builtin_arm_rsr64("ICC_CTLR_EL1"), __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTFRQ_EL0"), __builtin_arm_rsr64("DAIF"));
 +	sweet_early_hex("GIC vtimer intid", sweet_vtimer_intid);
 +	sweet_early_hex("GIC gicr pe base", (uint64_t)gicr_pe_base);
 +	sweet_early_hex("GIC GICD_CTLR", gicd_read32(GICD_CTLR));
