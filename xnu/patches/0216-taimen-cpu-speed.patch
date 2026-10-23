@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index ce3285a..4db0990 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -139,6 +139,29 @@ taimen_disp_dump(const char *tag)
+ 	IOLog("DISP %s busy of 20000 reads: engine %u mdp %u nonzero %u\n", tag, eng, mdp, any);
+ }
+ 
++/*
++ * Boot 31: iOS reaches the home screen but is very slow. How fast does CPU0 run? A
++ * subs/b.ne loop is about one iteration per cycle on these cores; timed against the
++ * 19.2 MHz counter it gives the clock ABL left the core at (no cpufreq on taimen yet).
++ */
++static void
++taimen_cpu_speed(const char *tag)
++{
++	/* fastest of 5 runs of 20M: preemption only makes a run slower */
++	uint64_t best = ~0ULL;
++	for (int run = 0; run < 5; run++) {
++		uint64_t n = 20000000ULL, t0 = mach_absolute_time();
++		__asm__ volatile ("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(n) : : "cc");
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		best = ns < best ? ns : best;
++	}
++	uint64_t midr;
++	__asm__ volatile ("mrs %0, midr_el1" : "=r"(midr));
++	IOLog("TAIMEN CPU %s: 20M loop in %llu us = ~%llu MHz (1 iteration/cycle), midr %#llx\n",
++	    tag, best / 1000, best ? 20000000ULL * 1000ULL / best : 0, midr);
++}
++
+ /* Three short lines: the on-screen log viewer shows 90 columns. */
+ static void
+ taimen_fb_report(int t)
+@@ -187,6 +210,7 @@ taimen_wdt_thread(void *arg)
+ 		}
+ 		if (t == 0 || t == 60) {
+ 			taimen_disp_dump(t == 0 ? "xnu-0s" : "xnu-60s");
++			taimen_cpu_speed(t == 0 ? "0s" : "60s");
+ 		}
+ 		if (t == 10 || t == 40) {
+ 			taimen_thread_dump(t == 10 ? "10s" : "40s");
