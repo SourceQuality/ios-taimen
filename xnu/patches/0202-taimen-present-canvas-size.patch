@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7ae9ef7..17934ba 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -376,6 +376,19 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * Taimen: the 1440x2880 panel is larger than the ADT's 1125x2436 canvas. With the
++	 * panel size reported, CoreAnimation scaled canvas -> display on every frame through
++	 * AppleM2ScalerCSCDriver (boots 17-18: backboardd "IOServiceMatchingfailed for:
++	 * AppleM2ScalerCSCDriver" 60 times a second). Present the canvas size and copy it
++	 * 1:1 into the middle of the panel (negative fOffX/fOffY, clipped in swapEnd).
++	 */
++	if (!native && !fScaled) {
++		fLogicalW = SWEET_FB_LOGICAL_W;
++		fLogicalH = SWEET_FB_LOGICAL_H;
++	}
++#endif
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+@@ -390,6 +403,15 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (fOffX < 0 || fOffY < 0) {
++		/* black borders around the centered canvas; the panel memory still holds the shim's screen */
++		volatile uint64_t *px = (volatile uint64_t *)fPixels;
++		for (size_t i = 0; i < (size_t)fRowBytes * fHeight / 8; i++) {
++			px[i] = 0xff000000ff000000ULL;
++		}
++	}
++#endif
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
