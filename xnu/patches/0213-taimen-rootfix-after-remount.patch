@@ -1,0 +1,124 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 52d60f6..2a52deb 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -1,6 +1,6 @@
+ /*
+- * Taimen root fixups: the iOS root on userdata is patched at every boot, after vfs_mountroot
+- * and before launchd, from the payload blob ROOTFIX (/chosen/memory-map, mkpayload --blob;
++ * Taimen root fixups: the iOS root on userdata is patched at every boot, once launchd has
++ * remounted it read-write (see rootfix_thread), from the payload blob ROOTFIX (/chosen/memory-map, mkpayload --blob;
+  * built by port/tools/taimen/mkrootfix.py). No reflash and no HFS+ tools on the PC: the
+  * mounted root (ufsrw=1) is written through the VFS.
+  *   blob     "RFX1", u32 count, then records: u32 op, mode, uid, gid, path length, data
+@@ -18,7 +18,9 @@
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount_internal.h>
++#include <sys/kernel.h>
+ #include <sys/kauth.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
+ #include <pexpert/pexpert.h>
+@@ -117,37 +119,17 @@ rootfix_mkdir(const char *path, uint32_t mode, uint32_t uid, uint32_t gid, vfs_c
+ 	return err;
+ }
+ 
+-void
+-taimen_rootfix(void)
++static const uint8_t *rootfix_blob;
++static uint64_t rootfix_len;
++static int rootfix_chan;
++
++static void
++rootfix_apply(void)
+ {
+-	int enabled = 1;
+-	DTEntry node;
+-	uint64_t const *v;
+-	unsigned int size;
+-	(void)PE_parse_boot_argn("taimenrootfix", &enabled, sizeof(enabled));
+-	if (!enabled || SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, "ROOTFIX", (void const **)&v, &size) != kSuccess || size != 16) {
+-		printf("TAIMEN ROOTFIX: %s\n", enabled ? "no ROOTFIX blob in the payload" : "disabled");
+-		return;
+-	}
+-	const uint8_t *b = (const uint8_t *)phystokv(v[0]), *end = b + v[1];
++	const uint8_t *b = rootfix_blob, *end = b + rootfix_len;
+ 	const uint32_t *h = (const uint32_t *)b;
+-	if (v[1] < 8 || h[0] != RFX_MAGIC) {
+-		printf("TAIMEN ROOTFIX: bad blob (len %llu magic %#x)\n", v[1], v[1] >= 4 ? h[0] : 0);
+-		return;
+-	}
+ 	uint32_t count = h[1], done = 0, skipped = 0, failed = 0;
+ 	vfs_context_t ctx = vfs_context_kernel();
+-	/*
+-	 * Boot 26: every write failed with EROFS. The root comes up read-only and launchd's
+-	 * boot tasks remount it read-write later (mount -uw /), too late for launchd.plist.
+-	 * Do that update here; launchd's own then finds it done.
+-	 */
+-	if (rootvnode != NULLVP && vfs_isrdonly(vnode_mount(rootvnode))) {
+-		int err = kernel_mount("hfs", NULLVP, NULLVP, "/", NULL, 0, MNT_UPDATE, 0, ctx);
+-		printf("TAIMEN ROOTFIX: root was read-only, update to read-write: %s %d\n",
+-		    err ? "error" : "ok", err);
+-	}
+ 	const uint8_t *p = b + 8;
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		if (p + 24 > end) {
+@@ -188,4 +170,55 @@ taimen_rootfix(void)
+ 	}
+ 	printf("TAIMEN ROOTFIX: %u records: %u written, %u already present, %u failed\n", count, done, skipped, failed);
+ }
++
++/*
++ * Boots 26-27: the root comes up read-only, launchd's boot tasks remount it read-write
++ * (mount -uw /), and an update from here fails: HFS takes local mount args, which
++ * mount_common copies in, and bsdinit_task runs as the init process (copyin from a kernel
++ * address: EFAULT). So wait for launchd's remount and write then. launchd.plist edits take
++ * effect from the next boot (the root persists); prefs are in place before SpringBoard.
++ */
++static void
++rootfix_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned waited = 0;
++	while (rootvnode == NULLVP || vfs_isrdonly(vnode_mount(rootvnode))) {
++		if (waited >= 120 * 5) {
++			printf("TAIMEN ROOTFIX: root still read-only after 120 s, nothing written\n");
++			return;         /* a kernel thread ends by returning */
++		}
++		(void)tsleep(&rootfix_chan, PZERO, "rootfix", hz / 5);
++		waited++;
++	}
++	printf("TAIMEN ROOTFIX: root read-write after %u.%u s\n", waited / 5, (waited % 5) * 2);
++	rootfix_apply();
++}
++
++void
++taimen_rootfix(void)
++{
++	int enabled = 1;
++	DTEntry node;
++	uint64_t const *v;
++	unsigned int size;
++	thread_t thread;
++	(void)PE_parse_boot_argn("taimenrootfix", &enabled, sizeof(enabled));
++	if (!enabled || SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "ROOTFIX", (void const **)&v, &size) != kSuccess || size != 16) {
++		printf("TAIMEN ROOTFIX: %s\n", enabled ? "no ROOTFIX blob in the payload" : "disabled");
++		return;
++	}
++	rootfix_blob = (const uint8_t *)phystokv(v[0]);
++	rootfix_len = v[1];
++	const uint32_t *h = (const uint32_t *)rootfix_blob;
++	if (rootfix_len < 8 || h[0] != RFX_MAGIC) {
++		printf("TAIMEN ROOTFIX: bad blob (len %llu magic %#x)\n", rootfix_len, rootfix_len >= 4 ? h[0] : 0);
++		return;
++	}
++	if (kernel_thread_start(rootfix_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("TAIMEN ROOTFIX: no thread\n");
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
