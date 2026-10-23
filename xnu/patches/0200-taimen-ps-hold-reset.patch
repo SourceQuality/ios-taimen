@@ -1,0 +1,88 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 59d26cd..dcb65d7 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -74,46 +74,10 @@ taimen_wdt_thread(void *arg)
+ 	}
+ 	IOLog("TAIMEN WDT: taimenreboot=%d reached: WDT EN 0x%x STS 0x%x BARK 0x%x BITE 0x%x; reset ladder follows\n",
+ 	    reboot_s, wdt[TAIMEN_WDT_EN / 4], wdt[0x0c / 4], wdt[TAIMEN_WDT_BARK / 4], wdt[TAIMEN_WDT_BITE / 4]);
+-	IOSleep(1000);
+-	IOLog("TAIMEN WDT: +1 s: STS 0x%x (counting?)\n", wdt[0x0c / 4]);
+-	/* 1. PSCI SYSTEM_RESET, smc conduit (the Linux DTS says smc; worked from the shim) */
+-	{
+-		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+-		register uint64_t x1 __asm__("x1") = 0, x2 __asm__("x2") = 0, x3 __asm__("x3") = 0;
+-		IOLog("TAIMEN RESET: 1. PSCI SYSTEM_RESET via smc\n");
+-		IOSleep(300);
+-		__asm__ volatile("dsb sy; smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
+-		IOLog("TAIMEN RESET: smc returned 0x%llx\n", x0);
+-	}
+-	/* 2. the same through hvc (QHEE may own PSCI for EL1 callers) */
+-	{
+-		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+-		register uint64_t x1 __asm__("x1") = 0, x2 __asm__("x2") = 0, x3 __asm__("x3") = 0;
+-		IOLog("TAIMEN RESET: 2. PSCI SYSTEM_RESET via hvc\n");
+-		IOSleep(300);
+-		__asm__ volatile("dsb sy; hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
+-		IOLog("TAIMEN RESET: hvc returned 0x%llx\n", x0);
+-	}
+-	/* 3. a short watchdog bite: 1 s bark/bite from a fresh pet */
+-	IOLog("TAIMEN RESET: 3. WDT bite in 1 s (BARK/BITE 0x8000)\n");
++	IOSleep(500);
++	IOLog("TAIMEN RESET: PS_HOLD = 0\n");
+ 	IOSleep(300);
+-	wdt[TAIMEN_WDT_BARK / 4] = 0x8000;
+-	wdt[TAIMEN_WDT_BITE / 4] = 0x8000;
+-	wdt[TAIMEN_WDT_RST / 4] = 1;
+-	wdt[TAIMEN_WDT_EN / 4] = 1;
+-	IOSleep(3000);
+-	IOLog("TAIMEN RESET: still here after the bite: STS 0x%x EN 0x%x\n", wdt[0x0c / 4], wdt[TAIMEN_WDT_EN / 4]);
+-	/* 4. PS_HOLD low (Linux msm_restart's fallback); may fault if XPU-protected */
+-	{
+-		volatile uint32_t *ps_hold = (volatile uint32_t *)ml_io_map(0x10ac000, 0x1000);
+-		IOLog("TAIMEN RESET: 4. PS_HOLD = 0\n");
+-		IOSleep(300);
+-		if (ps_hold != NULL) {
+-			*ps_hold = 0;
+-			__asm__ volatile("dsb sy" ::: "memory");
+-		}
+-	}
+-	IOSleep(2000);
++	taimen_halt_restart(0);
+ 	IOLog("TAIMEN RESET: nothing worked; parking\n");
+ 	for (;;) {
+ 		IOSleep(1000000);
+@@ -154,14 +118,20 @@ taimen_wdt_start(void)
+  * granule probe). Without a hook, reboot and panic-restart spin until the
+  * APSS watchdog bites ~32 s later.
+  */
++static volatile uint32_t *taimen_ps_hold;       /* mapped in start(); panic context must not map */
+ static int
+ taimen_halt_restart(unsigned int type __unused)
+ {
+-	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+-	register uint64_t x1 __asm__("x1") = 0;
+-	register uint64_t x2 __asm__("x2") = 0;
+-	register uint64_t x3 __asm__("x3") = 0;
+-	__asm__ volatile("dsb sy; smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
++	/*
++	 * Boot 15 (reset ladder): PSCI SYSTEM_RESET via smc and hvc both return
++	 * with x0 untouched under QHEE, and the APSS WDT bite no longer resets
++	 * since boot 13; pulling PS_HOLD low resets at once and RAM survives.
++	 */
++	if (taimen_ps_hold != NULL) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		*taimen_ps_hold = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
+ 	for (;;) {
+ 		__asm__ volatile("wfi");
+ 	}
+@@ -173,6 +143,7 @@ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	taimen_ps_hold = (volatile uint32_t *)ml_io_map(0x10ac000, 0x1000);
+ 	PE_halt_restart = taimen_halt_restart;
+ #endif
+ 	IOLog("SWEET: starting device-tree platform expert\n");
