@@ -35,7 +35,7 @@ index 1dce730..7562510 100644
  		wdt[TAIMEN_WDT_RST / 4] = 1;
  		IOLog("TAIMEN WDT: pet at %d s\n", t);
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index a6ad5f0..f300903 100644
+index a6ad5f0..d418057 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -56,6 +56,32 @@ _gic_write32(vm_offset_t addr, uint32_t value)
@@ -87,7 +87,25 @@ index a6ad5f0..f300903 100644
  			return gicr_pe_base;
  		}
  
-@@ -268,6 +301,9 @@ pe_init_fiq()
+@@ -235,6 +268,17 @@ pe_init_fiq()
+ 		gicr_size = gicr_size_prop;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* Bring-up: what is really in the redistributor window and the distributor header. */
++	printf("TAIMEN GIC: GICD_IIDR 0x%x GICD_TYPER 0x%x GICD_CTLR 0x%x; GICR window %u frames of 0x%x\n",
++	    gicd_read32(0x8), gicd_read32(0x4), gicd_read32(GICD_CTLR), (unsigned)(gicr_size / GICR_STRIDE), GICR_STRIDE);
++	for (vm_offset_t off = 0; off < gicr_size; off += 0x10000) {
++		vm_offset_t f = gicr_base + off;
++		printf("TAIMEN GIC: +0x%05lx: CTLR 0x%x IIDR 0x%x TYPER 0x%llx WAKER 0x%x | ISENABLER0(+0x100) 0x%x IPRIO0(+0x400) 0x%x ICFGR1(+0xc04) 0x%x\n",
++		    (unsigned long)off, _gic_read32(f + 0x0), _gic_read32(f + 0x4), _gic_read64(f + 0x8), _gic_read32(f + 0x14),
++		    _gic_read32(f + 0x100), _gic_read32(f + 0x400), _gic_read32(f + 0xc04));
++	}
++#endif
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+ 
+@@ -268,6 +312,9 @@ pe_init_fiq()
  		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
  	}
  	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
