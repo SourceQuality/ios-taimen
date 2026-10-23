@@ -8,8 +8,9 @@ started with `fastboot boot` acts as iBoot, Apple's open-source XNU kernel (xnu-
 phone, and the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X** runs on top of it. Nothing is flashed to the
 boot chain. The Pixel 1 history is kept in this repository; the taimen work starts at "taimen: Pixel 2 XL bring-up notes".
 
-> Experimental bring-up, nowhere near a usable phone OS. **XNU has not booted on this phone yet.** What exists today is
-> the shim, the measurements it made, the kernel configuration, and the tooling to put the pieces together.
+> Experimental bring-up, nowhere near a usable phone OS. **XNU runs on this phone with 4K pages** (first boot
+> 2026-10-22: MMU on, VM and pmap bootstrap, screen console, kprintf, then a panic mapping the framebuffer, fixed in
+> 0186). No root filesystem yet, so no iOS userland yet.
 
 ## Status (2026-10-22)
 
@@ -17,10 +18,10 @@ boot chain. The Pixel 1 history is kept in this repository; the taimen work star
 | --- | --- |
 | Bootloader | Google ABL, unlocked. `fastboot boot` of our images works: v0 header, gzip kernel with the stock DTB appended, AVB hash footer to 40 MiB (the shape TWRP has). Nothing flashed. |
 | Shim | `shim/taimen.c` runs on the phone: paints on the ABL splash framebuffer, dumps the display engine, clock and watchdog registers, and PSCI-resets. Stage 2 (`-DSTAGE2`) loads an XNU payload from the boot image's ramdisk through `/chosen` and jumps, with the APSS watchdog armed. |
-| Logs | The shim writes its RAM log to UFS (`shim/ufs_taimen.c`, a port of the Pixel 4 shim's driver) into the empty `align_parti` partition; `tools/taimen/log-pull.sh` reads it back over rooted ADB. Ramoops does not survive a reset on this phone. |
+| Logs | The shim writes its RAM log to UFS (`shim/ufs_taimen.c`, a port of the Pixel 4 shim's driver) into the empty `align_parti` partition; `tools/taimen/log-pull.sh` reads it back over rooted ADB. The kernel's early log goes to the ramoops console zone (0xb0080000); Linux copies it to the alt region on the next Android boot and `/dev/access-ramoops` exposes it: `tools/taimen/xnu-log-pull.sh`. |
 | Display | Measured: framebuffer 0x9d400000, 1440x2880, 32 bpp BGRA, one VIG0 pipe, LM0 → CTL0 → PP0 → INTF1/DSI0 (command mode), **autorefresh off**: every frame needs an MDP CTL0 START (0xc90201c). |
 | CPU | Kryo 280, ARMv8.0, **no 16K translation granule** (ID_AA64MMFR0_EL1 = 0x1122). The kernel is built with 4K pages, which no Qualcomm port has done before; the Exynos ports (Galaxy S8 / A5) are the reference. |
-| Kernel | `TAIMEN` machine config = the sweet/sailfish kernel without 16K pages (patches 0184, 0185): compact 39-bit kernel VA, 4K user VA limit, code signing relaxed for the 16K-signed iOS cache, on-screen boot marks. Builds on GitHub Actions (`machine_config=TAIMEN`), warm runs in about 3.5 minutes. |
+| Kernel | `TAIMEN` machine config = the sweet/sailfish kernel without 16K pages (patches 0184-0186): compact 39-bit kernel VA, 4K user VA limit, code signing relaxed for the 16K-signed iOS cache, on-screen boot marks. Builds on GitHub Actions (default `machine_config=TAIMEN`), warm runs in about 3.5 minutes. **Boots**: 20 early stages through `kprintf startup complete` on the first attempt; its log comes back through the ramoops zone (`tools/taimen/xnu-log-pull.sh`). |
 | Storage, Wi-Fi, GPU, touch | Not started. Taimen uses UFS 2.1 at 0x1da4000, the integrated WCN3990 (the Pixel 4 / topaz Wi-Fi path, not sailfish's PCIe QCA6174), an Adreno 540 (a5xx, sailfish's freedreno path should apply), and an ST FTM4 touch controller. |
 
 Everything measured so far is in [NOTES-taimen.md](NOTES-taimen.md); the address-by-address map from the Pixel 1 code to
