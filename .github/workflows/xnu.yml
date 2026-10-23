@@ -15,8 +15,11 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      package_buildtree:
+        description: also upload the build tree for local compiles (slow, rarely needed)
+        default: "false"
   push:
-    branches: [main]
+    branches: [main, taimen]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -31,6 +34,9 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # Bump to throw away every cache below (sources, built deps, ccache).
+  CACHE_SALT: v1
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
   build:
@@ -51,11 +57,14 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # Shallow clones: the Apple source tags are all we ever check out
+          sed -i '' 's/git clone --branch/git clone --depth 1 --branch/' dxb/build.sh
+          grep -c 'git clone --depth 1 --branch' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja
+          brew install jq gum bash cmake ninja ccache
           # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
@@ -66,16 +75,85 @@ jobs:
           sudo xcode-select -s "$XC"
           xcodebuild -version
           xcrun --find iig
+          echo "XCODE_VER=$(xcodebuild -version | head -1 | tr ' ' '_')" >> "$GITHUB_ENV"
+
+      # --- caches -------------------------------------------------------------
+      # 1. Apple source clones (xnu, bootstrap_cmds, dtrace, AvailabilityVersions,
+      #    libplatform, libdispatch). build.sh skips the clone when the dir exists;
+      #    "Reset cached trees" below puts them back to pristine before patching.
+      - name: Cache Apple source clones
+        uses: actions/cache@v4
+        with:
+          path: |
+            dxb/xnu
+            dxb/bootstrap_cmds
+            dxb/dtrace
+            dxb/AvailabilityVersions
+            dxb/libplatform
+            dxb/libdispatch
+          key: sources-${{ env.CACHE_SALT }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}
+
+      # 2. Built dependencies: mig, ctf tools, availability.pl, installed xnu and
+      #    Libsystem headers, libplatform headers, libfirehose_kernel.a. None of
+      #    them depend on our kernel patches, so the key is the toolchain only.
+      #    The Kernels dir is excluded so a failed build can never hand the Collect
+      #    step a stale kernel.
+      - name: Cache built dependencies (fakeroot)
+        uses: actions/cache@v4
+        with:
+          path: |
+            dxb/fakeroot
+            !dxb/fakeroot/System/Library/Kernels
+          key: fakeroot-${{ env.CACHE_SALT }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.XCODE_VER }}
+
+      # 3. ccache for the kernel compile itself. A new entry is saved every run
+      #    (unique key); the newest matching prefix is restored.
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.CACHE_SALT }}-${{ env.MACOS_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.CACHE_SALT }}-${{ env.MACOS_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
+            ccache-${{ env.CACHE_SALT }}-${{ env.MACOS_VERSION }}-
+
+      - name: Reset cached trees and configure ccache
+        run: |
+          for d in xnu bootstrap_cmds dtrace AvailabilityVersions libplatform libdispatch; do
+            if [ -d "dxb/$d/.git" ]; then
+              git -C "dxb/$d" reset -q --hard
+              git -C "dxb/$d" clean -qfdx
+              echo "reset dxb/$d to $(git -C "dxb/$d" describe --tags --always)"
+            fi
+          done
+          rm -rf dxb/fakeroot/System/Library/Kernels
+          [ -f dxb/fakeroot/.xnu_headers_installed ] && echo "fakeroot: deps cached" || echo "fakeroot: deps will be built"
+          ccache --set-config=max_size=1.5G
+          ccache --set-config=compression=true
+          # sources are checked out fresh each run, so ignore mtimes and let direct mode hit
+          ccache --set-config=sloppiness=time_macros,include_file_mtime,include_file_ctime,pch_defines
+          ccache --set-config=base_dir="$GITHUB_WORKSPACE"
+          ccache -z
+          ccache -p | grep -E 'max_size|sloppiness|cache_dir'
 
       - name: Build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          # xnu's makedefs honour CC/CXX from the environment (origin != default)
+          export CC="ccache $(xcrun -sdk macosx -find clang)"
+          export CXX="ccache $(xcrun -sdk macosx -find clang++)"
+          echo "CC=$CC"
+          bash build.sh
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
 
       - name: Package build tree for local compiles
-        if: always()
+        if: inputs.package_buildtree == 'true'
         run: |
           # Generated headers, config option headers, mig output and the patched
           # source: enough to re-run any single compile command from the log locally.
@@ -90,7 +168,7 @@ jobs:
           ls -la buildtree.tgz
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: inputs.package_buildtree == 'true'
         with:
           name: xnu-buildtree
           path: buildtree.tgz
