@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/taimen_touch.c b/bsd/dev/taimen_touch.c
+index c1e13e0..e228fda 100644
+--- a/bsd/dev/taimen_touch.c
++++ b/bsd/dev/taimen_touch.c
+@@ -351,10 +351,94 @@ ftm_write(const uint8_t *cmd, unsigned n)
+ 	return qup_msg(false, b, MIN(n, (unsigned)sizeof(b)));
+ }
+ 
+-/* Command, then a separate read (write-STOP-read; Linux uses a repeated start, plan 9.1). */
++/*
++ * Write ncmd bytes, repeated START, read len bytes (the REC tag ends with NACK + STOP): one
++ * QUP run with v1 tags START|w, DATA.., START|r, REC|len, as i2c-msm-v2 sends Linux's
++ * write+read pair. Boot 25: with a STOP between the two the FTM4 restarts its read pointer
++ * (chip id read 00 36 36 36 36 36 36 instead of 00 36 70 ..).
++ */
++static int
++qup_xfer(const uint8_t *cmd, unsigned ncmd, uint8_t *buf, unsigned len)
++{
++	uint32_t tags[12];
++	unsigned nt = 0;
++	if (ncmd > 8 || len == 0 || len > tt.rx_max) {
++		return EINVAL;
++	}
++	tags[nt++] = QUP_TAG_START | (TT_ADDR << 1);
++	for (unsigned i = 0; i < ncmd; i++) {
++		tags[nt++] = QUP_TAG_DATA | cmd[i];
++	}
++	tags[nt++] = QUP_TAG_START | (TT_ADDR << 1) | 1u;
++	tags[nt++] = QUP_TAG_REC | len;
++	if (!qup_state(QUP_STATE_RESET) || !(tt_rd(tt.qup, QUP_STATE) & QUP_STATE_MASTER)) {
++		return EIO;
++	}
++	tt_wr(tt.qup, QUP_MX_OUTPUT_CNT, 0);
++	tt_wr(tt.qup, QUP_MX_WRITE_CNT, nt);
++	tt_wr(tt.qup, QUP_MX_INPUT_CNT, 0);
++	tt_wr(tt.qup, QUP_MX_READ_CNT, len);
++	tt_wr(tt.qup, QUP_CONFIG, QUP_MINI_CORE | QUP_N_VAL);
++	tt_wr(tt.qup, QUP_IO_MODE, QUP_REPACK_EN);
++	if (!qup_state(QUP_STATE_RUN)) {
++		return EIO;
++	}
++	tt_wr(tt.qup, QUP_I2C_CLK_CTL, QUP_CLK_400K);
++	if (!qup_state(QUP_STATE_PAUSE)) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < nt; i += 2) {         /* two 16-bit tags per word, low half first */
++		tt_wr(tt.qup, QUP_OUT_FIFO, tags[i] | (i + 1 < nt ? tags[i + 1] << 16 : 0u));
++	}
++	if (!qup_state(QUP_STATE_RUN)) {
++		return EIO;
++	}
++	unsigned pos = 0;
++	int err = EIO;
++	for (unsigned t = 0; t < 20000; t++) {
++		uint32_t bus = tt_rd(tt.qup, QUP_I2C_STATUS) & QUP_BUS_ERRORS;
++		uint32_t qerr = tt_rd(tt.qup, QUP_ERROR_FLAGS) & QUP_ERRORS;
++		uint32_t op = tt_rd(tt.qup, QUP_OPERATIONAL);
++		if (bus || qerr) {
++			tt.last_status = bus;
++			tt.last_err = qerr;
++			tt_wr(tt.qup, QUP_ERROR_FLAGS, qerr);
++			tt_wr(tt.qup, QUP_I2C_STATUS, bus);
++			err = (bus & (1u << 3)) ? ENXIO : EIO;
++			break;
++		}
++		if (op & (QUP_OUT_SVC | QUP_IN_SVC)) {
++			tt_wr(tt.qup, QUP_OPERATIONAL, op & (QUP_OUT_SVC | QUP_IN_SVC));
++		}
++		while (pos < len && (tt_rd(tt.qup, QUP_OPERATIONAL) & QUP_IN_NOT_EMPTY)) {
++			uint32_t v = tt_rd(tt.qup, QUP_IN_FIFO);
++			buf[pos++] = (uint8_t)v;
++			if (pos < len) {
++				buf[pos++] = (uint8_t)(v >> 16);
++			}
++		}
++		if (pos == len) {
++			err = 0;
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned t = 0; t < 1000 && (tt_rd(tt.qup, QUP_I2C_STATUS) & QUP_BUS_ACTIVE); t++) {
++		delay(1);
++	}
++	tt_wr(tt.qup, QUP_STATE, QUP_STATE_RESET);
++	return err;
++}
++
++/* Command, repeated start, read (boot-arg taimentouchstop=1: the old write-STOP-read). */
++static int tt_stop_read;
++
+ static int
+ ftm_read(const uint8_t *cmd, unsigned ncmd, uint8_t *buf, unsigned n)
+ {
++	if (!tt_stop_read) {
++		return qup_xfer(cmd, ncmd, buf, n);
++	}
+ 	int err = ftm_write(cmd, ncmd);
+ 	return err ? err : qup_msg(true, buf, n);
+ }
+@@ -632,6 +716,7 @@ tt_thread(void *arg, wait_result_t result)
+ 		goto out;
+ 	}
+ 	tt_log_pins("before");
++	(void)PE_parse_boot_argn("taimentouchstop", &tt_stop_read, sizeof(tt_stop_read));
+ 	int rails = 1;
+ 	(void)PE_parse_boot_argn("taimentouchrpm", &rails, sizeof(rails));
+ 	if (!tt_power_and_reset(rails != 0)) {
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 386c5a5..f4cdb12 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -44,7 +44,7 @@ static char rootfix_uuid[37];
+ static const char *
+ rootfix_path(const char *path, char *buf, size_t len)
+ {
+-	const char *at = strstr(path, "@HOSTUUID@");
++	const char *at = strnstr(path, "@HOSTUUID@", strlen(path) + 1);
+ 	if (at == NULL) {
+ 		return path;
+ 	}
