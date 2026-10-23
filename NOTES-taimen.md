@@ -366,3 +366,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   original and kept its old binary-plist trailer. **The phone's launchd.plist is corrupt** until a ROOTFIX boot with
   0214 (vnode_setsize to 0 first; remount polled every 50 ms) rewrites it: always boot with ROOTFIX now. The UFS ring
   of a boot that dies this early still holds the previous boot's log; pstore has the new one.
+- 2026-10-23 boot 29 (r35 = +0214 truncate; ROOTFIX): **the user sees the Apple logo on the panel** (the first iOS
+  picture on the Pixel 2 XL's own display). ROOTFIX 39 records, 10 written, 0 failed, launchd fine; no CommCenter and
+  no fairplayd launches any more (boot 24: 65 and 145); 7466 frames, all done, no DSI reset. Still migrating.
+- 2026-10-23 boot 30 (r36 = +0215 remove op, sentinel /private/var/datamigrator/migrate removed): still migrating (the
+  sentinel was not the trigger), but **fast now** (the user: "the bar appears to be moving quickly", 1/4 in ~4 min;
+  fairplayd's loop had been blocking locationd's CoreLocation migrator, sweet NOTES). The reader came ~4 min after the
+  deadline under the migration's load, after autoboot's window had closed (window now deadline + 10 min).
+- 2026-10-23 **boot 31 (r36 + ROOTFIX, taimenreboot=1200): iOS 16 HOME SCREEN on the Pixel 2 XL, touch works.** The
+  migration finished in one run; Setup skipped by the ROOTFIX prefs; SpringBoard shows the home screen (screenshot
+  `../research/taimen/shots/boot31-home.png`: status bar, two "Waiting..." widgets, Photos, App Store, Settings, Search,
+  dock Phone/Safari/Messages). The user: "super laggy, but the touch screen works; the display is smaller than the full
+  pixel screen" (the 1125x2436 canvas is shown 1:1 in the middle). 30 touches logged, 14008 frames / 14008 done / 0 DSI
+  resets in 20 minutes; crashes: assetsd x2, driverkitd. Next: CPU clock (0216 measures it), secondary cores
+  (docs/taimen-smp-plan.md, in progress), MDP hardware scaling (docs/taimen-display-scaling-plan.md, in progress).

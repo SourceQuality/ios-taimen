@@ -8,22 +8,24 @@ started with `fastboot boot` acts as iBoot, Apple's open-source XNU kernel (xnu-
 phone, and the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X** runs on top of it. Nothing is flashed to the
 boot chain. The Pixel 1 history is kept in this repository; the taimen work starts at "taimen: Pixel 2 XL bring-up notes".
 
-> Experimental bring-up, nowhere near a usable phone OS. **XNU runs on this phone with 4K pages** (first boot
-> 2026-10-22: MMU on, VM and pmap bootstrap, screen console, kprintf). Since 2026-10-23 the kernel runs with working
-> timer interrupts and scheduler: IOKit comes up, a kernel thread pets the watchdog every 5 s for as long as asked.
-> No root filesystem mounted yet, so no iOS userland yet.
+> Experimental bring-up, nowhere near a usable phone OS. **iOS 16 reaches the home screen on the Pixel 2 XL's own
+> display and the touch screen works** (boot 31, 2026-10-23): XNU with 4K pages, the unmodified iOS 16.7.16 userland
+> from an HFS+ root on userdata, backboardd and SpringBoard drawing in software on one CPU core. Very slow, and the
+> 1125x2436 iPhone X picture sits 1:1 in the middle of the 1440x2880 panel.
 
 ## Status (2026-10-23)
 
 | Area | State |
 | --- | --- |
-| Bootloader | Google ABL, unlocked. `fastboot boot` of our images works: v0 header, gzip kernel with the stock DTB appended, AVB hash footer to 40 MiB (the shape TWRP has). Nothing flashed. |
-| Shim | `shim/taimen.c` runs on the phone: paints on the ABL splash framebuffer, dumps the display engine, clock and watchdog registers, and PSCI-resets. Stage 2 (`-DSTAGE2`) loads an XNU payload from the boot image's ramdisk through `/chosen` and jumps, with the APSS watchdog armed. |
-| Logs | The shim writes its RAM log to UFS (`shim/ufs_taimen.c`, a port of the Pixel 4 shim's driver) into the empty `align_parti` partition; `tools/taimen/log-pull.sh` reads it back over rooted ADB. The kernel's early log goes to the ramoops console zone (0xb0080000); Linux copies it to the alt region on the next Android boot and `/dev/access-ramoops` exposes it: `tools/taimen/xnu-log-pull.sh`. |
-| Display | Measured: framebuffer 0x9d400000, 1440x2880, 32 bpp BGRA, one VIG0 pipe, LM0 → CTL0 → PP0 → INTF1/DSI0 (command mode), **autorefresh off**: every frame needs an MDP CTL0 START (0xc90201c). |
-| CPU | Kryo 280, ARMv8.0, **no 16K translation granule** (ID_AA64MMFR0_EL1 = 0x1122). The kernel is built with 4K pages, which no Qualcomm port has done before; the Exynos ports (Galaxy S8 / A5) are the reference. |
-| Kernel | `TAIMEN` machine config = the sweet/sailfish kernel without 16K pages (patches 0184-0186): compact 39-bit kernel VA, 4K user VA limit, code signing relaxed for the 16K-signed iOS cache, on-screen boot marks. Builds on GitHub Actions (default `machine_config=TAIMEN`), warm runs in about 3.5 minutes. **Boots**: VM, zones, IOKit registration, timer interrupts and the scheduler all work (boot 10, 2026-10-23); its log comes back through the ramoops zone (`tools/taimen/xnu-log-pull.sh`). Two taimen-specific findings on the way: the bootloader leaves the GIC distributor's affinity routing off, so the redistributor must not be programmed before `GICD_CTLR.ARE_NS` is set (0191); and `ICC_HPPIR0_EL1` / `CNTP_*` reads trap to firmware and reset the phone (0192). Current work: find where the bootstrap thread blocks before the BSD root mount (0194 thread dump). |
-| Storage, Wi-Fi, GPU, touch | Not started. Taimen uses UFS 2.1 at 0x1da4000, the integrated WCN3990 (the Pixel 4 / topaz Wi-Fi path, not sailfish's PCIe QCA6174), an Adreno 540 (a5xx, sailfish's freedreno path should apply), and an ST FTM4 touch controller. |
+| Bootloader | Google ABL, unlocked. `fastboot boot` of our images works: v0 header, gzip kernel with the stock DTB appended, AVB hash footer to 40 MiB (the shape TWRP has). The iOS root is on userdata; the boot slots hold the log reader. |
+| Shim | `shim/taimen.c`: stage 2 (`-DSTAGE2`) loads the XNU payload from the boot image's ramdisk through `/chosen` and jumps, with the APSS watchdog armed; it also logs a DSI/pingpong register dump to UFS (`align_parti`). |
+| Logs, unattended boots | `tools/taimen/autoboot.sh` runs fastboot -> XNU -> log reader -> fastboot with nobody at the phone. The reader (`tools/taimen/mkreader.sh`: TWRP's kernel + a busybox initramfs, on both boot slots) starts after XNU's PS_HOLD reset, hands pstore and the kernel's 4 MiB UFS console ring to Windows as a USB drive, and reboots into fastboot. A kernel panic resets the same way (`debug=0x10000c`). The kernel also prints thumbnails of the last frame into the log (`tools/taimen/shots.py`). |
+| Display | AppleCLCD presents the iPhone X canvas (1125x2436) 1:1 in the middle of the 1440x2880 command-mode DSC panel; every frame is a CPU copy plus MDP CTL0 START (autorefresh is off). The kernel sends nothing before backboardd's first frame: frames sent during the early boot starved the DSI lanes (HS FIFO underflow) and hung its command engine (0206-0212). |
+| CPU | Kryo 280, ARMv8.0, **no 16K translation granule**: the kernel is built with 4K pages. Only CPU0 runs (`cpus=1`). |
+| Kernel | `TAIMEN` machine config = the sweet/sailfish kernel without 16K pages; patches up to `xnu/patches/0215`, built on GitHub Actions in ~3.5 min (`tools/windows/ci-kernel.sh`). Taimen findings on the way: GICD_CTLR.ARE_NS off at handoff (0191), CNTP/ICC_HPPIR0 reads trap (0192), PSCI calls from EL1 do nothing, PS_HOLD resets (0200), the DSI underflow (0207, 0212). |
+| Root | HFS+ (XNU's open-source tree has HFS+, not APFS). `tools/taimen/mkrootfix.py` + xnu 0210-0215 patch it at every boot without reflashing (the Pixel 1 port's userland tweaks: no CommCenter/fairplayd/diagnostics jobs, Setup skipped, ...). |
+| Touch | ST FTM4 on BLSP1 QUP5 (`bsd/dev/taimen_touch.c`, 0209/0211): rails through the RPM over GLINK, I2C with repeated start, events to SweetHID mapped onto the canvas ([docs/taimen-touch-plan.md](docs/taimen-touch-plan.md)). |
+| Not started | Secondary CPUs, CPU clocks, GPU (Adreno 540), Wi-Fi (WCN3990), buttons, audio, display scaling to full screen. |
 
 Everything measured so far is in [NOTES-taimen.md](NOTES-taimen.md); the address-by-address map from the Pixel 1 code to
 taimen is [docs/taimen-porting-map.md](docs/taimen-porting-map.md); the 4K-page work list is
