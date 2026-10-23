@@ -329,3 +329,18 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   RPM L28/L6 over GLINK at 0x778000, TLMM tiles, polled attention pin), SweetHID mapping panel 1440x2880 onto the
   1125x2436 canvas. boot-xnu.sh now passes debug=0x10000c: with 0xc the DB_NMI bit set panicDebugging and a panic
   parked the phone (no watchdog bite since boot 13); DB_REBOOT_ALWAYS sends it through PS_HOLD to the log reader.
+- 2026-10-23 **boot 25 (r30 = +0209 touch, taimenreboot=2700; ended by the user holding power at ~16:36): the FTM4
+  answers.** `SWEET RPM: link up` over GLINK at 0x778000, `L28 3300000 uV set 0/1: ok`, `L6 1800000 uV set 0/1: ok` (RPM
+  works from XNU at EL1 on taimen); before power SDA/SCL read 0, after it 1 (rails on, switch gpio75 low); clocks on
+  (vote 0x808a9d80, QUP5 CBCR 0x1, RCGR XO /1); QUP hw 0x20070000, io 0xa5, 64-byte input FIFO = 32 data bytes per read;
+  INT disable ACKed, CONTROLLER_READY seen after the system reset; chip id read `00 36 36 36 36 36 36`: the first byte
+  is right but repeats, i.e. after the STOP between command and read the FTM4 restarts its read pointer (plan risk 1).
+  0211: reads as one QUP run START|w, DATA.., START|r, REC|len (repeated start). The data migration was ~10 % when the
+  user reset it. A hard reset by the power key also lands in the log reader: logs came back as usual.
+- 2026-10-23 0210 ROOTFIX (no reflash): `bsd/kern/taimen_rootfix.c` writes the files of a ROOTFIX payload blob into
+  the mounted root before launchd; `tools/taimen/mkrootfix.py` builds it from the raw root image (7-Zip reads HFS+;
+  `tools/simg2img.py`): launchd.plist (7 _PanicOnCrash renamed; CommCenter, fairplayd.H2, vmd, ReportCrash, spindump,
+  tailspind, aggregated(.addaily) removed; backboardd CA_BACKDROP_SCALE=1), MediaToolbox StartRecorderServer off,
+  containers, ExtensionKit flag, SpringBoard/Setup prefs, and LastSystemVersion 20H392 in
+  ByHost/com.apple.migration.<IOPlatformUUID>.plist to skip the data migration. r31 failed to build (no strstr in the
+  kernel); r32 = 0210 fixed + 0211.
