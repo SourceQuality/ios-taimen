@@ -1,0 +1,37 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 9c8cc7a..c6330ab 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -5,6 +5,7 @@
+ #include <stdint.h>
+ #include <libkern/section_keywords.h>
+ #include <arm64/proc_reg.h>
++#include <arm64/sweet_early.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+ #include <machine/atomic.h>
+@@ -311,6 +312,24 @@ pe_init_fiq()
+ 	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
+ 	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"),
+ 	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("DAIF"));
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* kprintf has no sink this early (serial_init comes later): the saved early log instead */
++	sweet_early_hex("GIC vtimer intid", sweet_vtimer_intid);
++	sweet_early_hex("GIC gicr pe base", (uint64_t)gicr_pe_base);
++	sweet_early_hex("GIC GICD_CTLR", gicd_read32(GICD_CTLR));
++	sweet_early_hex("GIC GICD_TYPER", gicd_read32(0x4));
++	sweet_early_hex("GIC GICR_WAKER", gicr_read32(GICR_WAKER));
++	sweet_early_hex("GIC GICR_TYPER", gicr_read32(GICR_TYPER));
++	sweet_early_hex("GIC GICR_ISENABLER0", gicr_read32(GICR_ISENABLER0));
++	sweet_early_hex("GIC GICR_IGROUPR0", gicr_read32(GICR_IGROUPR0));
++	sweet_early_hex("GIC ICC_SRE", __builtin_arm_rsr64("ICC_SRE_EL1"));
++	sweet_early_hex("GIC ICC_IGRPEN1", __builtin_arm_rsr64("ICC_IGRPEN1_EL1"));
++	sweet_early_hex("GIC ICC_PMR", __builtin_arm_rsr64("ICC_PMR_EL1"));
++	sweet_early_hex("GIC ICC_CTLR", __builtin_arm_rsr64("ICC_CTLR_EL1"));
++	sweet_early_hex("GIC CNTV_CTL", __builtin_arm_rsr64("CNTV_CTL_EL0"));
++	sweet_early_hex("GIC CNTFRQ", __builtin_arm_rsr64("CNTFRQ_EL0"));
++	sweet_early_hex("GIC DAIF", __builtin_arm_rsr64("DAIF"));
++#endif
+ #else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
