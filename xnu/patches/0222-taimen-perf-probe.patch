@@ -1,0 +1,85 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 69d91c3..f04ab9a 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -249,7 +249,7 @@ perf_turbo(vm_offset_t apc0, vm_offset_t apc1, vm_offset_t cbf, vm_offset_t cbfp
+ 	printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u\n", clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8));
+ }
+ 
+-static void
++static void __attribute__((unused))     /* not called on taimen */
+ perf_clocks(void)
+ {
+ 	vm_offset_t apc0 = ml_io_map(CLK_APC0_PA, 0x1000), apc1 = ml_io_map(CLK_APC1_PA, 0x1000);
+@@ -366,8 +366,10 @@ perf_bandwidth(int cpu)
+ 			memcpy((i & 1) ? a : b, (i & 1) ? b : a, sz);
+ 		}
+ 		uint64_t ns = perf_ns(mach_absolute_time() - t0);
+-		printf("SWEET PERF: cpu%d memcpy %llu MB/s (8 x 4 MiB, cached kalloc)\n",
+-		    cpu, ns ? (8ull * sz * 1000) / ns : 0);
++		uint64_t midr, mpidr;
++		__asm__ volatile ("mrs %0, midr_el1\n\tmrs %1, mpidr_el1" : "=r"(midr), "=r"(mpidr));
++		printf("SWEET PERF: cpu%d memcpy %llu MB/s (8 x 4 MiB, cached kalloc), midr %#llx mpidr %#llx, %llu MHz\n",
++		    cpu, ns ? (8ull * sz * 1000) / ns : 0, midr, mpidr & 0xffff, perf_mhz());
+ 	}
+ 	kfree_data(a, sz);
+ 	kfree_data(b, sz);
+@@ -492,7 +494,7 @@ dbg_run(vm_offset_t dbg, uint32_t ticks)
+ 	return clk_rd(dbg, 0x8) & 0x1ffffffu;
+ }
+ 
+-static uint64_t
++static uint64_t __attribute__((unused)) /* not called on taimen */
+ clk_measure_mhz(uint32_t sel)
+ {
+ 	static vm_offset_t dbg, xo4;
+@@ -525,6 +527,8 @@ perf_thread(void *arg, wait_result_t result)
+ {
+ 	(void)arg;
+ 	(void)result;
++#if !defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* MSM8996 clock and debug-mux addresses: none of this is right on taimen (0222). */
+ 	perf_clocks();
+ 	/*
+ 	 * sweetddr=MHZ: ask the RPM for that DDR rate (bimc_clk, "clk2" id 0,
+@@ -540,6 +544,7 @@ perf_thread(void *arg, wait_result_t result)
+ 		printf("SWEET PERF: DDR vote %d MHz %s: %llu -> %llu MHz\n", ddr, ok ? "acked" : "FAILED",
+ 		    before, clk_measure_mhz(0xad) * 2);
+ 	}
++#endif
+ 	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
+ 		thread_bind(cpu_to_processor(c));
+ 		thread_block(THREAD_CONTINUE_NULL);
+@@ -551,23 +556,28 @@ perf_thread(void *arg, wait_result_t result)
+ 	uint64_t swaps = 0, presents = 0, pabs = 0, t = mach_absolute_time(), gap[4] = {0};
+ 	uint32_t moves = 0;
+ 	for (;;) {
+-		uint64_t mhz[4] = {0, 0, 0, 0};
+-		for (int c = 0; c < 4 && c < (int)ml_get_cpu_count(); c++) {
++		uint64_t mhz[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++		char mline[64];
++		int ml = 0;
++		for (int c = 0; c < 8 && c < (int)ml_get_cpu_count(); c++) {
+ 			thread_bind(cpu_to_processor(c));
+ 			thread_block(THREAD_CONTINUE_NULL);	/* migrate */
+ 			mhz[c] = perf_mhz();
++			ml += snprintf(mline + ml, sizeof(mline) - (size_t)ml, "%s%llu", c ? "/" : "", mhz[c]);
+ 		}
+ 		thread_bind(NULL);
+ 		uint64_t now = mach_absolute_time(), ms = perf_ns(now - t) / NSEC_PER_MSEC;
+ 		uint64_t ds = sweet_fb_stat_swaps - swaps, dp = sweet_fb_stat_presents - presents;
+ 		uint64_t dabs = sweet_fb_stat_present_abs - pabs;
+-		printf("SWEET PERF: MHz %llu/%llu/%llu/%llu  swaps %llu.%llu/s  presents %llu.%llu/s  present avg %llu us\n",
+-		    mhz[0], mhz[1], mhz[2], mhz[3],
++		printf("SWEET PERF: MHz %s  swaps %llu.%llu/s  presents %llu.%llu/s  present avg %llu us\n",
++		    mline,
+ 		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
+ 		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0,
+ 		    dp ? perf_ns(dabs) / 1000 / dp : 0);
++#if !defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 		uint64_t bimc = clk_measure_mhz(0xad);
+ 		printf("SWEET PERF: bimc %llu MHz (DDR %llu MHz)\n", bimc, bimc * 2);
++#endif
+ 		printf("SWEET PERF: swap gaps <20 %llu <37 %llu <54 %llu more %llu ms, touch moves %u\n",
+ 		    sweet_fb_stat_gap[0] - gap[0], sweet_fb_stat_gap[1] - gap[1], sweet_fb_stat_gap[2] - gap[2],
+ 		    sweet_fb_stat_gap[3] - gap[3], sweet_touch_moves - moves);
