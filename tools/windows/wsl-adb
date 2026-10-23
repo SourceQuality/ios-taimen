@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# adb for WSL2: runs Windows' adb.exe (the phone stays attached to Windows; USB
+# passthrough into WSL drops on every reboot of the phone) and turns the local
+# file arguments into Windows paths. Device paths are left alone: only push's
+# sources, pull's destination and install/sideload files are translated.
+# Installed as ~/.local/bin/adb by tools/windows/setup-wsl.sh.
+exe=${ADB_EXE:-/mnt/c/platform-tools/adb.exe}
+w() { wslpath -w "$(realpath -m "$1")"; }
+args=("$@") out=() i=0 sub="" n=${#args[@]}
+# skip global options (-s SERIAL, -d, -e, -t ID ...) to find the subcommand
+while [ $i -lt $n ]; do
+	case ${args[$i]} in
+		-s|-t|-H|-P|-L) out+=("${args[$i]}" "${args[$((i+1))]}"); i=$((i+2));;
+		-*) out+=("${args[$i]}"); i=$((i+1));;
+		*) sub=${args[$i]}; out+=("$sub"); i=$((i+1)); break;;
+	esac
+done
+rest=("${args[@]:$i}") m=${#rest[@]}
+case $sub in
+	push)	for j in "${!rest[@]}"; do a=${rest[$j]}
+			if [ $j -lt $((m-1)) ] && [ "${a#-}" = "$a" ]; then out+=("$(w "$a")"); else out+=("$a"); fi; done;;
+	pull)	for j in "${!rest[@]}"; do a=${rest[$j]}
+			if [ $j -eq $((m-1)) ] && [ $m -ge 2 ] && [ "${a#-}" = "$a" ]; then
+				[ -e "$a" ] || : > "$a" 2>/dev/null; out+=("$(w "$a")")
+			else out+=("$a"); fi; done;;
+	install|sideload|install-multiple)
+		for a in "${rest[@]}"; do if [ -f "$a" ]; then out+=("$(w "$a")"); else out+=("$a"); fi; done;;
+	*)	out+=("${rest[@]}");;
+esac
+exec "$exe" "${out[@]}"

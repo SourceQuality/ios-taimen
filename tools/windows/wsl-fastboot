@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# fastboot for WSL2: runs Windows' fastboot.exe (needs Google's USB driver for
+# the bootloader interface, tools/windows/setup-windows.ps1) and turns arguments
+# that are local files into Windows paths (fastboot boot IMG, flash PART IMG).
+# Installed as ~/.local/bin/fastboot by tools/windows/setup-wsl.sh.
+exe=${FASTBOOT_EXE:-/mnt/c/platform-tools/fastboot.exe}
+out=()
+for a in "$@"; do if [ -f "$a" ]; then out+=("$(wslpath -w "$(realpath "$a")")"); else out+=("$a"); fi; done
+exec "$exe" "${out[@]}"

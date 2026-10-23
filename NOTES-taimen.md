@@ -205,3 +205,31 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   thread calls the PSCI SYSTEM_RESET hook itself. Screen: still the shim text + noise band, so 0193/0197 did not get
   the kernel's frames onto the panel. Tooling: attention.sh (chimes + speech + notification) on "phone did not come
   back"; xnu-log-pull.sh times out instead of blocking forever.
+- 2026-10-23 boot 14 (r20 = 0198): deadline at 84.6 s, `PSCI SYSTEM_RESET now` logged, then the kernel kept running
+  (mount retries to 281 s, user held power). So `smc #0` SYSTEM_RESET from XNU at EL1 does nothing (no panic, no
+  exception logged), and the APSS WDT bite does not reset either since boot 13. 0199: logged reset ladder at the
+  deadline (WDT register dump, smc, hvc, 1 s bite, PS_HOLD).
+- 2026-10-23 boot 15 (r21 = 0199 reset ladder, deadline 60 s): `WDT EN 0x1 STS 0x2b8 BARK 0xfffff BITE 0xfffff`;
+  smc SYSTEM_RESET returned x0 = 0x84000009 untouched; hvc the same; a 1 s WDT bite (BARK/BITE 0x8000, RST, EN) did
+  nothing in 3 s (STS 0xf2); **PS_HOLD = 0 (0x10ac000) reset at once**, RAM log intact, back in Android at +107 s,
+  bootreason "watchdog". So from XNU at EL1 under QHEE: PSCI calls are swallowed, the APSS WDT no longer bites
+  (it did in boots 1-12; unexplained), PS_HOLD works. 0200: PS_HOLD for the deadline and PE_halt_restart.
+- 2026-10-23 root install: TWRP 3.7.0 (../research/taimen/twrp, checksums verified) on boot_a, ios16-root.simg to
+  userdata with `fastboot flash`. Chunks 1-23 went fine; chunk 24 is a 4.4 GiB FILL (zeros) that ABL writes very
+  slowly, and the flash was killed by mistake. Fix: ../research/ipsw-x/ios16-root-tail.simg (DONT_CARE up to 11604 MiB,
+  then the remaining chunks with big FILLs turned into DONT_CARE; 356 MB), flashed in 11 s. **The iOS root is fully
+  on userdata.** Lesson: turn large zero FILLs into DONT_CARE before flashing (userdata was zeroed beforehand).
+- 2026-10-23 **boot 16 (r22 = 0200, ROOT=1, taimenreboot=300): the phone came back into TWRP at +343 s by itself =
+  the PS_HOLD reset works.** The log was NOT retrieved: TWRP's adbd is unreliable (shell hangs, "error: closed",
+  "offline", then not listed although the USB interface is there). Same with Google's adb, so it is TWRP's side;
+  made worse by concurrent adb jobs and `adb kill-server` killing transfers. What sometimes worked: MTP off in TWRP,
+  one kill-server, then commands at once. TWRP 3.6.2 behaves the same; 3.5.2 via fastboot boot booted LineageOS.
+  The UFS console ring (last 4 MiB + 4 KiB of userdata, ufsrw=1) should still hold boot 16's log; TWRP reads gave
+  86 KB, 348 KB, then 0. Rule: one adb user at a time, never kill-server while another job uses adb.
+- On-screen log viewer (no USB needed): shim built with -DLOGVIEW (`EXTRA_CFLAGS=-DLOGVIEW OUT_NAME=taimen-logview
+  shim/build-taimen.sh ../backup/boot_a.img`) reads the ramoops PRZ at 0xb0080000 (sig 0x43474244, start +4, size
+  +8, data +12) and draws at scale 2 a header, the key lines (panic, BSD root, SWEET UFS, mount, launchd, TAIMEN
+  RESET, hfs, exec, Exception, Fatal, kernel trap) and the tail; re-kicks the panel every 5 s. Plan (boot 17):
+  flash it to boot_a, `ROOT=1 BOOT_WAIT=25 NO_ALERT=1 tools/taimen/boot-xnu.sh r22 out/taimen-xnu-r22b
+  taimenreboot=180`; after the PS_HOLD reset ABL boots the viewer from boot_a; photograph the screen. Not run yet.
+- 2026-10-23 move to a Windows PC (WSL2 + Windows adb/fastboot): tools/windows/README.md.
