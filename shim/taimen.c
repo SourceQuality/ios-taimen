@@ -92,7 +92,7 @@ static void save(const char *why)
  */
 static void disp_dump(const char *tag)
 {
-	for (uint32_t o = 0; o < 0x200; o += 0x20) {
+	for (uint32_t o = 0; o < 0x400; o += 0x20) {
 		uint64_t a = 0xc994000UL + o;
 		log_printf("DISP %s DSI0+0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, o,
 			   rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16), rd32(a + 20),

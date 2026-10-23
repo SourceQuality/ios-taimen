@@ -1,0 +1,131 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index f4cdb12..52d60f6 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -17,6 +17,7 @@
+ #include <sys/fcntl.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
++#include <sys/mount_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
+@@ -137,6 +138,16 @@ taimen_rootfix(void)
+ 	}
+ 	uint32_t count = h[1], done = 0, skipped = 0, failed = 0;
+ 	vfs_context_t ctx = vfs_context_kernel();
++	/*
++	 * Boot 26: every write failed with EROFS. The root comes up read-only and launchd's
++	 * boot tasks remount it read-write later (mount -uw /), too late for launchd.plist.
++	 * Do that update here; launchd's own then finds it done.
++	 */
++	if (rootvnode != NULLVP && vfs_isrdonly(vnode_mount(rootvnode))) {
++		int err = kernel_mount("hfs", NULLVP, NULLVP, "/", NULL, 0, MNT_UPDATE, 0, ctx);
++		printf("TAIMEN ROOTFIX: root was read-only, update to read-write: %s %d\n",
++		    err ? "error" : "ok", err);
++	}
+ 	const uint8_t *p = b + 8;
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		if (p + 24 > end) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 14de358..83b5916 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -98,6 +98,7 @@ extern "C" void sweet_fbcon_blank(bool blank);
+ extern "C" bool sweet_fbcon_dcs(uint8_t cmd, uint8_t param);
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ extern "C" void sweet_fbcon_wait_idle(void);
++extern "C" bool sweet_fbcon_gui_started;       /* pe_serial.c, 0212 */
+ #endif
+ #include "../../../bsd/dev/sweet_gpu.h"
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+@@ -945,6 +946,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	sweet_fbcon_gui_started = true;         /* from now on frames go to the panel (0212) */
+ 	if (!fGpu) {
+ 		sweet_fbcon_wait_idle();        /* no CPU copy during a transfer (pe_serial.c) */
+ 	}
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 1d18b3a..ce3285a 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -100,7 +100,7 @@ taimen_fb_probe(int t)
+ 
+ /*
+  * Boot 20: the panel memory holds the kernel's frames and the MDP completes every kickoff
+- * without a DSI error, so compare the link with the shim's: DSI0 (0xc994000) and PP0
++ * without a DSI error, so compare the link with the shim's: DSI0 (0xc994000, 0x000-0x3ff: DSC settings sit at 0x2a8) and PP0
+  * (0xc971000) register dumps in the shim's format ("DISP tag DSI0+0x000: 8 words"; the STAGE2
+  * shim logs the same just before the jump), and how often DSI0 STATUS0 reads busy.
+  */
+@@ -119,7 +119,7 @@ taimen_disp_dump(const char *tag)
+ 			return;
+ 		}
+ 	}
+-	for (uint32_t o = 0; o < 0x200; o += 0x20) {
++	for (uint32_t o = 0; o < 0x400; o += 0x20) {
+ 		volatile uint32_t *d = taimen_dsi0 + o / 4;
+ 		IOLog("DISP %s DSI0+0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, o,
+ 		    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 2b58a92..11228fb 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -57,10 +57,20 @@ static volatile uint32_t *early_intr = (volatile uint32_t *)(uintptr_t)(TAIMEN_M
+  * START while a frame is in flight desyncs the DSC panel (noise band, frozen
+  * picture): that is what boots 1-9 did from here and from start.s.
+  */
++/*
++ * Boots 23-26: frames sent during the early boot's memory traffic starved the DSI lanes (HS
++ * FIFO underflow), and the DSI reset that recovers from it left the panel black (boot 26). The
++ * bands still go into the panel memory; nothing is sent before backboardd's first frame (0212).
++ */
++static int taimen_early_kicks;     /* 0: the early bands are never sent */
++
+ static void
+ taimen_kick(void)
+ {
+ 	uint64_t f, t0, t;
++	if (!taimen_early_kicks) {
++		return;
++	}
+ 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+ 	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
+ 	do {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index b1c7e3b..4b694f4 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -855,9 +855,30 @@ fbcon_frame_done(uint64_t now)
+ 	return false;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * Set by AppleCLCD's first present. Before it the console only draws into the panel memory:
++ * a frame sent during the early boot's memory traffic starved the DSI (boots 23-26) and the
++ * reset that recovers it left the panel black (boot 26). Boot-arg taimenconsolekick=1 sends
++ * the console's frames from the start as before.
++ */
++bool sweet_fbcon_gui_started;
++static int fbcon_console_kicks = -1;
++#endif
++
+ static bool
+ fbcon_try_kick(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (fbcon_console_kicks < 0) {
++		int v = 0;
++		(void)PE_parse_boot_argn("taimenconsolekick", &v, sizeof(v));
++		fbcon_console_kicks = v != 0;
++	}
++	if (!sweet_fbcon_gui_started && !fbcon_console_kicks) {
++		return true;    /* nothing sent; callers need not wait */
++	}
++#endif
+ 	if (!os_atomic_cmpxchg(&fbcon_kick_lock, 0u, 1u, acquire)) {
+ 		return false;
+ 	}
