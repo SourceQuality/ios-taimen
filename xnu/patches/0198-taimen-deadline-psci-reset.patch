@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 24624ad..526f063 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -11,6 +11,9 @@
+ #include <IOKit/IOLib.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++static int taimen_halt_restart(unsigned int type);
++#endif
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -69,7 +72,9 @@ taimen_wdt_thread(void *arg)
+ 		}
+ 		IOSleep(TAIMEN_WDT_PET_S * 1000);
+ 	}
+-	IOLog("TAIMEN WDT: taimenreboot=%d reached, no more pets: reset follows\n", reboot_s);
++	IOLog("TAIMEN WDT: taimenreboot=%d reached: PSCI SYSTEM_RESET now (the APSS WDT did not bite after the pets stopped in boot 13)\n", reboot_s);
++	IOSleep(500);
++	taimen_halt_restart(0);
+ 	for (;;) {
+ 		IOSleep(1000000);
+ 	}

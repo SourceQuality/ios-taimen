@@ -37,6 +37,7 @@ for i in $(seq 1 240); do
 	sleep 1
 done
 echo "+$(( $(date +%s)-t0 ))s: back in ${back:-nothing (hung? power key needed)}"
+[ -n "$back" ] || "$(cd "$(dirname "$0")" && pwd)/attention.sh" "Pixel 2 XL did not come back after the boot: check the screen, then hold power 10 seconds"
 if [ "$back" = "android" ]; then
 	echo "bootreason: $(timeout 5 adb shell getprop ro.boot.bootreason 2>/dev/null)"
 	"$P/tools/taimen/log-pull.sh" "$out/shim-log.txt" | grep -E 'LOADER|saved|EXC|wdt' || true

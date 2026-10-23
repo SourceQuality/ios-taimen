@@ -9,7 +9,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - Bootloader TMZ30m, `unlocked:yes`, `is_oem_unlocked:yes`, `secure:yes`, `kernel:uefi` (Google ABL).
   `max-download-size:0x20000000` (512 MiB). Slots a/b, both bootable, current slot a.
 - Baseband g8998-00034-2006052136. Runs LineageOS (Android 12, fingerprint RP1A.201005.004.A1).
-- Partition backups (22, sha256-verified on device) in `../backup/` (never committed); sizes in `../backup/partition-sizes.txt`.
+- Partition backups (22, sha256-verified on device) in `../backup/` (never committed); sizes in `backup/partition-sizes.txt`.
   boot: 40 MiB (0x2800000); dtbo 8 MiB; persist 32 MiB; userdata ~53 GB (`sda13`).
 - Block devices: boot_a `sde8`, boot_b `sde22`, dtbo_a `sde13`, vbmeta_a `sde12`, persist `sda4`,
   modemst1/2 `sdf1`/`sdf2`, fsc `sdf3`, fsg `sde32`, xbl_a `sdb1`, abl_a `sde6`. UFS host at `1da4000.ufshc`.
@@ -77,7 +77,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   intf 0x6b000+, pp 0x71000+, dsc 0x81000): ran to the end, `bootreason=reboot`. So the MDSS reads, the WDT
   write and the CTL0 START kick are all fine; shim 1 died on the two wrong offsets (INTF 0x6a800 / PP 0x70000).
 - 2026-10-22 **UFS log channel works.** Pixel 4 shim's UFSHCI driver ported to 0x1da4000 (`shim/ufs_taimen.c`);
-  log written to `align_parti` (sda12, 6 MiB all-zero GPT pad, backed up to `../backup/align_parti.img`), read back
+  log written to `align_parti` (sda12, 6 MiB all-zero GPT pad, backed up to `backup/align_parti.img`), read back
   with `tools/taimen/log-pull.sh` from rooted Android. ABL leaves the host enabled: ver=0x210 (UFSHCI 2.1),
   cap=0x1587001f, hce=1, hcs=0x10f, its UTRL at 0x9bc39000. TUR ok, GPT parsed, partition first=0x14aa08
   blocks=0x5f8 (4K units), WRITE(10)+SYNC ok. Replaces ramoops.
@@ -174,3 +174,34 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   write the right addresses; the fault is cadence: ~20 bare CTL0 STARTs ~1 ms apart during the first command-mode
   frame desync the DSC panel (noise band at the top, picture frozen). 0193: early kicks wait for PP0 done, clear it,
   then START (the shim's sequence); start.s no longer STARTs at all.
+- 2026-10-23 boot 11 (r16 = 0193 kick cadence + 0194 thread dump): 20 kernel threads, all idle/waiting; **the
+  bootstrap thread (tid 101) sleeps on `max_cpus_initialized`** = ml_wait_max_cpus(), no bsd_init / IOFindBSDRoot
+  marker. Nobody calls ml_set_max_cpus because no CPU driver starts: the built-in SweetCPU personality
+  (iokit/KernelConfigTables.cpp) has IONameMatch 'qcom,kryo' and the taimen ADT cpu nodes say 'qcom,kryo280'.
+  0195: match both. (Screen outcome of the 0193 cadence fix not yet observed: needs a photo during a boot.)
+- 2026-10-23 **boot 12 (r17 = 0195 CPU personality): CPU driver starts ("SWEET CPU: cpu=0 mpidr=0x0 came alive"),
+  bsd_init entered, MAC/AMFI/Sandbox stand-ins, HFS registered, networking stubs, IOFindBSDRoot entered.** Then
+  panic `pmap_ttne: Attempt to demote L2 block, tte=0x6000009da0060d, addr=0xfffffff00099a000` from
+  sweet_ufs_rootdev -> io_map -> pmap_map: kernel_map's io_submap was carved at 0xfffffff000000000, right over the
+  20 early alias blocks (FB/log/MDP) at 0xfffffff000200000+. The arm64 kmem_init reserves only pmap_virtual_region 0
+  = [gVirtBase & 8M, virtual_space_start) and region 1; the 1 GB L1 slot below the physmap is free VA. 0196: TAIMEN
+  region 2 = [link & ~(1G-1), gVirtBase & 8M) reserved.
+- 2026-10-23 ~07:05-10:50 interruption: the session hit its usage limit mid-chain. The 0196 chain had NOT committed
+  (patch file empty), "build 18" re-watched build 17 and "boot 13" re-booted the r17 kernel (same panic, nothing new),
+  and the scratchpad (patched xnu tree, agent transcripts) was wiped. Rebuilt the tree the CI way (dxb at the pinned
+  SHA + xnu-8796.141.3 + dxb patches + 0001-0195; the libpthread/IONetworking staging scripts need xcrun so those
+  files and patches 0031/0041 are absent locally; irrelevant for patch authoring). Four audits ordered by the user are
+  in port/docs/taimen-audit-*.md: personalities/ADT (no second kryo-class mismatch), display/touch/GPU/Wi-Fi
+  (present() never kicks on the 32 bpp path = SpringBoard blocker; touch protocol must be rewritten for FTM4),
+  platform/SMP (per-CPU GIC diagnostics would blow the 5 s secondary budget; no restart hook), root path (UFS driver
+  64-bit clean; boot the root with ufsrw=1, cs_enforcement_disable=1, no taimenreboot).
+- 0196 (re-done) reserve the alias 1 GB slot; 0197: present() kicks on taimen, bl_on=0, PE_halt_restart = PSCI
+  SYSTEM_RESET, GIC diagnostics once. Build 19.
+- 2026-10-23 **boot 13 (r19 = 0196 + 0197): the UFS root path works.** `SWEET UFS: "userdata" on LUN 0: first block
+  0x14b000, 54307 MiB, read-only, DMA at 0x1029af000` (DMA above 4 GiB fine), `BSD root: ufsroot0`, then
+  `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 20` / `cannot mount root, errno = 19` every 5 s for
+  16 minutes (userdata is still LineageOS; expected). The kernel ran 982 s stably until the user held power. The APSS
+  WDT did NOT bite after the pets stopped at 144 s (it did in boots 9-12; cause unknown). 0198: at the deadline the pet
+  thread calls the PSCI SYSTEM_RESET hook itself. Screen: still the shim text + noise band, so 0193/0197 did not get
+  the kernel's frames onto the panel. Tooling: attention.sh (chimes + speech + notification) on "phone did not come
+  back"; xnu-log-pull.sh times out instead of blocking forever.

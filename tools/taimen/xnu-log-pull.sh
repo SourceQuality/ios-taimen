@@ -12,7 +12,13 @@ set -euo pipefail
 out=${1:-xnu-log.txt}
 adb root >/dev/null 2>&1 || true
 sleep 2
-adb wait-for-device
+here=$(cd "$(dirname "$0")" && pwd)
+# Never block forever: a phone that does not come back needs the human (power key).
+if ! timeout "${XNU_LOG_WAIT:-180}" adb wait-for-device; then
+    "$here/attention.sh" "Pixel 2 XL did not come back after the boot: hold power 10 seconds"
+    echo "phone not back within ${XNU_LOG_WAIT:-180} s" >&2
+    exit 2
+fi
 # TWRP (the boot slot during the root phase) has pstore but does not mount it
 adb shell 'mountpoint -q /sys/fs/pstore 2>/dev/null || mount -t pstore pstore /sys/fs/pstore 2>/dev/null; true' >/dev/null 2>&1 || true
 raw="$out.raw"
