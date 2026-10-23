@@ -1,0 +1,161 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bf5fad3..302c324 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -96,6 +96,9 @@ extern "C" void sweet_fbcon_kick(bool force);           /* pexpert/arm/pe_serial
+ extern "C" void sweet_fbcon_flip(uint64_t pa, uint32_t stride);
+ extern "C" void sweet_fbcon_blank(bool blank);
+ extern "C" bool sweet_fbcon_dcs(uint8_t cmd, uint8_t param);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++extern "C" void sweet_fbcon_wait_idle(void);
++#endif
+ #include "../../../bsd/dev/sweet_gpu.h"
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ /* Read by bsd/dev/sweet_perf.c. */
+@@ -941,6 +944,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (!fGpu) {
++		sweet_fbcon_wait_idle();        /* no CPU copy during a transfer (pe_serial.c) */
++	}
++#endif
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 3e80f48..1d18b3a 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -44,6 +44,8 @@ extern "C" void sweet_fbcon_regs(uint32_t r[10]);
+ extern "C" void sweet_fb_screenshot(const char *tag);  /* SweetFramebuffer.cpp */
+ extern "C" void sweet_log_kick(void);                  /* bsd/dev/sweet_ufs.c */
+ extern "C" uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
++extern "C" uint64_t sweet_fbcon_stat_dsi_resets;       /* pe_serial.c, 0207 */
++extern "C" uint32_t sweet_fbcon_last_dsi_fifo;
+ 
+ /*
+  * Boot 19: the MDP takes every kickoff (PP0 done for each) with the shim's exact register
+@@ -146,6 +148,8 @@ taimen_fb_report(int t)
+ 	sweet_fbcon_regs(r);
+ 	IOLog("TAIMEN FB %d: kicks %llu done %llu timeout %llu INTR_EN 0x%x STS 0x%x\n",
+ 	    t, sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout, r[0], r[1]);
++	IOLog("TAIMEN FB %d: DSI resets %llu, last FIFO_STATUS 0x%x\n",
++	    t, sweet_fbcon_stat_dsi_resets, sweet_fbcon_last_dsi_fifo);
+ 	IOLog("TAIMEN FB %d: CTL0 LAYER 0x%x TOP 0x%x FLUSH 0x%x\n", t, r[2], r[3], r[4]);
+ 	IOLog("TAIMEN FB %d: VIG0 SIZE 0x%x SRC0 0x%x YSTR 0x%x DSI0 0x%x 0x%x\n",
+ 	    t, r[5], r[6], r[7], r[8], r[9]);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 070cce1..b1c7e3b 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -783,6 +783,55 @@ static uint32_t fbcon_kick_lock;        /* kickoffs and DSI commands */
+ static uint64_t fbcon_kick_last;
+ static bool fbcon_kick_pending = true;  /* the shim's last frame may still be out */
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * Taimen, boot 22: a kernel frame starved the DSI lanes (FIFO_STATUS 0x99991080 = HS FIFO
++ * underflow on DLN0-3), after which the DSI command engine stayed busy for good (STATUS0 0x5
++ * in 20000 of 20000 reads, lanes out of LP-11) and nothing more reached the panel, although
++ * PP0 kept reporting done. The shim, idle between frames, reads STATUS0 0 and no underflow.
++ * So: a frame is only done once DSI0 is idle too, and a DSI0 that underflowed or stayed busy
++ * past the 50 ms timeout gets the msm-4.4 mdss_dsi_sw_reset() (CTRL enable off, CLK_CTRL all
++ * on, SOFT_RESET pulse, CTRL back) and its latched FIFO errors cleared before the next START.
++ */
++#define DSI_CTRL                (0x004 / 4)
++#define DSI_STATUS0             (0x008 / 4)
++#define DSI_FIFO_STATUS         (0x00c / 4)
++#define DSI_SOFT_RESET          (0x118 / 4)
++#define DSI_CLK_CTRL            (0x11c / 4)
++#define DSI_STATUS0_BUSY        0x5u            /* CMD_MODE_ENGINE_BUSY | CMD_MODE_MDP_BUSY */
++#define DSI_FIFO_HS_UNDERFLOW   0x88880000u     /* DLN0..3_HS_FIFO_UNDERFLOW */
++uint64_t sweet_fbcon_stat_dsi_resets;
++uint32_t sweet_fbcon_last_dsi_fifo;
++
++static void
++fbcon_dsi_recover(void)
++{
++	volatile uint32_t *d = fbcon_dsi;
++
++	if (d == NULL) {
++		return;
++	}
++	uint32_t fifo = d[DSI_FIFO_STATUS];
++	if (!(fifo & DSI_FIFO_HS_UNDERFLOW) && !(d[DSI_STATUS0] & DSI_STATUS0_BUSY)) {
++		return;
++	}
++	uint32_t ctrl = d[DSI_CTRL];
++	d[DSI_CTRL] = ctrl & ~1u;
++	__builtin_arm_dsb(DSB_SY);
++	d[DSI_CLK_CTRL] = 0x23f;
++	__builtin_arm_dsb(DSB_SY);
++	d[DSI_SOFT_RESET] = 1;
++	__builtin_arm_dsb(DSB_SY);
++	d[DSI_SOFT_RESET] = 0;
++	__builtin_arm_dsb(DSB_SY);
++	d[DSI_CTRL] = ctrl;
++	d[DSI_FIFO_STATUS] = fifo;              /* write-1-to-clear */
++	__builtin_arm_dsb(DSB_SY);
++	sweet_fbcon_last_dsi_fifo = fifo;
++	sweet_fbcon_stat_dsi_resets++;
++}
++#endif
++
+ /* fbcon_kick_lock held: the previous frame is done (or 50 ms passed). */
+ static bool
+ fbcon_frame_done(uint64_t now)
+@@ -790,7 +839,12 @@ fbcon_frame_done(uint64_t now)
+ 	if (!fbcon_kick_pending) {
+ 		return true;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (fbcon_intr != NULL && (*fbcon_intr & FBCON_PP0_DONE) &&
++	    (fbcon_dsi == NULL || !(fbcon_dsi[DSI_STATUS0] & DSI_STATUS0_BUSY))) {
++#else
+ 	if (fbcon_intr != NULL && (*fbcon_intr & FBCON_PP0_DONE)) {
++#endif
+ 		sweet_fbcon_stat_done++;
+ 		return true;
+ 	}
+@@ -810,6 +864,9 @@ fbcon_try_kick(void)
+ 	uint64_t now = mach_absolute_time();
+ 	bool ok = fbcon_frame_done(now);
+ 	if (ok) {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		fbcon_dsi_recover();
++#endif
+ 		if (fbcon_intr != NULL) {
+ 			fbcon_intr[1] = FBCON_PP0_DONE;
+ 		}
+@@ -947,6 +1004,29 @@ sweet_fbcon_kick(bool force)
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * AppleCLCD: wait (50 ms at most) for the frame in flight before copying the next one into
++ * the panel memory, so the CPU copy does not compete with the MDP fetch that starved the
++ * DSI lanes in boot 22.
++ */
++void sweet_fbcon_wait_idle(void);
++void
++sweet_fbcon_wait_idle(void)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint64_t lim = gPEClockFrequencyInfo.timebase_frequency_hz / 20;
++
++	while (fbcon_kick_pending && fbcon_intr != NULL && mach_absolute_time() - t0 < lim) {
++		if ((*fbcon_intr & FBCON_PP0_DONE) &&
++		    (fbcon_dsi == NULL || !(fbcon_dsi[DSI_STATUS0] & DSI_STATUS0_BUSY))) {
++			return;
++		}
++		delay(200);
++	}
++}
++#endif
++
+ /*
+  * TAIMEN FB report (SweetPlatformExpert.cpp): the MDP/DSI registers a
+  * kickoff depends on, 0 where nothing is mapped. The kernel's frames have

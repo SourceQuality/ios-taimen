@@ -285,3 +285,30 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   to the PC as a USB drive labelled TAIMENLOG, and reboots into fastboot (`rebootbl bootloader`); a 150 s guard
   reboots into fastboot whatever happens. `tools/taimen/reader-pull.ps1` copies the drive on Windows;
   `tools/taimen/autoboot.sh KERNEL OUTDIR args` runs fastboot -> XNU -> reader -> logs -> fastboot with no hands.
+- 2026-10-23 log reader first run (boot 19's logs): fastboot 15:22:23 -> reader drive on the PC 19 s after reboot
+  -> fastboot again 15:23:30, no hands. Boot 19's whole UFS log (274 KB, ring not wrapped) shows **SpringBoard
+  running** (exec, AppleKeyStore, /product reads, no crash) and **backboardd swapping 1125x2436 BGRA frames**
+  between surfaces 2 and 3 (`SWEET FB: swap N layer 0 surface 2 1125x2436 fmt 0x42475241 bpr 4608`). Crashes only
+  CommCenter (x3, no baseband) and driverkitd (sig 9). hfs mounted iOSRoot read-write after a journal replay; "root
+  volume is not authenticated; continuing unsealed". The UFS ring missed the last ~5 s (flush every 10 s; 0205 kicks
+  it before PS_HOLD); pstore has them.
+- 2026-10-23 **boot 20 (r25 = +0204), first fully unattended run** (autoboot.sh: push -> CI -> boot -> reader ->
+  logs -> fastboot 15:31:22). **The kernel's writes reach the panel memory**: `WC write 5a5a1234 over ff000000,
+  Device reads 5a5a1234`; rows 60/1440/2870 of 0x9d400000 read black 0xff000000 (AppleCLCD's clear, not the shim's
+  picture), row 2870 gets white console pixels from 40 s, row 1440's checksum changes once frames arrive and then
+  stays (static picture). MDP: kicks 4043 done 4042 by 100 s, registers as in the shim, no DSI error bit. So RAM
+  is right and the MDP sends; whatever keeps the shim's picture on the glass sits between the MDP and the panel.
+  backboardd's power request (sel 12) was "on": no blanking. Next: 0206 + shim DSI0/PP0 dumps to compare.
+- 2026-10-23 **boot 22 (r27 = +0205 screenshots, +0206 DSI0/PP0 dumps): iOS draws its boot screen; the DSI hangs.**
+  Kernel screenshot of backboardd's last frame (`../out/taimen-xnu-r27/shots/end-surface2.png`, 1/5): the iOS boot
+  screen, Apple logo and progress bar (data migration on first boot), ~15 % at 120 s. The panel memory thumbnail
+  holds the same picture centered, console text in the borders. Shim (frames show) vs kernel (they do not):
+  DSI0 STATUS0 0x0 / busy 0 of 20000 reads vs 0x5 / busy 20000 of 20000 (at 0 s and 60 s); FIFO_STATUS 0x11111080
+  vs **0x99991080 = HS FIFO underflow on DLN0-3**; +0xa8 lane status 0x1f1f vs 0x1f00 at 60 s (lanes out of LP-11);
+  PP0 line count 0xb40 vs 0x692; DSI0 +0x120 (CLK_STATUS) 0x2343 vs 0x8037c3. Everything else in DSI0 0x000-0x1ff
+  and PP0 is identical. One starved transfer hung the DSI command engine for good (PP0 still says done each kick),
+  which also explains the old photos' noise band at the top (the frame that broke). **0207**: recover with the
+  msm-4.4 `mdss_dsi_sw_reset()` (CTRL off, CLK_CTRL 0x23f, SOFT_RESET 0x118 pulse, CTRL back, W1C the FIFO errors)
+  when the FIFO underflowed or the DSI is still busy at the 50 ms timeout; done = PP0 done and DSI idle; AppleCLCD
+  waits for the frame in flight before copying. ROOT boots add `sweetfb_noconsole=1`. pstore had no XNU text this
+  time (0 bytes): the screenshots wrapped the 1 MiB PRZ; the 4 MiB UFS ring held all 1.6 MB.

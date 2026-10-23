@@ -12,9 +12,10 @@ args=${*:-}
 # ROOT=1: the iOS root on userdata (tools/taimen/install-root.sh). The args are the Pixel 1
 # README's line minus its GPU/Wi-Fi parts plus what docs/taimen-audit-root-path.md asks for:
 # ufsrw=1 (HFS+ journal replay, UFS console ring), cs_enforcement_disable=1 (4K pages vs the
-# 16K-signed cache), the userland switches dyld/launchd/watchdogd read from kern.bootargs.
+# 16K-signed cache), the userland switches dyld/launchd/watchdogd read from kern.bootargs;
+# sweetfb_noconsole=1: no kernel text over the GUI (the log reader brings the console back).
 if [ "${ROOT:-0}" = 1 ]; then
-	args="rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin ${args}"
+	args="rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
 fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"
