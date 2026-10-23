@@ -319,3 +319,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (3647 kicks, 3645 done, 2 timeouts). Screenshots: the boot progress screen again, bar ~22 % at 180 s (~15 % at 120 s
   in boot 22): first-boot data migration, ~7 %/min. The panel memory keeps the console text the kernel drew in the
   borders before the first swap muted it. Next: boot 24, 25 minutes, to let the migration finish on screen.
+- 2026-10-23 **boot 24 (r28, taimenreboot=1500, sweetprof=-): 25 minutes of iOS, DSI stable.** 40552 kicks, 40550
+  done, still only the 2 early DSI resets. Screenshots: boot progress at ~1 % at 60 s and ~85 % at 1500 s (slower towards
+  the end): **the first-boot data migration starts over on every boot** (boot 23 had ~22 % at 180 s), so it needs one
+  uninterrupted run of 30+ minutes; once done it is recorded on the read-write root. 65 CommCenter crashes (no
+  baseband), fairplayd.H2 and bluetoothd relaunched 145 times each, SpringBoard alive throughout. Boot 25: r30 (0209
+  touch driver) for 45 minutes.
+- 2026-10-23 0209 taimen touch: `bsd/dev/taimen_touch.c` from `docs/taimen-touch-plan.md` (FTM4 at 0x49 on BLSP1 QUP5,
+  RPM L28/L6 over GLINK at 0x778000, TLMM tiles, polled attention pin), SweetHID mapping panel 1440x2880 onto the
+  1125x2436 canvas. boot-xnu.sh now passes debug=0x10000c: with 0xc the DB_NMI bit set panicDebugging and a panic
+  parked the phone (no watchdog bite since boot 13); DB_REBOOT_ALWAYS sends it through PS_HOLD to the log reader.
