@@ -54,7 +54,7 @@ TAIMEN = dict(
     phys_base=0x100000000, mem_size=0x20000000,  # 512 MiB above 4 GB to start (4K kernels failed above that on the S8)
     gicd=0x17a00000, gicr=0x17b00000,  # redistributor stride 0x20000 (the kernel default)
     vtimer=19,  # Qualcomm PPI numbering, like sweet
-    fb=0x9d400000, fb_size=0x2400000, fb_w=1440, fb_h=2880, fb_bpp=32,  # VIG0: BGRA, stride 0x1680
+    fb=0x9d400000, fb_size=0x1000000, fb_w=1440, fb_h=2880, fb_bpp=32,  # VIG0: BGRA, stride 0x1680; 1440*2880*4 = 0xfd2000 (the splash region is 36 MiB, map only the panel)
     fb_kickoff=0xc90201c,  # MDP CTL0 START: PP0 autorefresh is off, every frame is requested
     ufs=0x1da4000, ufs_size=0x2500,
     # MPIDR, cluster, max clock: 4 x Kryo 280 silver (A53-class) + 4 x gold (A73-class)

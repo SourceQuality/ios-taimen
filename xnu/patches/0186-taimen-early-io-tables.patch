@@ -1,0 +1,20 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index acdc2ca..9c34592 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2359,6 +2359,15 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	va_l1 = dynamic_memory_begin;
+ 	va_l1_end = va_l1 + ((2 + (mem_segments * 10)) << 20);
+ 	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
++#if defined(TAIMEN)
++	/*
++	 * The console maps the framebuffer once (sweet-fbcon reg) and
++	 * initialize_screen maps it again (16.6 MB each on the 1440x2880 panel),
++	 * and the SoC drivers map dozens of pages: with 512 MiB of RAM the
++	 * formula above gave 40 MB and pmap_map_bd ran off the end (first boot).
++	 */
++	va_l1_end += (64ULL << 20);
++#endif
+ 	va_l1_end = (va_l1_end + 0x00000000007FFFFFULL) & 0xFFFFFFFFFF800000ULL;
+ 
+ 	cpu_l1_tte = cpu_tte + ((va_l1 & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT);
