@@ -250,3 +250,38 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   No other port mentions M2Scaler; first suspect is the missing /product (sweet: MobileGestalt needs it for the
   display mode). Deadline at 1376.296 s (`WDT EN 0x1 STS 0x5003b BARK 0xfffff`), `TAIMEN RESET: PS_HOLD = 0` at
   1376.798 s, log lines continue ~0.3 s after it, then the reset and the viewer. Screen during the run: shim text.
+- 2026-10-23 boot 18 (r22, ROOT=1, taimenreboot=120, ADT WITH /product, 12456 bytes): photo
+  `../research/taimen/boot18-logview.jpg`. Same picture: launchd starts daemons (contextstored, dasd, logd_helper,
+  iconservicesagent, nanoregistryd, aggregated, audioclocksyncd, analyticsd, passd, apsd, carkitd, geod, securityd,
+  mobileactivationd, coreduetd, UserEventAgent, 36-54 s) and backboardd still writes `IOServiceMatchingfailed for:
+  AppleM2ScalerCSCDriver` every ~17 ms to the end (deadline 146.3 s, PS_HOLD at 146.8 s). So /product is not the
+  cause. The ring wrapped again (oldest kept line ~36 s). Cause found in the kernel: AppleCLCD reports the panel size
+  (1440x2880, GetDisplaySize) while the ADT canvas is the iPhone X 1125x2436; sweet's 1080x2400 panel was smaller
+  than the canvas, so there AppleCLCD presented 1125x2436 and the two agreed. Here CoreAnimation must scale canvas ->
+  display every frame and asks for the hardware scaler. **0202**: TAIMEN presents 1125x2436, copied 1:1 into the
+  middle of the panel (black borders). **0201** counts repeated /dev/null tee lines. **0203** logs the fbcon kickoff
+  counters and MDP CTL0/VIG0/INTR + DSI0 registers every 20 s (the kernel's frames still never reach the panel). Log
+  viewer: key lines without exec/mount/hfs (they crowded out everything), half the screen, 32768-line index. r23 = 0201
+  (CI 40007805836, not booted), r24 = 0201-0203 (CI 40009260799).
+- 2026-10-23 **boot 19 (r24 = 0201-0203, ROOT=1, taimenreboot=120): the M2Scaler loop is gone (0202) and backboardd
+  presents ~48 frames/s.** Photo `../research/taimen/boot19-logview.jpg` (new viewer keys). BSD root ufsroot0 at 215.3 s
+  (counter base again from power-on), `SWEET FB: AppleCLCD 1440x2880 stride 5760 at 0x9d400000 ... presented as
+  1125x2436`, launchd.development absent -> /sbin/launchd, launchd boot tasks fsck, mount-phase-1/2, data-protection,
+  finish-obliteration, detect-installed-roots, commit-boot-mode, restore-datapartition, init-with-data-volume,
+  MSUEarlyBootTask, fips, keybag, usermanagerd, dirs_cleaner; daemons still starting at the deadline (fairplayd.H2,
+  CommCenter, bluetoothd, syncdefaultsd, fmflocatord, bluetoothuserd at 335-338 s). 0203 report: at 0 s `kicks 17 done
+  16 timeout 1, INTR_EN 0 STS 0x111000, CTL0 LAYER 0x1000005 TOP 0x20020 FLUSH 0x60000000, VIG0 SIZE 0xb4005a0 SRC0
+  0x9d400000 YSTR 0x1680, DSI0 STATUS0 0x5 INTR_CTRL 0x500`; at 120 s `kicks 5815 done 5814 timeout 1`, registers the
+  same. Identical to the shim's own dump (`../research/taimen/shim-diag-ufs.txt`). So the MDP takes and completes every
+  kickoff with the shim's pipeline, yet the panel showed the shim's picture during boots 17-18: the open question is
+  what the panel memory in RAM holds. **0204** reads rows 60/1440/2870 through uncached windows every 20 s and tests a
+  write-combine write against an uncached read. The viewer's tail was 80-line `PROF` dumps (sweet_sample profiler of
+  backboardd, on by default; `sweetprof=-` turns it off). Current slot was a again at this boot (both slots carry the
+  same image, so it does not matter).
+- 2026-10-23 **unattended boots: the log reader.** `tools/taimen/mkreader.sh` -> `shim/out/taimen-reader.img` = TWRP
+  3.7.0's kernel (`skip_initramfs` renamed so a normal boot keeps the initramfs) + TWRP's DTB + a busybox initramfs
+  (`tools/taimen/reader/init`). On both boot slots it replaces the on-screen viewer: after the PS_HOLD reset it copies
+  pstore (XNU's PRZ) and the last 1025 blocks of userdata (the 4 MiB UFS console ring) into a FAT image, shows that
+  to the PC as a USB drive labelled TAIMENLOG, and reboots into fastboot (`rebootbl bootloader`); a 150 s guard
+  reboots into fastboot whatever happens. `tools/taimen/reader-pull.ps1` copies the drive on Windows;
+  `tools/taimen/autoboot.sh KERNEL OUTDIR args` runs fastboot -> XNU -> reader -> logs -> fastboot with no hands.

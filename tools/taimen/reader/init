@@ -1,0 +1,74 @@
+#!/bin/busybox sh
+# taimen log reader: the /init of tools/taimen/mkreader.sh's boot image, which sits on both
+# boot slots. After an XNU run (PS_HOLD reset) ABL boots it: it collects XNU's logs, shows
+# them to the PC as a read-only USB drive labelled TAIMENLOG, then reboots into fastboot.
+#   pstore-*        /sys/fs/pstore (console-ramoops = XNU's PRZ at 0xb0080000)
+#   sweetlog.bin    last 1025 4K blocks of userdata: the kernel's 4 MiB UFS log ring (ufsrw=1)
+#   reader.txt      this script's own log and dmesg
+# Boot-arg-free: everything runs from here, and a 150 s guard reboots into fastboot whatever
+# happens.
+/bin/busybox mkdir -p /proc /sys /dev /tmp /mnt /out /bin
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t tmpfs tmpfs /dev
+mdev -s
+mount -t tmpfs -o size=128m tmpfs /tmp
+log() { echo "taimen-reader: $*" > /dev/kmsg; echo "$(cut -d' ' -f1 /proc/uptime) $*" >> /out/reader.txt; }
+(sleep 150; log "guard: 150 s, rebooting into fastboot"; /bin/rebootbl bootloader) &
+log "start, cmdline: $(cat /proc/cmdline)"
+
+mkdir -p /sys/fs/pstore
+mount -t pstore pstore /sys/fs/pstore && for f in /sys/fs/pstore/*; do
+	[ -f "$f" ] && cp "$f" "/out/pstore-$(basename "$f")"
+done
+log "pstore: $(ls -l /sys/fs/pstore 2>&1 | tr '\n' ' ')"
+
+# userdata appears once the UFS host has probed its LUNs
+dev=
+for i in $(seq 1 30); do
+	mdev -s
+	for u in /sys/class/block/*/uevent; do
+		grep -q '^PARTNAME=userdata$' "$u" && dev=$(sed -n 's/^DEVNAME=//p' "$u")
+	done
+	[ -n "$dev" ] && [ -b "/dev/$dev" ] && break
+	sleep 1
+done
+if [ -n "$dev" ] && [ -b "/dev/$dev" ]; then
+	blocks=$(( $(cat "/sys/class/block/$dev/size") / 8 ))
+	dd if="/dev/$dev" of=/out/sweetlog.bin bs=4096 skip=$((blocks - 1025)) count=1025 2>> /out/reader.txt
+	log "userdata /dev/$dev, $blocks 4K blocks, ring area copied"
+else
+	log "userdata not found"
+fi
+
+dmesg > /out/dmesg.txt
+dd if=/dev/zero of=/tmp/log.img bs=1048576 count=48 2>/dev/null
+mkdosfs -n TAIMENLOG /tmp/log.img > /dev/null
+mount -o loop /tmp/log.img /mnt && cp /out/* /mnt/ && sync && umount /mnt
+log "FAT image ready: $(ls /out | tr '\n' ' ')"
+
+mount -t configfs none /sys/kernel/config
+G=/sys/kernel/config/usb_gadget/reader
+mkdir -p $G/strings/0x409 $G/functions/mass_storage.0 $G/configs/c.1/strings/0x409
+echo 0x1d6b > $G/idVendor
+echo 0x0104 > $G/idProduct
+echo taimen-reader > $G/strings/0x409/serialnumber
+echo ios-taimen > $G/strings/0x409/manufacturer
+echo "taimen log reader" > $G/strings/0x409/product
+echo "logs" > $G/configs/c.1/strings/0x409/configuration
+echo 1 > $G/functions/mass_storage.0/lun.0/removable
+echo 1 > $G/functions/mass_storage.0/lun.0/ro
+echo /tmp/log.img > $G/functions/mass_storage.0/lun.0/file
+ln -s $G/functions/mass_storage.0 $G/configs/c.1/
+udc=$(ls /sys/class/udc | head -1)
+echo "$udc" > $G/UDC
+log "gadget on $udc: $(cat $G/UDC 2>&1)"
+
+# The PC copies the drive within a few seconds of seeing it (tools/taimen/reader-pull.ps1).
+sleep 45
+log "done, rebooting into fastboot"
+echo "" > $G/UDC
+sync
+/bin/rebootbl bootloader
