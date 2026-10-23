@@ -233,3 +233,20 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   flash it to boot_a, `ROOT=1 BOOT_WAIT=25 NO_ALERT=1 tools/taimen/boot-xnu.sh r22 out/taimen-xnu-r22b
   taimenreboot=180`; after the PS_HOLD reset ABL boots the viewer from boot_a; photograph the screen. Not run yet.
 - 2026-10-23 move to a Windows PC (WSL2 + Windows adb/fastboot): tools/windows/README.md.
+- 2026-10-23 move to the Windows PC done: WSL tree at ~/Projects/ios-taimen (Ubuntu 26.04, gcc 15 cross), phone on
+  Windows fastboot.exe. Found on arrival: **slot a marked unbootable** (retry count 0; TWRP never marks the slot
+  successful, so the resets of boots 13-16 used up its retries) and current slot b (successful, retry count 3,
+  LineageOS boot_b). A reset into boot_b would have started Android on the HFS+ userdata. The log viewer
+  (`-DLOGVIEW`) is now on **both** boot_a and boot_b and slot b stays active, so every reset lands in the viewer.
+  Also: `research` (symlink to ../research) did not come over, and mkadt.py then only warns and leaves out
+  `/product` (9772-byte ADT instead of 12456); setup-wsl.sh now creates the link.
+- 2026-10-23 **boot 17 (r22 = 0200, ROOT=1, taimenreboot=180, ADT WITHOUT /product): iOS USERLAND RUNS.** Viewer
+  photo `../research/taimen/boot17-logview.jpg`. The 1 MiB ring wrapped and kept only 1241-1377 s (the counter runs
+  from power-on; the phone had sat ~20 min in fastboot, so kernel start ~1196 s). launchd is starting LaunchDaemons:
+  xpcproxy (many), adprivacyd, calaccessd, ScreenTimeAgent, akd, mapspushd, wcd, assistantd, routined,
+  appleaccountd, remotepairingdeviced, navd, installcoordinationd, ind, profiled, CircleJoinRequested,
+  siriactionsd. **backboardd runs** and writes `IOServiceMatchingfailed for: AppleM2ScalerCSCDriver` every ~17 ms
+  (once per 60 Hz frame; via the sweetnull /dev/null tee), which is what flushed the boot start out of the ring.
+  No other port mentions M2Scaler; first suspect is the missing /product (sweet: MobileGestalt needs it for the
+  display mode). Deadline at 1376.296 s (`WDT EN 0x1 STS 0x5003b BARK 0xfffff`), `TAIMEN RESET: PS_HOLD = 0` at
+  1376.798 s, log lines continue ~0.3 s after it, then the reset and the viewer. Screen during the run: shim text.

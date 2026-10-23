@@ -3,7 +3,7 @@ backup/
 dtb/
 recovery/
 # third-party/Apple sources fetched for reading, phone pulls, IPSW parts, firmware
-research/
+research
 # build outputs and boot images
 shim/out/
 xnu/out/

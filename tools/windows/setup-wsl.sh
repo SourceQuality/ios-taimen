@@ -18,6 +18,9 @@ if ! command -v avbtool >/dev/null && ! sudo apt-get install -y avbtool; then
 fi
 for t in adb fastboot; do ln -sfn "$P/tools/windows/wsl-$t" ~/.local/bin/$t; done
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc; export PATH="$HOME/.local/bin:$PATH";; esac
+# port/research -> ../research: tools/mkadt.py reads the iPhone X /product node from
+# research/ipsw-x/d22ap.adt and only warns when it is missing
+ln -sfn ../research "$P/research"
 echo "== checks"
 [ -x /mnt/c/platform-tools/adb.exe ] || echo "MISSING /mnt/c/platform-tools/adb.exe: run setup-windows.ps1 first"
 adb version | head -1
