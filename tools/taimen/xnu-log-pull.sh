@@ -13,6 +13,8 @@ out=${1:-xnu-log.txt}
 adb root >/dev/null 2>&1 || true
 sleep 2
 adb wait-for-device
+# TWRP (the boot slot during the root phase) has pstore but does not mount it
+adb shell 'mountpoint -q /sys/fs/pstore 2>/dev/null || mount -t pstore pstore /sys/fs/pstore 2>/dev/null; true' >/dev/null 2>&1 || true
 raw="$out.raw"
 if adb shell 'test -r /sys/fs/pstore/console-ramoops' 2>/dev/null; then
 	adb exec-out 'cat /sys/fs/pstore/console-ramoops' > "$raw"
