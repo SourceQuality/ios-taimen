@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 1dce730..644771f 100644
+index 1dce730..7562510 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -9,6 +9,7 @@
@@ -10,12 +10,19 @@ index 1dce730..644771f 100644
  
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -48,6 +49,16 @@ taimen_wdt_thread(void *arg)
+@@ -33,6 +34,7 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+  * pstore copy of our log) back by itself.
+  */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void taimen_gic_dump(const char *tag);
+ 
+ #define TAIMEN_WDT_PA    0x17817000
+ #define TAIMEN_WDT_RST   0x04
+@@ -48,6 +50,15 @@ taimen_wdt_thread(void *arg)
  	int reboot_s = 0;
  	PE_parse_boot_argn("taimenreboot", &reboot_s, sizeof(reboot_s));
  	IOLog("TAIMEN WDT: pet thread running\n");
 +	{
-+		extern void taimen_gic_dump(const char *tag);
 +		for (int i = 0; i < 3; i++) {
 +			uint64_t t0 = mach_absolute_time();
 +			while (mach_absolute_time() - t0 < 19200000ULL * 3 / 2) {	/* 1.5 s busy wait, no timer needed */
