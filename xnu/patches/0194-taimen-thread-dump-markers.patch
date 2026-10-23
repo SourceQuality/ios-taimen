@@ -13,15 +13,22 @@ index bb2a2bf..f9a76f6 100644
  	vnode_t init_rootvnode = NULLVP;
  	struct proc_ro_data kernproc_ro_data = {
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 7562510..c4acb0c 100644
+index 7562510..9e485d7 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -62,6 +62,10 @@ taimen_wdt_thread(void *arg)
+@@ -35,6 +35,7 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+  */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void taimen_gic_dump(const char *tag);
++extern "C" void taimen_thread_dump(const char *tag);
+ 
+ #define TAIMEN_WDT_PA    0x17817000
+ #define TAIMEN_WDT_RST   0x04
+@@ -62,6 +63,9 @@ taimen_wdt_thread(void *arg)
  	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += TAIMEN_WDT_PET_S) {
  		wdt[TAIMEN_WDT_RST / 4] = 1;
  		IOLog("TAIMEN WDT: pet at %d s\n", t);
 +		if (t == 10 || t == 40) {
-+			extern "C" void taimen_thread_dump(const char *tag);
 +			taimen_thread_dump(t == 10 ? "10s" : "40s");
 +		}
  		IOSleep(TAIMEN_WDT_PET_S * 1000);
