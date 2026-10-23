@@ -1,0 +1,13 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 5b04f5c..c0d5d8d 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo';"  /* Pixel 1 (MSM8996) cpu nodes */
++    "     'IONameMatch'     = ('qcom,kryo','qcom,kryo280');"  /* Pixel 1 (MSM8996) / Pixel 2 XL (MSM8998) cpu nodes */
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
