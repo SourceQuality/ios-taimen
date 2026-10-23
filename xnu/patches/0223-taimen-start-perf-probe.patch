@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 528ef74..26ae359 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -669,9 +669,11 @@ sweet_ufs_init(void)
+ 	 * arbiter windows and the rest are unclaimed. Nothing of this runs until
+ 	 * each driver is retargeted (docs/taimen-boot-audit.md).
+ 	 */
+-	printf("SWEET UFS: taimen: Pixel 1 keys/touch/usb/perf/gpu/wlan drivers not started\n");
++	printf("SWEET UFS: taimen: Pixel 1 keys/touch/usb/gpu/wlan drivers not started\n");
+ 	/* retargeted to MSM8998 so far: touch (taimen_touch.c, docs/taimen-touch-plan.md) */
+ 	taimen_touch_init();
++	/* and the perf probe without its MSM8996 clock code (0222; boot-arg sweetperf=1) */
++	sweet_perf_init();
+ #else
+ 	sweet_keys_init();
+ 	sweet_touch_init();
