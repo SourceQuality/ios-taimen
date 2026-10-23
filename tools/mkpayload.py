@@ -153,7 +153,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
     # virt_base: 32MB (16K-granule L2 block) below the mach header, so start.s's
     # block mapping that starts at the header's block begins exactly at phys_base.
-    virt_base = text['vmaddr'] & ~(0x2000000 - 1)
+    virt_base = text['vmaddr'] & ~(args.l2block - 1)
     kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
@@ -205,6 +205,8 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--l2block', type=lambda v: int(v, 0), default=0x2000000,
+                    help='L2 block size virt_base is aligned down to: 32 MB (16K granule, default) or 0x200000 (4K granule, taimen)')
     ap.add_argument('--blob', action='append', default=[], metavar='NAME=FILE',
                     help='file for /chosen/memory-map NAME')
     a = ap.parse_args()

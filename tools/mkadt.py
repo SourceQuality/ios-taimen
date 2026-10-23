@@ -4,6 +4,7 @@
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1]
 --pixel1: Google Pixel 1 (sailfish, MSM8996) presented as an iPhone 8 instead.
+--taimen: Google Pixel 2 XL (taimen, MSM8998), iPhone X identity, 4K-page kernel.
 """
 import hashlib, os, struct, sys
 
@@ -47,6 +48,20 @@ PIXEL1 = dict(
           (0x100, 1, 2150400000), (0x101, 1, 2150400000)],
 )
 
+# Google Pixel 2 XL (taimen, MSM8998), from its live FDT and the stage-1 shim
+# register dump (NOTES-taimen.md, docs/taimen-porting-map.md).
+TAIMEN = dict(
+    phys_base=0x100000000, mem_size=0x20000000,  # 512 MiB above 4 GB to start (4K kernels failed above that on the S8)
+    gicd=0x17a00000, gicr=0x17b00000,  # redistributor stride 0x20000 (the kernel default)
+    vtimer=19,  # Qualcomm PPI numbering, like sweet
+    fb=0x9d400000, fb_size=0x2400000, fb_w=1440, fb_h=2880, fb_bpp=32,  # VIG0: BGRA, stride 0x1680
+    fb_kickoff=0xc90201c,  # MDP CTL0 START: PP0 autorefresh is off, every frame is requested
+    ufs=0x1da4000, ufs_size=0x2500,
+    # MPIDR, cluster, max clock: 4 x Kryo 280 silver (A53-class) + 4 x gold (A73-class)
+    cpus=[(0x0, 0, 1900800000), (0x1, 0, 1900800000), (0x2, 0, 1900800000), (0x3, 0, 1900800000),
+          (0x100, 1, 2457600000), (0x101, 1, 2457600000), (0x102, 1, 2457600000), (0x103, 1, 2457600000)],
+)
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -85,13 +100,13 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, pixel1=False):
+def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     vtimer = QEMU_VTIMER_INTID if qemu else VTIMER_INTID
-    if pixel1:
-        P = PIXEL1
+    if pixel1 or taimen:
+        P = PIXEL1 if pixel1 else TAIMEN
         phys_base, mem_size, gicd, gicr, vtimer = P['phys_base'], P['mem_size'], P['gicd'], P['gicr'], P['vtimer']
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -152,7 +167,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
-        if pixel1:
+        if pixel1 or taimen:
             break
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
@@ -175,11 +190,11 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
             ('fixed-frequency', u32(timebase)),
         ]))
     # Pixel 1: 2 + 2 Kryo (same core, different clocks) as one SMP cluster too.
-    for core, (mpidr, cluster, hz) in enumerate(PIXEL1['cpus'] if pixel1 else []):
+    for core, (mpidr, cluster, hz) in enumerate(PIXEL1['cpus'] if pixel1 else TAIMEN['cpus'] if taimen else []):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo') + cstr('ARM,v8')),
+            ('compatible', cstr('qcom,kryo280' if taimen else 'qcom,kryo') + cstr('ARM,v8')),
             ('reg', u32(mpidr)),
             ('cpu-id', u32(core)),
             ('cluster-id', u32(0)),
@@ -244,8 +259,8 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
     ])
-    if pixel1:
-        P = PIXEL1
+    if pixel1 or taimen:
+        P = PIXEL1 if pixel1 else TAIMEN
         fbcon = node('sweet-fbcon', [
             ph(),
             ('reg', u64(P['fb'], P['fb_size'])),
@@ -261,7 +276,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(PIXEL1['ufs'], PIXEL1['ufs_size']) if pixel1 else u64(UFS, UFS_SIZE)),
+        ('reg', u64(PIXEL1['ufs'], PIXEL1['ufs_size']) if pixel1 else u64(TAIMEN['ufs'], TAIMEN['ufs_size']) if taimen else u64(UFS, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -297,9 +312,11 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     compat = cstr(ident[0]) + cstr(ident[1]) + cstr('xiaomi,sweet')
     if pixel1:
         compat += cstr(ident[3])
+    if taimen:
+        compat += cstr('google,taimen')
     return node('device-tree', [
         ph(),
-        ('compatible', compat + cstr(ident[4]) + cstr('AppleARM')),
+        ('compatible', compat + cstr('qcom,msm8998' if taimen else ident[4]) + cstr('AppleARM')),
         ('model', cstr(ident[1])),
         ('target-type', cstr(ident[2])),
         ('target-sub-type', cstr(ident[0])),
@@ -310,7 +327,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv, taimen='--taimen' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

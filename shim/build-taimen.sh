@@ -2,8 +2,9 @@
 # Build the Pixel 2 XL (taimen) shim: start.S + taimen.c + pstore.c + console.c
 # (+ fdt.c loader.c, unused by stage 1), packed into a boot image that Google's
 # ABL accepts for `fastboot boot` (see tools/taimen/mkboot.sh).
-# A PAYLOAD (tools/mkpayload.py) may be appended to the Image at _end.
-# Usage: shim/build-taimen.sh TEMPLATE_BOOT.img [PAYLOAD]   -> shim/out/${OUT_NAME:-taimen-boot}.img
+# A PAYLOAD (tools/mkpayload.py) goes in as the boot image ramdisk: ABL loads it at
+# 0xa0000000 and the shim finds it through /chosen linux,initrd-start/end (STAGE2).
+# Usage: [EXTRA_CFLAGS=-DSTAGE2] shim/build-taimen.sh TEMPLATE_BOOT.img [PAYLOAD]   -> shim/out/${OUT_NAME:-taimen-boot}.img
 set -euo pipefail
 template=$(realpath "$1")
 payload=${2:+$(realpath "$2")}
@@ -23,5 +24,4 @@ ${X}gcc $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segment
 ${X}objcopy -O binary out/taimen/shim.elf out/taimen/Image
 size=$(${X}nm out/taimen/shim.elf | awk '$3=="_end"{print $1}')
 truncate -s $((16#$size)) out/taimen/Image
-[ -z "$payload" ] || cat "$payload" >> out/taimen/Image
-../tools/taimen/mkboot.sh "$template" out/taimen/Image out/${OUT_NAME:-taimen-boot}.img
+../tools/taimen/mkboot.sh "$template" out/taimen/Image out/${OUT_NAME:-taimen-boot}.img ${payload:+"$payload"}

@@ -4,14 +4,16 @@
 # are kept. The kernel goes in as gzip: the sailfish aboot `fastboot boot`
 # path says "dtb not found" for LZ4 kernels, even for the unmodified stock
 # Image.lz4-dtb that boots fine from flash.
-# Usage: tools/mkboot-v0.sh STOCK_BOOT.img Image OUT.img
+# Usage: tools/mkboot-v0.sh STOCK_BOOT.img Image OUT.img [RAMDISK]
+#   RAMDISK (taimen): replaces the stock ramdisk, e.g. the SWEETXNU payload that the
+#   shim finds through /chosen linux,initrd-start/end (ABL loads it at 0xa0000000).
 set -euo pipefail
-stock=$1 image=$2 out=$3
+stock=$1 image=$2 out=$3 rd=${4:-}
 tmp=$(mktemp -d)
 gzip -9 -n -c "$image" > "$tmp/Image.gz"
-python3 -I - "$stock" "$tmp/Image.gz" "$out" <<'EOF'
+python3 -I - "$stock" "$tmp/Image.gz" "$out" "$rd" <<'EOF'
 import hashlib, struct, sys
-stock, gz, out = sys.argv[1:]
+stock, gz, out, rd = sys.argv[1:]
 b = open(stock, 'rb').read()
 assert b[:8] == b'ANDROID!'
 ksize, _, rsize, _, ssize, _, _, page, hv = struct.unpack_from('<9I', b, 8)
@@ -19,17 +21,18 @@ assert hv == 0, 'only v0 headers'
 up = lambda n: (n + page - 1) // page * page
 kernel = b[page:page + ksize]
 dtbs = kernel[kernel.index(b'\xd0\x0d\xfe\xed'):]   # stock appended DTBs
-ramdisk = b[page + up(ksize):][:rsize]
+ramdisk = open(rd, 'rb').read() if rd else b[page + up(ksize):][:rsize]
 second = b[page + up(ksize) + up(rsize):][:ssize]
 kernel = open(gz, 'rb').read() + dtbs
 h = bytearray(b[:page])
 struct.pack_into('<I', h, 8, len(kernel))
+struct.pack_into('<I', h, 16, len(ramdisk))
 sha = hashlib.sha1()
 for part in (kernel, ramdisk, second):
 	sha.update(part); sha.update(struct.pack('<I', len(part)))
 h[576:608] = sha.digest().ljust(32, b'\0')
 pad = lambda d: d + b'\0' * (up(len(d)) - len(d))
 open(out, 'wb').write(bytes(h) + pad(kernel) + pad(ramdisk) + pad(second))
-print(f'{out}: kernel {len(kernel)} bytes ({len(dtbs)} of stock DTBs)')
+print(f'{out}: kernel {len(kernel)} bytes ({len(dtbs)} of stock DTBs), ramdisk {len(ramdisk)} bytes' + (' (replaced)' if rd else ''))
 EOF
 rm -rf "$tmp"

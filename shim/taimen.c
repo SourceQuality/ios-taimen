@@ -23,6 +23,10 @@
 #define WDT_EN			0x08
 #define WDT_BARK		0x10
 #define WDT_BITE		0x14
+#ifndef WDT_SECS
+#define WDT_SECS		120
+#endif
+#define IMEM_RESTART_REASON	0x146bf65cUL	/* qcom,msm-imem-restart_reason; 0x77665500 = fastboot */
 
 #define GCC_BASE		0x100000UL	/* qcom,gcc@100000 */
 #define MMSS_CC_BASE		0xc8c0000UL	/* qcom,mmsscc@c8c0000 */
@@ -42,6 +46,9 @@ static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; 
 
 static void __attribute__((noreturn)) psci_reset(void)
 {
+#ifdef RESET_TO_FASTBOOT
+	wr32(IMEM_RESTART_REASON, 0x77665500);
+#endif
 	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
 	__asm__ volatile("dsb sy; smc #0" : "+r"(x0) : : "memory");
 	for (;;)
@@ -101,6 +108,19 @@ void shim_main(uint64_t dtb)
 	psci_reset();
 #endif
 	con_skip();
+	/* 0. Does DDR survive a reset through this bootloader? Read markers a previous
+	 * run left, then plant new ones: in the ramoops region, in low RAM, and in
+	 * the RAM above 4 GB. Compared on the next boot. */
+	{
+		static const uintptr_t marks[3] = { 0xb0000000UL, 0x8a800000UL, 0x100000000UL };
+		for (int i = 0; i < 3; i++) {
+			uint64_t v = *(volatile uint64_t *)marks[i];
+			log_printf("rammark @%lx = %lx\n", (unsigned long)marks[i], v);
+			con_hex2("MARK", "@", (uint32_t)marks[i], "=", (uint32_t)v);
+			*(volatile uint64_t *)marks[i] = 0x5441494d454e0000ULL | (uint32_t)(rsr("cntpct_el0") & 0xffff);
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+	}
 	/* 1. GCC is always clocked. 8998 gcc: mmss_sys_noc_axi 0x9000, mmss_noc_cfg_ahb 0x9004 */
 	probe("GCC", "mmss_axi", GCC_BASE + 0x9000);
 	probe("GCC", "mmss_ahb", GCC_BASE + 0x9004);
@@ -155,11 +175,40 @@ void shim_main(uint64_t dtb)
 	con_str("KICK", "done");
 	log_printf("kick done\n");
 	save("after kick");
+#ifdef STAGE2
+	/*
+	 * Stage 2: act as iBoot. The SWEETXNU payload is the boot image's ramdisk,
+	 * which ABL loads at /chosen linux,initrd-start (0xa0000000). Arm the APSS
+	 * watchdog first so a kernel hang ends in a reset (bite WDT_SECS later)
+	 * instead of needing the power button.
+	 */
+	con_skip();
+	con_str("WDT", "arming for xnu");
+	wr32(APSS_WDT + WDT_BARK, WDT_SECS * 32768u);
+	wr32(APSS_WDT + WDT_BITE, WDT_SECS * 32768u);
+	wr32(APSS_WDT + WDT_RST, 1);
+	wr32(APSS_WDT + WDT_EN, 1);
+	__asm__ volatile("dsb sy" ::: "memory");
+	log_printf("wdt armed: %u s\n", (unsigned)WDT_SECS);
+	save("before loader");
+	con_str("LOADER", "payload from initrd ..");
+	con_flush();
+	const char *why = loader_boot(dtb);
+	log_printf("LOADER: %s\n", why);
+	con_str("LOADER", why);
+	con_flush();
+	save("loader returned");
+	con_str("RESET", "in 15s");
+	con_flush();
+	delay_ms(15000);
+	psci_reset();
+#else
 	con_skip();
 	con_str("RESET", "in 15s");
 	con_flush();
 	delay_ms(15000);
 	psci_reset();
+#endif
 }
 
 void secondary_main(uint64_t idx)

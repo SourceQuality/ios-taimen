@@ -1,0 +1,311 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index 9b553be..fdb52df 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -371,7 +371,11 @@ cs_validate_codedirectory(const CS_CodeDirectory *cd, size_t length)
+ 	if (ntohl(cd->magic) != CSMAGIC_CODEDIRECTORY) {
+ 		return EBADEXEC;
+ 	}
+-	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)) {
++	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	    && (cd->pageSize != 14)	/* iOS 16 dyld shared cache: 16 KiB hash units on a 4 KiB kernel */
++#endif
++	    ) {
+ 		printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
+ 		return EBADEXEC;
+ 	}
+@@ -5920,6 +5924,11 @@ cs_validate_page(
+ 	*tainted_p = VMP_CS_ALL_FALSE;
+ 	*nx_p = VMP_CS_ALL_FALSE;
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* Bring-up: 16 KiB-signed cache on 4 KiB VM pages; do not hash past the mapped page. */
++	return;
++#endif
++
+ 	for (offset_in_page = 0;
+ 	    offset_in_page < PAGE_SIZE;
+ 	    /* offset_in_page updated based on bytes processed */) {
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 75e3fbb..0f58f4e 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -342,6 +342,14 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+ endif
+ 
++# taimen (Pixel 2 XL) runs 4 KiB pages: TTBR1 covers 39 bits, so the -2 TiB
++# ARM_LARGE_MEMORY link address is unreachable. Keep the compact layout.
++ifeq ($(CURRENT_MACHINE_CONFIG),TAIMEN)
++LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
++ARM64_PLKSEG_ADDR  =0xfffffff004004000
++ARM64_LINK_ADDR    =0xfffffff007004000
++endif
++
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+ 			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 7ed7d29..acdc2ca 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1832,6 +1832,44 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+  * for a Device alias of the early log block (sweet_early.c) that survives
+  * bootstrap TTBR0 teardown.
+  */
++#if defined(TAIMEN)
++/*
++ * 4K pages, compact layout: VM_MIN_KERNEL_ADDRESS sits in another 1 GB L1
++ * entry than the kernel, which has no L2 table yet. Use the free 2 MB slots
++ * between the low globals and the kernel text inside the kernel's own L1
++ * entry instead: slots 1-18 alias the splash framebuffer, 19 the early log
++ * block, 20 the MDP block (sweet_early.c relocates to this layout).
++ */
++#define SWEET_EARLY_FB_VA ((VM_KERNEL_LINK_ADDRESS & ~((1ULL << 30) - 1)) + ARM_TT_L2_SIZE)
++#define SWEET_EARLY_ALIAS_BLOCKS 20u
++
++static void
++sweet_early_map_block(vm_map_address_t va, uint64_t pa)
++{
++	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
++	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++	assert(*slot == ARM_TTE_EMPTY);
++	*slot = pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
++	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++}
++
++static void
++sweet_early_map_final(void)
++{
++	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++	assert(va + SWEET_EARLY_ALIAS_BLOCKS * ARM_TT_L2_SIZE <= gVirtBase);
++	for (unsigned int i = 0; i < 18u; i++) {
++		sweet_early_map_block(va + i * ARM_TT_L2_SIZE, 0x9d400000ULL + (uint64_t)i * ARM_TT_L2_SIZE);
++	}
++	sweet_early_map_block(va + 18u * ARM_TT_L2_SIZE, SWEET_EARLY_LOG_BLOCK);
++	sweet_early_map_block(va + 19u * ARM_TT_L2_SIZE, 0xc800000ULL);
++	__asm__ volatile("dsb ishst" ::: "memory");
++}
++#else /* !TAIMEN */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
+ static void
+@@ -1850,6 +1888,7 @@ sweet_early_map_final(void)
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
++#endif /* TAIMEN */
+ #endif
+ 
+ void
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 5ea69e3..47dfa41 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -539,6 +539,26 @@ Lsweet_s0_msg:
+ Lsweet_s0_after:
+ #endif
+ 
++#if defined(TAIMEN)
++	/*
++	 * Stage 0 on screen (MMU off): a white band at rows 2600-2663 of the ABL
++	 * splash framebuffer (0x9d400000, 1440x2880, 4 B/px), then MDP CTL0 START
++	 * (0xc90201c): the command-mode panel only shows a frame on request.
++	 */
++	MOV64	x0, (0x9d400000 + 2600 * 5760)
++	mov	x1, #-1
++	mov	x2, #(64 * 5760 / 8)
++Ltaimen_s0_band:
++	str	x1, [x0], #8
++	subs	x2, x2, #1
++	b.ne	Ltaimen_s0_band
++	dsb	sy
++	MOV64	x0, 0xc90201c
++	mov	w1, #1
++	str	w1, [x0]
++	dsb	sy
++#endif
++
+ 	// Set low reset vector before attempting any loads
+ 	adrp	x0, EXT(LowExceptionVectorBase)@page
+ 	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
+@@ -685,7 +705,44 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+-#if defined(SWEET)
++#if defined(TAIMEN)
++	/*
++	 * 4K granule, 2 MB L2 blocks. V=P Device mappings for sweet_early.c:
++	 *  - 0x9d400000..0xb0200000 (151 blocks, L1 index 2): the splash
++	 *    framebuffer (36 MiB) through the early log zone at 0xb0000000;
++	 *  - 0xc800000 (1 block, L1 index 0): MDP CTL0 START for frame kicks.
++	 * Both L1 indices differ from RAM's (0x100000000, index 4), so each
++	 * costs one extra bootstrap L2 page. Device: no speculative reads.
++	 */
++	MOV64	x0, 0x9d400000
++	mov	x4, x0
++	mov	x5, #151
++	create_bootstrap_mapping x0, x4, x5, x1, x2, x6, x10, x11, x12, x13
++	MOV64	x10, 0x9d400000
++	and	x11, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr	x11, x11, #(ARM_TT_L2_SHIFT)
++	add	x12, x2, x11, lsl #TTE_SHIFT
++	mov	x13, #151
++Ltaimen_dev_attr1:
++	ldr	x11, [x12]
++	bic	x11, x11, #(ARM_TTE_BLOCK_ATTRINDXMASK)
++	orr	x11, x11, #(ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE))
++	str	x11, [x12], #(1 << TTE_SHIFT)
++	subs	x13, x13, #1
++	b.ne	Ltaimen_dev_attr1
++	MOV64	x0, 0xc800000
++	mov	x4, x0
++	mov	x5, #1
++	create_bootstrap_mapping x0, x4, x5, x1, x2, x6, x10, x11, x12, x13
++	MOV64	x10, 0xc800000
++	and	x11, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr	x11, x11, #(ARM_TT_L2_SHIFT)
++	add	x12, x2, x11, lsl #TTE_SHIFT
++	ldr	x11, [x12]
++	bic	x11, x11, #(ARM_TTE_BLOCK_ATTRINDXMASK)
++	orr	x11, x11, #(ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE))
++	str	x11, [x12]
++#elif defined(SWEET)
+ 	/*
+ 	 * Early log block (pstore zone, sweet_early.c): one 32MB Device block
+ 	 * in the EXISTING V=P L2 table. Both it and RAM use L1 index 0; another
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 885c1e4..67f4c3f 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -20,9 +20,47 @@
+ /* persistent_ram_buffer: "DBGC", start, size, then the text (no ECC) */
+ #define PRZ_OFF         (SWEET_EARLY_LOG_PRZ - SWEET_EARLY_LOG_BLOCK)
+ #define PRZ_SIG         0x43474244u
++#if defined(TAIMEN)
++#define PRZ_DATA_MAX    (0x100000u - 12u)       /* taimen ramoops console zone is 1 MiB */
++#else
+ #define PRZ_DATA_MAX    (0x80000u - 12u)
++#endif
+ 
+ static volatile uint8_t *early_base = (volatile uint8_t *)(uintptr_t)SWEET_EARLY_LOG_BLOCK;
++
++#if defined(TAIMEN)
++/*
++ * On taimen RAM does not survive a reset, so the stage marks also go on the
++ * screen: a full-width band per mark at rows 2000 + 8*stage of the ABL splash
++ * framebuffer, followed by an MDP CTL0 START (the panel shows frames on request).
++ * Before arm_vm_init both are V=P through the bootstrap tables (start.s); after
++ * sweet_early_relocate they are aliases next to the log zone (arm_vm_init.c).
++ */
++#define TAIMEN_FB_PA    0x9d400000ULL
++#define TAIMEN_FB_W     1440u
++#define TAIMEN_FB_STRIDE 5760u
++#define TAIMEN_FB_BLOCKS 18u            /* 36 MiB of 2 MB blocks */
++#define TAIMEN_MDP_BLOCK_PA 0xc800000ULL
++#define TAIMEN_KICK_OFF  (0xc90201cULL - TAIMEN_MDP_BLOCK_PA)
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)TAIMEN_FB_PA;
++static volatile uint32_t *early_kick = (volatile uint32_t *)(uintptr_t)(TAIMEN_MDP_BLOCK_PA + TAIMEN_KICK_OFF);
++
++static void
++sweet_early_band(unsigned int stage)
++{
++	unsigned int y0 = 2000u + 8u * (stage % 100u);
++	uint32_t color = 0xff000000u | (0x00ff00u >> ((stage % 3u) * 8u)) | ((stage & 1u) ? 0x0000ffu : 0u);
++	for (unsigned int y = y0; y < y0 + 6u && y < 2880u; y++) {
++		volatile uint32_t *row = early_fb + (y * TAIMEN_FB_STRIDE) / 4u;
++		for (unsigned int x = 0; x < TAIMEN_FB_W; x++) {
++			row[x] = color;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	*early_kick = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++#endif
+ #define PRZ_W(off) (*(volatile uint32_t *)(early_base + PRZ_OFF + (off)))
+ 
+ /* Initialized data must remain writable until disable, including panics. */
+@@ -120,6 +158,11 @@ sweet_early_hex(const char *label, uint64_t v)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
++#if defined(TAIMEN)
++	if (!early_disabled) {
++		sweet_early_band(stage);
++	}
++#endif
+ 	if (early_disabled) {
+ 		return;
+ 	}
+@@ -185,7 +228,14 @@ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
++#if defined(TAIMEN)
++	/* alias layout (arm_vm_init.c): FB blocks, then the log block, then the MDP block */
++	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_base = (volatile uint8_t *)(uintptr_t)(base + (uint64_t)TAIMEN_FB_BLOCKS * ARM_TT_L2_SIZE);
++	early_kick = (volatile uint32_t *)(uintptr_t)(base + (uint64_t)(TAIMEN_FB_BLOCKS + 1u) * ARM_TT_L2_SIZE + TAIMEN_KICK_OFF);
++#else
+ 	early_base = (volatile uint8_t *)(uintptr_t)base;
++#endif
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel log VA live");
+ }
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..4d61884 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,7 +160,11 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/* 4 KiB kernel in the compact 39-bit VA layout, MacOSX platform facilities otherwise. */
++#define ZONE_MAP_MAX            (8ULL << 30)
++#define ZONE_MAP_VA_SIZE        (24ULL << 30)
++#elif XNU_PLATFORM_MacOSX
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..5edba74 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,7 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(ARM64_BOARD_CONFIG_TAIMEN)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index db1d613..03362c5 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -810,10 +810,15 @@ vm_shared_region_create(
+ 		goto done;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* Bring-up: the 16 KiB-signed iOS cache runs on 4 KiB VM pages. */
++	vm_map_cs_enforcement_set(sub_map, false);
++#else
+ 	/* shared regions should always enforce code-signing */
+ 	vm_map_cs_enforcement_set(sub_map, true);
+ 	assert(vm_map_cs_enforcement(sub_map));
+ 	assert(pmap_get_vm_map_cs_enforced(vm_map_pmap(sub_map)));
++#endif
+ 
+ 	assert(!sub_map->disable_vmentry_reuse);
+ 	sub_map->is_nested_map = TRUE;
