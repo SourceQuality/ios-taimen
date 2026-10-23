@@ -24,7 +24,7 @@
 #define WDT_BARK		0x10
 #define WDT_BITE		0x14
 #ifndef WDT_SECS
-#define WDT_SECS		120
+#define WDT_SECS		31	/* the register holds 32 s at most; the kernel pets it (xnu 0188) */
 #endif
 #define IMEM_RESTART_REASON	0x146bf65cUL	/* qcom,msm-imem-restart_reason; 0x77665500 = fastboot */
 
@@ -240,12 +240,13 @@ void shim_main(uint64_t dtb)
 	 */
 	con_skip();
 	con_str("WDT", "arming for xnu");
-	wr32(APSS_WDT + WDT_BARK, WDT_SECS * 32768u);
-	wr32(APSS_WDT + WDT_BITE, WDT_SECS * 32768u);
+	/* BARK/BITE are 20-bit tick counts at 32768 Hz (defaults 0x7ffff/0xfffff): 32 s max. */
+	wr32(APSS_WDT + WDT_BARK, (WDT_SECS * 32768u > 0xfffffu) ? 0xfffffu : WDT_SECS * 32768u);
+	wr32(APSS_WDT + WDT_BITE, (WDT_SECS * 32768u > 0xfffffu) ? 0xfffffu : WDT_SECS * 32768u);
 	wr32(APSS_WDT + WDT_RST, 1);
 	wr32(APSS_WDT + WDT_EN, 1);
 	__asm__ volatile("dsb sy" ::: "memory");
-	log_printf("wdt armed: %u s\n", (unsigned)WDT_SECS);
+	log_printf("wdt armed: %u s (bite reg %08x)\n", (unsigned)WDT_SECS, rd32(APSS_WDT + WDT_BITE));
 	save("before loader");
 	con_str("LOADER", "payload from initrd ..");
 	con_flush();

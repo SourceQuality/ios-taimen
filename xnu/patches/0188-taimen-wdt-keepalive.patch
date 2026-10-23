@@ -1,0 +1,84 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..22f4cbd 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -22,6 +22,69 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * taimen: the shim arms the APSS watchdog (qcom,msm-watchdog@17817000; the
++ * 20-bit BARK/BITE registers hold 32 s at most), so a kernel that hangs or
++ * panics resets the phone within half a minute instead of needing the power
++ * button. Pet it while threads run (after the Pixel 4 port's flame_wdt).
++ * taimenwdt=0 turns it off; taimenreboot=N stops petting after about N
++ * seconds, which bounds an unattended test run and brings Android (and its
++ * pstore copy of our log) back by itself.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define TAIMEN_WDT_PA    0x17817000
++#define TAIMEN_WDT_RST   0x04
++#define TAIMEN_WDT_EN    0x08
++#define TAIMEN_WDT_BARK  0x10
++#define TAIMEN_WDT_BITE  0x14
++#define TAIMEN_WDT_PET_S 5
++
++static void
++taimen_wdt_thread(void *arg)
++{
++	volatile uint32_t *wdt = (volatile uint32_t *)arg;
++	int reboot_s = 0;
++	PE_parse_boot_argn("taimenreboot", &reboot_s, sizeof(reboot_s));
++	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += TAIMEN_WDT_PET_S) {
++		wdt[TAIMEN_WDT_RST / 4] = 1;
++		IOSleep(TAIMEN_WDT_PET_S * 1000);
++	}
++	IOLog("TAIMEN WDT: taimenreboot=%d reached, no more pets: reset follows\n", reboot_s);
++	for (;;) {
++		IOSleep(1000000);
++	}
++}
++
++static void
++taimen_wdt_start(void)
++{
++	int enabled = 1;
++	PE_parse_boot_argn("taimenwdt", &enabled, sizeof(enabled));
++	volatile uint32_t *wdt = (volatile uint32_t *)ml_io_map(TAIMEN_WDT_PA, 0x1000);
++	if (wdt == NULL) {
++		IOLog("TAIMEN WDT: mapping failed\n");
++		return;
++	}
++	if (!(wdt[TAIMEN_WDT_EN / 4] & 1)) {
++		IOLog("TAIMEN WDT: not armed by the shim\n");
++		return;
++	}
++	/* 32 s window from each pet; the shim may have armed less */
++	wdt[TAIMEN_WDT_BARK / 4] = 0xfffff;
++	wdt[TAIMEN_WDT_BITE / 4] = 0xfffff;
++	wdt[TAIMEN_WDT_RST / 4] = 1;
++	if (!enabled) {
++		wdt[TAIMEN_WDT_EN / 4] = 0;
++		IOLog("TAIMEN WDT: disabled (taimenwdt=0)\n");
++		return;
++	}
++	IOCreateThread(taimen_wdt_thread, (void *)wdt);
++	IOLog("TAIMEN WDT: petting every %d s\n", TAIMEN_WDT_PET_S);
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -29,6 +92,9 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	taimen_wdt_start();
++#endif
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
