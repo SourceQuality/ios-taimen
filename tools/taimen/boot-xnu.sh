@@ -27,7 +27,8 @@ python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
 # The Pixel 1 keys/touch/usb/perf/battery/backlight drivers are compiled out on TAIMEN
 # (xnu 0187) and their boot-args are set to 0 as well (docs/taimen-boot-audit.md).
 safe="sweetkeys=0 sweettouch=0 sweetusb=0 sweetperf=0 sweetbattery=0 sweetcharge=0 sweetbl=0"
-cmdline="debug=0x10000c serial=3 cpus=1 keepsyms=1 -noprogress ${safe} ${args}"
+# taimenepoch: the PC clock for the calendar (xnu 0217; no RTC driver yet)
+cmdline="debug=0x10000c serial=3 cpus=1 keepsyms=1 -noprogress taimenepoch=$(date +%s) ${safe} ${args}"
 # ROOTFIX=FILE: files the kernel writes into the iOS root before launchd (tools/taimen/mkrootfix.py, xnu 0210)
 blobs=()
 [ -n "${ROOTFIX:-}" ] && blobs+=(--blob "ROOTFIX=$(realpath "$ROOTFIX")")

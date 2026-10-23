@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 4db0990..46ebaba 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -23,10 +23,31 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++#endif
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * No RTC driver on taimen (the PM8998 RTC sits behind the SPMI arbiter), so the calendar
++ * started at 0 and the lock screen read Wednesday, December 31 (boot 32). The PC passes
++ * its clock as boot-arg taimenepoch (tools/taimen/boot-xnu.sh, when the payload is
++ * built, ~25 s before the kernel asks).
++ */
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	long epoch = 0;
++	if (PE_parse_boot_argn("taimenepoch", &epoch, sizeof(epoch)) && epoch > 0) {
++		return epoch + 25;
++	}
++	return 0;
++}
++#endif
++
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ /*
+  * taimen: the shim arms the APSS watchdog (qcom,msm-watchdog@17817000; the
