@@ -1,124 +1,87 @@
-# ios-sailfish
+# ios-taimen
 
-**Apple's iOS 16.7.16 running on a Google Pixel 1 (`sailfish`, Snapdragon 821), with GPU-accelerated graphics.**
+**Bringing Apple's iOS 16 up on the Google Pixel 2 XL (`taimen`, Qualcomm MSM8998 / Snapdragon 835).**
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the first Google Pixel and runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone 8** on it: launchd, the system daemons, backboardd, SpringBoard and the stock apps. It is a fork of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet), which brought the same kernel up on a Redmi Note 10 Pro; that history is kept, and the Pixel work starts at the commit "tools: granule-probe, 16K page check for other phones".
+This is a port of [joranv1/ios-sailfish](https://github.com/joranv1/ios-sailfish) (iOS 16 on the Pixel 1, itself a port of
+[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Pixel 2 XL. The plan is the same: a bare-metal shim
+started with `fastboot boot` acts as iBoot, Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) runs on the
+phone, and the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X** runs on top of it. Nothing is flashed to the
+boot chain. The Pixel 1 history is kept in this repository; the taimen work starts at "taimen: Pixel 2 XL bring-up notes".
 
-> Experimental, not a usable phone OS. Many things are missing or stubbed (see below) and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
+> Experimental bring-up, nowhere near a usable phone OS. **XNU has not booted on this phone yet.** What exists today is
+> the shim, the measurements it made, the kernel configuration, and the tooling to put the pieces together.
 
 ## Status (2026-10-22)
 
-- Boots from `fastboot boot` to the lock screen in **about 20 seconds**.
-- **GPU acceleration on the Adreno 530**: CoreAnimation's own OpenGL ES renderer runs on Mesa's freedreno driver, through our own kernel GPU driver.
-- Display updates **up to 60 Hz**. The GPU scales each frame onto the panel and the display flips between two buffers, so there is no tearing and no CPU copy. The UI runs at roughly 20–40 frames/s depending on the screen: CoreAnimation's CPU work in backboardd (and the app's main thread) is now the limit, not the GPU.
-- Lock screen, home screen, App Library, Control Center, notification center, Settings, the stock iOS 16 wallpaper with its layered artwork, and **all stock Apple apps** (Weather, Calendar, Clock, Mail, Notes, Maps, Music, Calculator, Files, ...).
-- Touchscreen, power / volume buttons, **real battery percentage and charging**.
-- **Brightness control and display sleep**: the Control Center / Settings slider, and the screen fades out on lock and back in on wake.
-- **Wi-Fi**: the Settings Wi-Fi page lists networks, joins WPA2 networks with a password, forgets and rejoins; iOS gets its address by DHCP and Safari loads pages.
-
-## What works
-
 | Area | State |
 | --- | --- |
-| Boot | Stock Pixel bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to boot partitions |
-| CPU | All 4 Kryo cores via PSCI (1228 / 1363 MHz; optional `sweetboost=1824 sweetboostpwr=1478` or turbo to 1594 / 2150 MHz with `sweetturbo=1`, both run hot), 16K pages, GICv3 with device interrupts, timers |
-| Memory | 2 GB (the upper DDR bank), DDR clocked to 1804 MHz through the RPM |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone 8 16.7.16 root filesystem, cryptexes and shared cache (the userland is ARMv8.0-clean, so it runs on Kryo) |
-| GPU | Adreno 530 at 600 MHz: power, clocks, SMMU, CP microcode, zap shader via TrustZone; buffer objects and command submission for user space. Mesa (freedreno, GLES 3.1) runs inside backboardd as `sweetgl.dylib`, behind an EAGL shim that CoreAnimation's GL renderer uses as if it were Apple's |
-| Display | Command-mode Samsung panel through the MDP: iOS sees an iPhone 8 panel (750×1334 @2x), scaled (bilinear, on the GPU) to 1080×1920; double-buffered, up to 60 Hz |
-| Brightness / sleep | iOS's CoreBrightness drives a kernel `AppleARMBacklight`, which sends the panel's DCS brightness command (0x51) through the DSI command FIFO between frames; display sleep blanks the layer mixer (black = pixels off on the AMOLED panel) |
-| Touch | Synaptics RMI4 over I²C (BLSP QUP), rails switched on through the RPM, interrupt-driven, delivered as HID digitizer events |
-| Wi-Fi | QCA6174 over PCIe: own driver for firmware download (BMI), copy engines, HTC/WMI/HTT, scan, WPA2-PSK (CCMP) with our own 4-way and group-key handshake, rejoin after the AP drops us, interrupt-driven data path. To iOS it is an Apple80211 interface (`en0`), so wifid, configd and the Settings page drive it as on an iPhone |
-| Buttons | Power, volume up, volume down = **Home** (PMIC/TLMM), as HID keys |
-| Battery | Fuel gauge readout and charging at 1.5 A (PMI8994) |
-| Device identity | iPhone 8 (`iPhone10,1` / `D20AP`), Home-button UI |
-| Activation | mobileactivationd's own "Hactivation" path, chosen through device-tree security status. No Apple servers involved |
+| Bootloader | Google ABL, unlocked. `fastboot boot` of our images works: v0 header, gzip kernel with the stock DTB appended, AVB hash footer to 40 MiB (the shape TWRP has). Nothing flashed. |
+| Shim | `shim/taimen.c` runs on the phone: paints on the ABL splash framebuffer, dumps the display engine, clock and watchdog registers, and PSCI-resets. Stage 2 (`-DSTAGE2`) loads an XNU payload from the boot image's ramdisk through `/chosen` and jumps, with the APSS watchdog armed. |
+| Logs | The shim writes its RAM log to UFS (`shim/ufs_taimen.c`, a port of the Pixel 4 shim's driver) into the empty `align_parti` partition; `tools/taimen/log-pull.sh` reads it back over rooted ADB. Ramoops does not survive a reset on this phone. |
+| Display | Measured: framebuffer 0x9d400000, 1440x2880, 32 bpp BGRA, one VIG0 pipe, LM0 → CTL0 → PP0 → INTF1/DSI0 (command mode), **autorefresh off**: every frame needs an MDP CTL0 START (0xc90201c). |
+| CPU | Kryo 280, ARMv8.0, **no 16K translation granule** (ID_AA64MMFR0_EL1 = 0x1122). The kernel is built with 4K pages, which no Qualcomm port has done before; the Exynos ports (Galaxy S8 / A5) are the reference. |
+| Kernel | `TAIMEN` machine config = the sweet/sailfish kernel without 16K pages (patches 0184, 0185): compact 39-bit kernel VA, 4K user VA limit, code signing relaxed for the 16K-signed iOS cache, on-screen boot marks. Builds on GitHub Actions (`machine_config=TAIMEN`), warm runs in about 3.5 minutes. |
+| Storage, Wi-Fi, GPU, touch | Not started. Taimen uses UFS 2.1 at 0x1da4000, the integrated WCN3990 (the Pixel 4 / topaz Wi-Fi path, not sailfish's PCIe QCA6174), an Adreno 540 (a5xx, sailfish's freedreno path should apply), and an ST FTM4 touch controller. |
 
-## What does not work (yet)
+Everything measured so far is in [NOTES-taimen.md](NOTES-taimen.md); the address-by-address map from the Pixel 1 code to
+taimen is [docs/taimen-porting-map.md](docs/taimen-porting-map.md); the 4K-page work list is
+[docs/taimen-4k-catalogue.md](docs/taimen-4k-catalogue.md).
 
-- **No Bluetooth, cellular, audio, camera, sensors, GPS, Touch ID or SEP.**
-- **Wi-Fi is WPA2-PSK only** (no WPA3, enterprise or open networks yet); 5 GHz is scanned passively, and turning Wi-Fi off does not power the chip down.
-- **No hardware video decoder:** HEIC images and video do not decode. The stock wallpapers' HEIC layers are converted to PNG when the root is built (`tools/wallpaper-heic2png.sh`).
-- **No Metal.** CoreAnimation falls back to its OpenGL ES renderer, which is what runs on the GPU. Apps that need Metal do not work.
-- **No thermal management:** keep turbo off for normal use.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
-
-## How it boots
+## How it boots (planned)
 
 ```
-Pixel bootloader (aboot, unlocked)
-  -> fastboot boot pixel-boot.img             (temporary; nothing is flashed to boot)
-     -> shim: stops the watchdog, loads the payload appended to the kernel image
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args + GPU firmware
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd (+ sweetgl.dylib) + SpringBoard
+ABL (stock Google bootloader, unlocked)
+  -> fastboot boot taimen-boot.img          (temporary; nothing is flashed)
+     -> shim (shim/taimen.c): logs to UFS, arms the watchdog, reads /chosen initrd
+        -> XNU Mach-O + Apple Device Tree + boot-args (the boot image "ramdisk")
+           -> XNU (TAIMEN config, 4K pages) -> UFS driver -> HFS+ root in userdata
+              -> dyld + shared cache -> launchd -> backboardd + SpringBoard
 ```
-
-There is no serial console. The kernel log goes to a persistent 4 MiB ring at the end of `userdata` and to the RAM console (pstore) that survives a warm reset; both are read from TWRP (`tools/sweet-log-pull.sh`).
 
 ## How to do it yourself
 
-You need a Google Pixel 1 (`sailfish`) with an **unlocked bootloader**, a Mac with Xcode 15.4 and the KDK 13.5 (for the kernel build), and [TWRP for sailfish](https://dl.twrp.me/sailfish/) (booted temporarily, never flashed). **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist are never touched. Keep your partition backups and any device dumps out of git (`.gitignore` covers `backup/`, `research/`, `logs/`).
+You need a Pixel 2 XL with an **unlocked bootloader** (check `fastboot getvar unlocked`), a Linux PC with an aarch64 GNU
+toolchain (`aarch64-linux-gnu-` or the Arm GNU `aarch64-none-elf-` bare-metal toolchain), `avbtool`, `mkbootimg`,
+`python3`, and a GitHub account for the kernel build (fork this repository; Actions build XNU on free macOS runners).
+Every step below is non-destructive until the root filesystem is written to `userdata`, which erases Android.
 
-1. **Kernel:** `tools/xnu-build-local.sh xnu/out-local-NNNN` builds XNU with all patches in `xnu/patches/` (blacktop/darwin-xnu-build, Xcode 15.4 and KDK 13.5 unpacked in `research/`).
-2. **iOS root:** download the iPhone 8 IPSW `iPhone_4.7_P3_16.7.16_20H392` and build the image with `sudo tools/mkiosroot-mac.sh OS.dmg SYSTEMOS.dmg APPOS.dmg ios16-root.img`. Before flashing, attach it read-write on the Mac (`hdiutil attach -imagekey diskimage-class=CRawDiskImage ios16-root.img`) and add what the build script does not do yet:
-   - the GL library: build it with `tools/sweetgl/build.sh` and copy `tools/sweetgl/out/sweetgl.dylib` to `/usr/lib/sweetgl.dylib` (mode 755);
-   - the stock apps: move every app from `/private/var/staged_system_apps` into `/Applications` (iOS's own first-boot install of them fails on code signing here);
-   - the stock wallpapers: `tools/wallpaper-heic2png.sh MOUNTED_ROOT`.
+1. **Back up the phone.** With rooted ADB (LineageOS: Developer options → Rooted debugging) or TWRP booted from RAM:
+   `tools/taimen/backup-partitions.sh ../backup`. Keep the backups out of git (`.gitignore` already does).
+   They include the modem calibration and the IMEI: private.
+2. **Shim.** `EXTRA_CFLAGS=-DSTAGE2 shim/build-taimen.sh ../backup/boot_a.img PAYLOAD` packs the shim and the payload
+   into `shim/out/taimen-boot.img`; `fastboot boot` it. Without a payload the stage-1 diagnostic runs instead.
+   Read the log afterwards with `tools/taimen/log-pull.sh`.
+3. **Kernel.** Run the `xnu` workflow with `machine_config=TAIMEN`; the artifact is `kernel.development.taimen`.
+4. **Payload.** `tools/mkadt.py taimen.adt --taimen`, then
+   `tools/mkpayload.py kernel.development.taimen taimen.adt payload --l2block 0x200000 --cmdline "..."`.
+5. **iOS root** (later): the iPhone X 16.7.16 IPSW, built into an HFS+ image with `tools/mkiosroot.sh` and written to
+   `userdata`. Not yet exercised on this phone.
 
-   Then detach it, convert it with `tools/img2simg.py` and flash it with `fastboot flash userdata`. The first boot takes a few minutes longer while iOS builds its caches.
-3. **Firmware:** the Adreno 530 microcode (`a530_pm4.fw`, `a530_pfp.fw`, without their 4-byte headers), the zap shader (`a530_zap.mdt` + `.b02`) and the QCA6174 Wi-Fi files (`otp30.bin`, `qwlan30.bin`, `bdwlan30.bin`, `.b80`, `.b82`) come from the phone's own vendor partition. They are not in this repository.
-4. **Boot image:** `tools/mkadt.py ADT --pixel1` (needs the iPhone 8 device tree `d20ap` from the IPSW), then
-
-   ```sh
-   python3 tools/mkpayload.py KERNEL ADT payload --cmdline "$ARGS" \
-       --blob GPU-PM4=pm4.bin --blob GPU-PFP=pfp.bin \
-       --blob GPU-ZAP-MDT=a530_zap.mdt --blob GPU-ZAP-SEG=a530_zap.b02 \
-       --blob WLAN-OTP=otp30.bin --blob WLAN-FW=qwlan30.bin --blob WLAN-BDF=bdwlan30.bin \
-       --blob WLAN-BDF-80=bdwlan30.b80 --blob WLAN-BDF-82=bdwlan30.b82
-   WDT_SECS=0 shim/build-pixel.sh STOCK_BOOT.img payload     # -> shim/out/pixel-boot.img
-   fastboot boot shim/out/pixel-boot.img
-   ```
-
-   with the boot-args in use:
-
-   ```
-   debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress sweetusb=0 rd=ufsroot0 unentitled_ios_sim_launch=1
-   ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1
-   sweetfb_noconsole=1 sweetsample=- sweetnull=backboardd cs_enforcement_disable=1 sweetprof=-
-   sweetgpu=8 sweetgpuclk=600 sweetddr=1804 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib
-   sailfishwlan=1
-   ```
-
-   Boot-args are limited to 608 bytes; longer command lines are cut off silently. Join a network from Settings (or add `sailfishssid=` / `sailfishpsk=` to join at boot).
-
-5. **Logs:** boot TWRP (`fastboot boot twrp.img`), then `tools/sweet-log-pull.sh OUT.txt`.
-
-## Repository layout
+## Repository layout (taimen additions)
 
 | Path | Contents |
 | --- | --- |
-| `xnu/patches/` | Kernel patches, applied in order on top of xnu-8796 (`0079`+ are the Pixel port) |
-| `shim/` | The boot shim (`build-pixel.sh`, `pixel.c`, console, pstore) |
-| `tools/mkadt.py`, `tools/mkpayload.py` | Apple Device Tree generator and kernel payload packer |
-| `tools/sweetgl/` | `sweetgl.dylib`: Mesa freedreno + libdrm/msm emulation over the kernel GPU driver + the EAGL shim for CoreAnimation (Mesa itself is fetched and built by `mesa-setup.sh`) |
-| `tools/gpu-shaders/`, `tools/ir3asm/` | Hand-written Adreno compute shaders used by the kernel (frame scaling, self-tests) and their assembler |
-| `tools/mkiosroot*.sh`, `tools/sweet-root-tweaks.py` | iOS root image builder and the userland changes it needs |
+| `shim/taimen.c`, `shim/build-taimen.sh` | The taimen shim and its build |
+| `shim/ufs_taimen.c`, `shim/log.c` | UFS log channel (polled UFSHCI, WRITE(10) into `align_parti`) and the RAM log |
+| `tools/taimen/` | `mkboot.sh` (ABL boot image), `log-pull.sh`, `backup-partitions.sh`, `granule-probe.sh` (+ `granule-probe-fb.S`) |
+| `tools/mkadt.py --taimen` | The Apple Device Tree for taimen |
+| `xnu/patches/0184-*`, `0185-*` | TAIMEN machine config and the 4K-page layout |
+| `NOTES-taimen.md`, `docs/taimen-*.md` | Measurements, porting map, 4K catalogue |
+| `.github/workflows/xnu.yml` | Kernel build with cached dependencies and ccache |
 
-## Notable kernel pieces
-
-- `bsd/dev/sweet_gpu.c`, `iokit/Kernel/arm/SweetGPU.cpp`: Adreno 530 bring-up and a msm-style buffer/submit interface for user space.
-- `iokit/Kernel/arm/SweetSurface.cpp`, `SweetFramebuffer.cpp`: IOSurface and IOMobileFramebuffer (`AppleCLCD`) as backboardd expects them; GPU present into double-buffered panel memory.
-- `bsd/dev/sweet_rpm.c`: talks to the RPM like Linux (GLINK, smd-rpm) for regulators, clocks, DDR and the memory rail.
-- `bsd/dev/sailfish_wlan.c`, `iokit/Kernel/arm/SailfishWLAN.cpp`: the QCA6174 Wi-Fi driver and its Apple80211 / IONetworking face for wifid and configd (Apple's IONetworkingFamily is staged into the kernel by `xnu/patches/0175-stage-ionetworking.sh`).
-- `bsd/dev/sweet_ufs.c`, `sweet_keys.c`, `sweet_touch.c`, `sweet_perf.c`: storage, buttons, touch, CPU clocks.
+The Pixel 1 port's own README is kept as [docs/upstream-sailfish-README.md](docs/upstream-sailfish-README.md).
 
 ## Credits
 
-- [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet): the original XNU-on-Qualcomm port this builds on.
-- [Mesa](https://mesa3d.org/) / freedreno: the open-source Adreno driver that renders iOS here.
-- [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz): the IOAcceleratorES and IOKit-quiesce findings behind the faster boot.
-- Apple's open-source XNU, and [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) for building it.
+- [joranv1/ios-sailfish](https://github.com/joranv1/ios-sailfish): the Pixel 1 port this repository is forked from (Qualcomm drivers, GPU through freedreno, Wi-Fi).
+- [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet): the original iOS 16 port to the Redmi Note 10 Pro.
+- [NWylynko/ios-flame](https://github.com/NWylynko/ios-flame): the Pixel 4 port; its shim's UFS driver and RAM log are reused here (MIT).
+- [Floppikrob/ios-galaxy-s8](https://github.com/Floppikrob/ios-galaxy-s8) and [orhunnx/ios-a5xelte](https://github.com/orhunnx/ios-a5xelte): the 4 KiB-page XNU work the TAIMEN config follows.
+- Apple's open-source releases (xnu, IOHIDFamily, hfs), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [blacktop/ipsw](https://github.com/blacktop/ipsw).
 
-iOS itself is Apple's and is not distributed here: you build the root from Apple's own IPSW.
+iOS belongs to Apple and is not distributed here: download the IPSW yourself.
+
+## License
+
+The XNU patches are derived from XNU and fall under the [APSL 2.0](https://opensource.apple.com/apsl/). The shim and
+tools follow the upstream repositories' licenses (MIT).
