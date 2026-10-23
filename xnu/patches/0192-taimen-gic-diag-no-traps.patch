@@ -1,0 +1,24 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 7fb03a9..07813fd 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -72,13 +72,14 @@ taimen_gic_dump(const char *tag)
+ 	    tag, (unsigned long)((gicr_pe_base - gicr_base) / GICR_STRIDE), typer, gicr_read32(GICR_WAKER),
+ 	    gicr_read32(GICR_ISENABLER0), gicr_read32(0x10200), gicr_read32(0x10300), gicr_read32(GICR_IPRIORITYR0 + 0x10),
+ 	    gicr_read32(0x10c04));
+-	printf("TAIMEN GIC [%s]: GICD_CTLR 0x%x ICC_IGRPEN1 0x%llx PMR 0x%llx RPR 0x%llx HPPIR1 0x%llx HPPIR0 0x%llx DAIF 0x%llx\n",
++	/* No ICC_HPPIR0_EL1 (Group 0 is TrustZone's: traps to EL3 with SCR_EL3.FIQ) and no CNTP_* (the
++	 * hypervisor traps physical timer access): reading either reset the phone (boots 7-9). */
++	printf("TAIMEN GIC [%s]: GICD_CTLR 0x%x ICC_IGRPEN1 0x%llx PMR 0x%llx RPR 0x%llx HPPIR1 0x%llx DAIF 0x%llx\n",
+ 	    tag, gicd_read32(GICD_CTLR), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"),
+-	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"), __builtin_arm_rsr64("ICC_HPPIR0_EL1"),
+-	    __builtin_arm_rsr64("DAIF"));
+-	printf("TAIMEN GIC [%s]: CNTV_CTL 0x%llx CNTV_CVAL 0x%llx CNTVCT 0x%llx CNTP_CTL 0x%llx CNTKCTL 0x%llx\n",
++	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"), __builtin_arm_rsr64("DAIF"));
++	printf("TAIMEN GIC [%s]: CNTV_CTL 0x%llx CNTV_CVAL 0x%llx CNTVCT 0x%llx CNTKCTL 0x%llx\n",
+ 	    tag, __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"), __builtin_arm_rsr64("CNTVCT_EL0"),
+-	    __builtin_arm_rsr64("CNTP_CTL_EL0"), __builtin_arm_rsr64("CNTKCTL_EL1"));
++	    __builtin_arm_rsr64("CNTKCTL_EL1"));
+ }
+ #endif
+ 
