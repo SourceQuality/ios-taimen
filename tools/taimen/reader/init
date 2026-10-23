@@ -4,6 +4,7 @@
 # them to the PC as a read-only USB drive labelled TAIMENLOG, then reboots into fastboot.
 #   pstore-*        /sys/fs/pstore (console-ramoops = XNU's PRZ at 0xb0080000)
 #   sweetlog.bin    last 1025 4K blocks of userdata: the kernel's 4 MiB UFS log ring (ufsrw=1)
+#   shim-log.bin    first 64 4K blocks of align_parti: the shim's RAM log
 #   reader.txt      this script's own log and dmesg
 # Boot-arg-free: everything runs from here, and a 150 s guard reboots into fastboot whatever
 # happens.
@@ -41,6 +42,15 @@ if [ -n "$dev" ] && [ -b "/dev/$dev" ]; then
 	log "userdata /dev/$dev, $blocks 4K blocks, ring area copied"
 else
 	log "userdata not found"
+fi
+# the shim's own RAM log (shim/ufs_taimen.c: the first blocks of align_parti)
+ap=
+for u in /sys/class/block/*/uevent; do
+	grep -q '^PARTNAME=align_parti$' "$u" && ap=$(sed -n 's/^DEVNAME=//p' "$u")
+done
+if [ -n "$ap" ] && [ -b "/dev/$ap" ]; then
+	dd if="/dev/$ap" of=/out/shim-log.bin bs=4096 count=64 2>> /out/reader.txt
+	log "align_parti /dev/$ap: shim log copied"
 fi
 
 dmesg > /out/dmesg.txt

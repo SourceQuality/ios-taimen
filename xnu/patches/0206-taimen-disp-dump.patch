@@ -1,0 +1,62 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 8940c7a..3e80f48 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -96,6 +96,47 @@ taimen_fb_probe(int t)
+ 	}
+ }
+ 
++/*
++ * Boot 20: the panel memory holds the kernel's frames and the MDP completes every kickoff
++ * without a DSI error, so compare the link with the shim's: DSI0 (0xc994000) and PP0
++ * (0xc971000) register dumps in the shim's format ("DISP tag DSI0+0x000: 8 words"; the STAGE2
++ * shim logs the same just before the jump), and how often DSI0 STATUS0 reads busy.
++ */
++#define TAIMEN_DSI0_PA  0xc994000
++#define TAIMEN_PP0_PA   0xc971000
++static volatile uint32_t *taimen_dsi0, *taimen_pp0;
++
++static void
++taimen_disp_dump(const char *tag)
++{
++	if (taimen_dsi0 == NULL) {
++		taimen_dsi0 = (volatile uint32_t *)ml_io_map(TAIMEN_DSI0_PA, PAGE_SIZE);
++		taimen_pp0 = (volatile uint32_t *)ml_io_map(TAIMEN_PP0_PA, PAGE_SIZE);
++		if (taimen_dsi0 == NULL || taimen_pp0 == NULL) {
++			IOLog("DISP %s: mapping failed\n", tag);
++			return;
++		}
++	}
++	for (uint32_t o = 0; o < 0x200; o += 0x20) {
++		volatile uint32_t *d = taimen_dsi0 + o / 4;
++		IOLog("DISP %s DSI0+0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, o,
++		    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
++	}
++	for (uint32_t o = 0; o < 0x80; o += 0x20) {
++		volatile uint32_t *d = taimen_pp0 + o / 4;
++		IOLog("DISP %s PP0+0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, o,
++		    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
++	}
++	uint32_t eng = 0, mdp = 0, any = 0;
++	for (int i = 0; i < 20000; i++) {
++		uint32_t s = taimen_dsi0[0x08 / 4];
++		eng += s & 1;
++		mdp += (s >> 2) & 1;
++		any += s != 0;
++	}
++	IOLog("DISP %s busy of 20000 reads: engine %u mdp %u nonzero %u\n", tag, eng, mdp, any);
++}
++
+ /* Three short lines: the on-screen log viewer shows 90 columns. */
+ static void
+ taimen_fb_report(int t)
+@@ -140,6 +181,9 @@ taimen_wdt_thread(void *arg)
+ 		if (t % 20 == 0) {
+ 			taimen_fb_report(t);
+ 		}
++		if (t == 0 || t == 60) {
++			taimen_disp_dump(t == 0 ? "xnu-0s" : "xnu-60s");
++		}
+ 		if (t == 10 || t == 40) {
+ 			taimen_thread_dump(t == 10 ? "10s" : "40s");
+ 		}

@@ -6,7 +6,8 @@
 #   into fastboot. Decoded logs: OUTDIR/sweetlog.txt (UFS ring), OUTDIR/pstore-xnu.txt.
 # Usage: [ROOT=1] tools/taimen/autoboot.sh KERNEL OUTDIR [boot-args]   (include taimenreboot=N)
 # Exit: 0 logs read and phone back in fastboot; 2 no fastboot at the start; 3 no reader drive
-# (phone hung: needs the power key); 4 logs read but the phone did not return to fastboot.
+# (phone hung: needs the power key); 4 logs read but the phone did not return to fastboot;
+# 5 the reader image did not build.
 set -uo pipefail
 P=$(cd "$(dirname "$0")/../.." && pwd)
 export PATH="$HOME/.local/bin:$PATH"
@@ -18,7 +19,7 @@ waitfb() { for i in $(seq 1 "$1"); do fb && return 0; sleep 2; done; return 1; }
 
 waitfb 60 || { say "phone not in fastboot"; "$P/tools/taimen/attention.sh" "Put the Pixel in fastboot mode: hold power and volume down"; waitfb 300 || exit 2; }
 img=$P/shim/out/taimen-reader.img
-[ -s "$img" ] || "$P/tools/taimen/mkreader.sh" >/dev/null
+"$P/tools/taimen/mkreader.sh" > /dev/null || { say "reader build failed"; exit 5; }
 for s in a b; do timeout 120 fastboot flash boot_$s "$img" 2>&1 | grep -E "Writing|FAILED"; done
 reboot_s=$(echo "$*" | sed -n 's/.*taimenreboot=\([0-9]*\).*/\1/p')
 NO_ALERT=1 BOOT_WAIT=25 "$P/tools/taimen/boot-xnu.sh" "$kernel" "$out" "$@" > "$out/boot.log" 2>&1
@@ -32,6 +33,7 @@ if ! powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$P/t
 	exit 3
 fi
 [ -f "$out/reader/sweetlog.bin" ] && python3 -I "$P/tools/sweet-log.py" "$out/reader/sweetlog.bin" "$out/sweetlog.txt"
+[ -f "$out/reader/shim-log.bin" ] && tr -d '\000' < "$out/reader/shim-log.bin" > "$out/shim-log.txt"
 python3 -I - "$out/reader" "$out/pstore-xnu.txt" <<'EOF'
 import glob, re, sys
 best = b''

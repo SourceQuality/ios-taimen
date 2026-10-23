@@ -85,6 +85,36 @@ static void save(const char *why)
 	con_hex2("UFS", "save rc=", (uint32_t)rc, 0, 0);
 }
 
+#ifdef STAGE2
+/*
+ * Reference for xnu 0206: DSI0 and PP0 registers while the shim's frames do reach the panel,
+ * in the same format as the kernel's "DISP" lines, and how often DSI0 STATUS0 reads busy.
+ */
+static void disp_dump(const char *tag)
+{
+	for (uint32_t o = 0; o < 0x200; o += 0x20) {
+		uint64_t a = 0xc994000UL + o;
+		log_printf("DISP %s DSI0+0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, o,
+			   rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16), rd32(a + 20),
+			   rd32(a + 24), rd32(a + 28));
+	}
+	for (uint32_t o = 0; o < 0x80; o += 0x20) {
+		uint64_t a = 0xc971000UL + o;
+		log_printf("DISP %s PP0+0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, o,
+			   rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16), rd32(a + 20),
+			   rd32(a + 24), rd32(a + 28));
+	}
+	uint32_t eng = 0, mdp = 0, any = 0;
+	for (int i = 0; i < 20000; i++) {
+		uint32_t s = rd32(0xc994008UL);
+		eng += s & 1;
+		mdp += (s >> 2) & 1;
+		any += s != 0;
+	}
+	log_printf("DISP %s busy of 20000 reads: engine %u mdp %u nonzero %u\n", tag, eng, mdp, any);
+}
+#endif
+
 extern char _end[];
 
 #ifdef LOGVIEW
@@ -352,6 +382,8 @@ void shim_main(uint64_t dtb)
 	wr32(APSS_WDT + WDT_EN, 1);
 	__asm__ volatile("dsb sy" ::: "memory");
 	log_printf("wdt armed: %u s (bite reg %08x)\n", (unsigned)WDT_SECS, rd32(APSS_WDT + WDT_BITE));
+	con_flush();
+	disp_dump("shim");
 	save("before loader");
 	con_str("LOADER", "payload from initrd ..");
 	con_flush();
