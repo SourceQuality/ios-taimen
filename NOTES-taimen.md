@@ -312,3 +312,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   when the FIFO underflowed or the DSI is still busy at the 50 ms timeout; done = PP0 done and DSI idle; AppleCLCD
   waits for the frame in flight before copying. ROOT boots add `sweetfb_noconsole=1`. pstore had no XNU text this
   time (0 bytes): the screenshots wrapped the 1 MiB PRZ; the 4 MiB UFS ring held all 1.6 MB.
+- 2026-10-23 **boot 23 (r28 = +0207 DSI recovery, taimenreboot=180): the DSI recovers and stays healthy.** Two
+  resets right after the kernel start (`DSI resets 2, last FIFO_STATUS 0x99991080`: the underflow happens during the
+  early boot's memory traffic), none afterwards. At 60 s DSI0 STATUS0 0, FIFO_STATUS 0x11111000 (clean), lanes back in
+  LP-11 between frames (+0xa8 0x1f1f), busy in 4296 of 20000 reads: transfers start and finish, ~24 frames/s by 180 s
+  (3647 kicks, 3645 done, 2 timeouts). Screenshots: the boot progress screen again, bar ~22 % at 180 s (~15 % at 120 s
+  in boot 22): first-boot data migration, ~7 %/min. The panel memory keeps the console text the kernel drew in the
+  borders before the first swap muted it. Next: boot 24, 25 minutes, to let the migration finish on screen.
