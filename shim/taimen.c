@@ -130,7 +130,7 @@ static int lv_has(const char *l, int n, const char *k)
 	}
 	return 0;
 }
-static uint32_t lv_ls[8192];
+static uint32_t lv_ls[32768];
 static void logview(void)
 {
 	lv_p = (volatile uint8_t *)PRZ_BASE;
@@ -150,17 +150,18 @@ static void logview(void)
 	con_line((sig ^ PRZ_SIG) ? "XNU LOG VIEW  (ring signature BAD)" : "XNU LOG VIEW  (ring signature ok)", cols, YELLOW);
 	/* line starts; when there are more lines than slots keep the newest */
 	uint32_t nl = 0;
-	lv_ls[nl++ % 8192] = 0;
+	lv_ls[nl++ % 32768] = 0;
 	for (uint32_t i = 0; i < lv_size; i++)
 		if (lv_ch(i) == '\n')
-			lv_ls[nl++ % 8192] = i + 1;
-	uint32_t base = nl > 8192 ? nl - 8192 : 0;
-	static const char keys[] = "panic\0PANIC\0BSD root\0SWEET UFS\0mount\0launchd\0TAIMEN RESET\0"
-	    "reached\0hfs\0exec\0Exception\0Fatal\0kernel trap\0";
-	int imp = rows / 3, shown = 0;
+			lv_ls[nl++ % 32768] = i + 1;
+	uint32_t base = nl > 32768 ? nl - 32768 : 0;
+	/* boots 17-18: "exec" crowded everything else out once the userland ran */
+	static const char keys[] = "panic\0PANIC\0BSD root\0launchd\0AppleCLCD\0TAIMEN FB\0TAIMEN RESET\0"
+	    "reached\0SpringBoard\0backboardd\0CRASH\0Exception\0Fatal\0kernel trap\0";
+	int imp = rows / 2, shown = 0;
 	con_line("== key lines (first matches) ==", cols, GREEN);
 	for (uint32_t l = base; l + 1 < nl && shown < imp; l++) {
-		int len = lv_get(lv_ls[l % 8192], lv_ls[(l + 1) % 8192], line, cols);
+		int len = lv_get(lv_ls[l % 32768], lv_ls[(l + 1) % 32768], line, cols);
 		for (const char *kq = keys; *kq; ) {
 			if (lv_has(line, len, kq)) {
 				con_line(line, len, WHITE);
@@ -176,7 +177,7 @@ static void logview(void)
 	uint32_t left = (uint32_t)(rows - 3 - shown);
 	uint32_t first = nl - 1 > base + left ? nl - 1 - left : base;
 	for (uint32_t l = first; l + 1 < nl; l++) {
-		int len = lv_get(lv_ls[l % 8192], lv_ls[(l + 1) % 8192], line, cols);
+		int len = lv_get(lv_ls[l % 32768], lv_ls[(l + 1) % 32768], line, cols);
 		con_line(line, len, WHITE);
 	}
 	con_flush();
