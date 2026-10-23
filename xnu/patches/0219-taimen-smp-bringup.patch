@@ -1,0 +1,376 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 93d6318..c28e2a1 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -26,7 +26,7 @@ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
+ 
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+-static int32_t
++static int32_t __attribute__((unused))
+ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+ {
+ 	register uint64_t x0 __asm__("x0") = 0xC4000003ULL;
+@@ -39,6 +39,150 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+ 	return (int32_t)x0;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * Taimen SMP bring-up (0219, docs/taimen-smp-plan.md). From XNU, PSCI SYSTEM_RESET came back
++ * with x0 unchanged (boots 14-15) although the shim's identical call worked, and the phone's
++ * Linux starts all 8 cores with CPU_ON over smc. So: probe PSCI in three contexts, CPU_ON in
++ * the first that answers, and follow the new core through breadcrumbs it writes from its
++ * first instruction on (start.s sweet_secondary_entry 0x01, arm_init_cpu 0x05/0x07/0x09,
++ * initCPU 0x0A).
++ */
++extern "C" {
++uint64_t taimen_smp_crumbs[8][8] __attribute__((aligned(64)));
++void taimen_smp_mark(uint64_t stage, uint64_t a, uint64_t b);
++}
++
++static unsigned
++taimen_crumb_slot(uint64_t mpidr)
++{
++	return (unsigned)((((mpidr >> 8) & 1) << 2) | (mpidr & 3));
++}
++
++/* Secondary, MMU on. Line: stage, MPIDR, a, b, -, -, CNTVCT. */
++void
++taimen_smp_mark(uint64_t stage, uint64_t a, uint64_t b)
++{
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	volatile uint64_t *c = taimen_smp_crumbs[taimen_crumb_slot(mpidr)];
++	c[1] = mpidr;
++	c[2] = a;
++	c[3] = b;
++	c[6] = __builtin_arm_rsr64("CNTVCT_EL0");
++	__builtin_arm_dmb(DMB_ISH);
++	c[0] = stage;
++	__builtin_arm_dsb(DSB_SY);
++}
++
++/* CPU0 before CPU_ON, and when polling: the core's MMU-off writes go straight to memory. */
++static void
++taimen_crumb_clear(uint64_t mpidr)
++{
++	volatile uint64_t *c = taimen_smp_crumbs[taimen_crumb_slot(mpidr)];
++	for (int i = 0; i < 8; i++) {
++		c[i] = 0;
++	}
++	__asm__ volatile ("dc civac, %0" : : "r"(c) : "memory");
++	__builtin_arm_dsb(DSB_SY);
++}
++
++static void
++taimen_crumb_read(uint64_t mpidr, uint64_t out[8])
++{
++	volatile uint64_t *c = taimen_smp_crumbs[taimen_crumb_slot(mpidr)];
++	__asm__ volatile ("dc civac, %0" : : "r"(c) : "memory");
++	__builtin_arm_dsb(DSB_SY);
++	for (int i = 0; i < 8; i++) {
++		out[i] = c[i];
++	}
++}
++
++enum { TPSCI_THREAD, TPSCI_NOIRQ, TPSCI_NOIRQ_PMR0, TPSCI_N };
++static const char *const taimen_psci_ctx_name[TPSCI_N] = {"thread", "irq off", "irq off, pmr 0"};
++static int taimen_psci_ctx = -1;        /* the first context PSCI_VERSION answered in */
++
++static uint64_t
++taimen_psci(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3, bool hvc, int ctx)
++{
++	boolean_t istate = TRUE;
++	uint64_t pmr = 0;
++	if (ctx != TPSCI_THREAD) {
++		istate = ml_set_interrupts_enabled(FALSE);
++	}
++	if (ctx == TPSCI_NOIRQ_PMR0) {          /* no NS Group 1 interrupt is signalled */
++		pmr = __builtin_arm_rsr64("ICC_PMR_EL1");
++		__builtin_arm_wsr64("ICC_PMR_EL1", 0);
++		__builtin_arm_isb(ISB_SY);
++	}
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	if (hvc) {
++		__asm__ volatile("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	} else {
++		__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	}
++	uint64_t r = x0;
++	if (ctx == TPSCI_NOIRQ_PMR0) {
++		__builtin_arm_wsr64("ICC_PMR_EL1", pmr);
++		__builtin_arm_isb(ISB_SY);
++	}
++	if (ctx != TPSCI_THREAD) {
++		(void)ml_set_interrupts_enabled(istate);
++	}
++	return r;
++}
++
++static const char *
++taimen_psci_err(int32_t rc)
++{
++	switch (rc) {
++	case 0: return "SUCCESS";
++	case -1: return "NOT_SUPPORTED";
++	case -2: return "INVALID_PARAMETERS";
++	case -3: return "DENIED";
++	case -4: return "ALREADY_ON";
++	case -5: return "ON_PENDING";
++	case -6: return "INTERNAL_FAILURE";
++	case -9: return "INVALID_ADDRESS";
++	default: return "?";
++	}
++}
++
++static void
++taimen_psci_probe(void)
++{
++	static const uint32_t aff[8] = {0x0, 0x1, 0x2, 0x3, 0x100, 0x101, 0x102, 0x103};
++	for (int ctx = 0; ctx < TPSCI_N; ctx++) {
++		const char *n = taimen_psci_ctx_name[ctx];
++		uint64_t v = taimen_psci(0x84000000ULL, 0, 0, 0, false, ctx);
++		IOLog("TAIMEN PSCI [%s] VERSION -> %#llx%s\n", n, v, v == 0x84000000ULL ? " UNCHANGED" : "");
++		uint64_t f1 = taimen_psci(0x8400000AULL, 0xC4000003ULL, 0, 0, false, ctx);
++		uint64_t f2 = taimen_psci(0x8400000AULL, 0xC4000004ULL, 0, 0, false, ctx);
++		uint64_t f3 = taimen_psci(0x8400000AULL, 0x84000009ULL, 0, 0, false, ctx);
++		IOLog("TAIMEN PSCI [%s] FEATURES CPU_ON %#llx AFFINITY_INFO %#llx SYSTEM_RESET %#llx\n", n, f1, f2, f3);
++		char line[128];
++		int len = 0;
++		for (int i = 0; i < 8 && len < (int)sizeof(line); i++) {
++			int32_t r = (int32_t)taimen_psci(0xC4000004ULL, aff[i], 0, 0, false, ctx);
++			len += snprintf(line + len, sizeof(line) - (size_t)len, " %x:%d", aff[i], r);
++		}
++		IOLog("TAIMEN PSCI [%s] AFFINITY_INFO%s (0 on, 1 off, 2 pending)\n", n, line);
++		if (taimen_psci_ctx < 0 && v >= 0x10000ULL && v < 0x80000000ULL) {
++			taimen_psci_ctx = ctx;
++		}
++	}
++	uint64_t h = taimen_psci(0x84000000ULL, 0, 0, 0, true, TPSCI_THREAD);
++	IOLog("TAIMEN PSCI [thread, hvc] VERSION -> %#llx%s\n", h, h == 0x84000000ULL ? " UNCHANGED" : "");
++	IOLog("TAIMEN PSCI: CPU_ON goes in context %s\n", taimen_psci_ctx >= 0 ? taimen_psci_ctx_name[taimen_psci_ctx] : "none");
++}
++#endif
++
+ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+@@ -151,6 +295,16 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	int probe = 0;
++	(void)PE_parse_boot_argn("taimenpsciprobe", &probe, sizeof(probe));
++	if (topology->num_cpus > 1 || probe) {
++		taimen_psci_probe();
++	}
++	if (taimen_psci_ctx < 0 && topology->num_cpus > 1) {
++		panic("TAIMEN PSCI: firmware did not answer smc in any context (probe above)");
++	}
++#endif
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+@@ -159,8 +313,32 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		uint64_t phys = topology->cpus[i].phys_id, t_on = mach_absolute_time(), crumb[8], last_stage = ~0ULL, us;
++		int32_t last_aff = -99;
++		unsigned polls = 0;
++#endif
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++			if (i != 0) {
++				taimen_crumb_read(phys, crumb);
++				absolutetime_to_nanoseconds(mach_absolute_time() - t_on, &us);
++				us /= 1000;
++				if (crumb[0] != last_stage) {
++					last_stage = crumb[0];
++					IOLog("SWEET CPU: cpu=%u +%llu us crumb %#llx mpidr %#llx v %#llx %#llx %#llx\n",
++					    i, us, crumb[0], crumb[1], crumb[2], crumb[3], crumb[4]);
++				}
++				if ((polls++ % 100) == 0 && taimen_psci_ctx >= 0) {
++					int32_t a = (int32_t)taimen_psci(0xC4000004ULL, phys, 0, 0, false, taimen_psci_ctx);
++					if (a != last_aff) {
++						last_aff = a;
++						IOLog("SWEET CPU: cpu=%u +%llu us AFFINITY_INFO %d\n", i, us, a);
++					}
++				}
++			}
++#endif
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
+@@ -203,6 +381,11 @@ SweetCPU::initCPU(bool boot)
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
+ 	setCPUState(kIOCPUStateRunning);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (getCPUNumber() != 0) {
++		taimen_smp_mark(0x0a, ml_get_interrupts_enabled(), 0);  /* initCPU, SGI1 queued */
++	}
++#endif
+ 	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+@@ -242,11 +425,24 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	int ctx = taimen_psci_ctx >= 0 ? taimen_psci_ctx : TPSCI_THREAD;
++	taimen_crumb_clear(cpu->phys_id);
++	int32_t before = (int32_t)taimen_psci(0xC4000004ULL, cpu->phys_id, 0, 0, false, ctx);
++	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u [%s] AFFINITY_INFO before %d\n",
++	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber(), taimen_psci_ctx_name[ctx], before);
++	__builtin_arm_dsb(DSB_SY);
++	uint64_t raw = taimen_psci(0xC4000003ULL, cpu->phys_id, entry, getCPUNumber(), false, ctx);
++	int32_t rc = (int32_t)raw;
++	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d %s raw %#llx%s\n", getCPUNumber(), rc, taimen_psci_err(rc), raw,
++	    raw == 0xC4000003ULL ? ": x0 unchanged, the call did not reach PSCI" : "");
++#else
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++#endif
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+ 		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..b9e3ef8 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -672,6 +672,10 @@ arm_init(
+  *    Runs on S2R resume (all CPUs) and SMP boot (non-boot CPUs only).
+  */
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++extern void taimen_smp_mark(uint64_t stage, uint64_t a, uint64_t b);   /* SweetCPU.cpp, 0219 breadcrumbs */
++#endif
++
+ void
+ arm_init_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+@@ -727,6 +731,11 @@ arm_init_cpu(
+ 	cpu_machine_idle_init(FALSE);
+ 
+ 	cpu_init();
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (cpu_data_ptr != &BootCpuData) {
++		taimen_smp_mark(0x05, cpu_data_ptr->cpu_number, 0);    /* MMU on, cpu_init done */
++	}
++#endif
+ 
+ #ifdef  APPLETYPHOON
+ 	if ((cpus_defeatures & (0xF << 4 * cpu_data_ptr->cpu_number)) != 0) {
+@@ -756,6 +765,11 @@ arm_init_cpu(
+ 		commpage_update_timebase();
+ 	}
+ 	PE_init_cpu();
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (cpu_data_ptr != &BootCpuData) {
++		taimen_smp_mark(0x07, 0, 0);                    /* GIC (pe_init_fiq) done */
++	}
++#endif
+ 
+ 	fiq_context_init(TRUE);
+ 	cpu_data_ptr->rtcPop = EndOfAllTime;
+@@ -796,6 +810,11 @@ arm_init_cpu(
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (cpu_data_ptr != &BootCpuData) {
++		taimen_smp_mark(0x09, 0, 0);                    /* timer on, into slave_main */
++	}
++#endif
+ 
+ 	slave_main(NULL);
+ }
+diff --git a/osfmk/arm/cpuid.c b/osfmk/arm/cpuid.c
+index a2fcff1..82c7417 100644
+--- a/osfmk/arm/cpuid.c
++++ b/osfmk/arm/cpuid.c
+@@ -388,6 +388,14 @@ do_cacheid(void)
+ 		cpuid_cache_info_p->c_inner_cache_size = cpuid_cache_info_p->c_dsize;
+ 		cpuid_cache_info_p->c_bulksize_op = cpuid_cache_info_p->c_dsize;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * Whole-cache set/way operations act on the executing core only; with more than one
++	 * core running (0219, docs/taimen-smp-plan.md 5.7) every flush takes the VA-range path,
++	 * which broadcasts. caches.c tests c_bulksize_op != 0 first.
++	 */
++	cpuid_cache_info_p->c_bulksize_op = 0;
++#endif
+ 
+ 	if (cpuid_cache_info_p->c_unified == 0) {
+ 		machine_write_csselr(CSSELR_L1, CSSELR_INSTR);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 3622163..4d9b1b6 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -289,6 +289,27 @@ LEXT(bootstrap_instructions)
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+ 	msr		DAIFSet, #0xf
++#if defined(TAIMEN)
++	/* 0219 breadcrumb 0x01, MMU off: this core runs our code. One 64-byte line per core in
++	 * taimen_smp_crumbs (SweetCPU.cpp), slot Aff1 * 4 + Aff0: stage, MPIDR, CurrentEL,
++	 * SCTLR_EL1, x0. adrp gives the physical address while the MMU is off. */
++	mrs		x10, MPIDR_EL1
++	and		x11, x10, #3
++	ubfx	x12, x10, #8, #1
++	orr		x11, x11, x12, lsl #2
++	adrp	x9, EXT(taimen_smp_crumbs)@page
++	add		x9, x9, EXT(taimen_smp_crumbs)@pageoff
++	add		x9, x9, x11, lsl #6
++	str		x10, [x9, #8]
++	mrs		x12, CurrentEL
++	str		x12, [x9, #16]
++	mrs		x12, SCTLR_EL1
++	str		x12, [x9, #24]
++	str		x0, [x9, #32]
++	mov		x13, #1
++	str		x13, [x9]
++	dsb		sy
++#endif
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 8e5b872..de07238 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -306,7 +306,18 @@ pe_init_fiq()
+ 
+ 	// Mark this PE to be awake
+ 	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * Never written on taimen (0219): the phone's Linux never touches it (wahoo builds with
++	 * CONFIG_ARM_GIC_V3_ACL), on MSM8996 the hypervisor guards it and a write reboots the
++	 * board, and all 8 frames read 0 at handoff. A sleeping redistributor would show as a
++	 * failed SGI1 check instead.
++	 */
++	static int taimen_waker_writes;
++	if ((gicr_waker & GICR_WAKER_CHILDRENASLEEP) && taimen_waker_writes) {
++#else
+ 	if (gicr_waker & GICR_WAKER_CHILDRENASLEEP) {
++#endif
+ 		gicr_waker &= ~GICR_WAKER_PROCESSORSLEEP;
+ 
+ 		gicr_write32(GICR_WAKER, gicr_waker);
