@@ -1,0 +1,69 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 47dfa41..3622163 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -553,10 +553,7 @@ Ltaimen_s0_band:
+ 	subs	x2, x2, #1
+ 	b.ne	Ltaimen_s0_band
+ 	dsb	sy
+-	MOV64	x0, 0xc90201c
+-	mov	w1, #1
+-	str	w1, [x0]
+-	dsb	sy
++	/* No START here: a bare START during a frame transfer desyncs the panel; sweet_early_band kicks properly. */
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 67f4c3f..1ceb39c 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -44,6 +44,30 @@ static volatile uint8_t *early_base = (volatile uint8_t *)(uintptr_t)SWEET_EARLY
+ #define TAIMEN_KICK_OFF  (0xc90201cULL - TAIMEN_MDP_BLOCK_PA)
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)TAIMEN_FB_PA;
+ static volatile uint32_t *early_kick = (volatile uint32_t *)(uintptr_t)(TAIMEN_MDP_BLOCK_PA + TAIMEN_KICK_OFF);
++#define TAIMEN_INTR_OFF  (0xc901014ULL - TAIMEN_MDP_BLOCK_PA)	/* MDP INTR_STATUS; +4 = INTR_CLEAR */
++#define TAIMEN_PP0_DONE  (1u << 8)
++static volatile uint32_t *early_intr = (volatile uint32_t *)(uintptr_t)(TAIMEN_MDP_BLOCK_PA + TAIMEN_INTR_OFF);
++
++/*
++ * One frame to the command-mode panel, the way the shim does it: wait for the
++ * previous transfer (PING_PONG_0_DONE, 100 ms cap), clear it, START. A bare
++ * START while a frame is in flight desyncs the DSC panel (noise band, frozen
++ * picture): that is what boots 1-9 did from here and from start.s.
++ */
++static void
++taimen_kick(void)
++{
++	uint64_t f, t0, t;
++	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
++	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
++	do {
++		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
++	} while (!(early_intr[0] & TAIMEN_PP0_DONE) && t - t0 < f / 10);
++	early_intr[1] = TAIMEN_PP0_DONE;
++	__asm__ volatile("dsb sy" ::: "memory");
++	*early_kick = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
+ 
+ static void
+ sweet_early_band(unsigned int stage)
+@@ -57,8 +81,7 @@ sweet_early_band(unsigned int stage)
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	*early_kick = 1;
+-	__asm__ volatile("dsb sy" ::: "memory");
++	taimen_kick();
+ }
+ #endif
+ #define PRZ_W(off) (*(volatile uint32_t *)(early_base + PRZ_OFF + (off)))
+@@ -233,6 +256,7 @@ sweet_early_relocate(uint64_t base)
+ 	early_fb = (volatile uint32_t *)(uintptr_t)base;
+ 	early_base = (volatile uint8_t *)(uintptr_t)(base + (uint64_t)TAIMEN_FB_BLOCKS * ARM_TT_L2_SIZE);
+ 	early_kick = (volatile uint32_t *)(uintptr_t)(base + (uint64_t)(TAIMEN_FB_BLOCKS + 1u) * ARM_TT_L2_SIZE + TAIMEN_KICK_OFF);
++	early_intr = (volatile uint32_t *)(uintptr_t)(base + (uint64_t)(TAIMEN_FB_BLOCKS + 1u) * ARM_TT_L2_SIZE + TAIMEN_INTR_OFF);
+ #else
+ 	early_base = (volatile uint8_t *)(uintptr_t)base;
+ #endif
