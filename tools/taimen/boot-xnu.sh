@@ -9,6 +9,13 @@ set -euo pipefail
 P=$(cd "$(dirname "$0")/../.." && pwd)
 kernel=$(realpath "$1"); out=${2:-$P/out/taimen-xnu}; shift || true; shift || true
 args=${*:-}
+# ROOT=1: the iOS root on userdata (tools/taimen/install-root.sh). The args are the Pixel 1
+# README's line minus its GPU/Wi-Fi parts plus what docs/taimen-audit-root-path.md asks for:
+# ufsrw=1 (HFS+ journal replay, UFS console ring), cs_enforcement_disable=1 (4K pages vs the
+# 16K-signed cache), the userland switches dyld/launchd/watchdogd read from kern.bootargs.
+if [ "${ROOT:-0}" = 1 ]; then
+	args="rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin ${args}"
+fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"
 python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
@@ -30,15 +37,16 @@ t0=$(date +%s)
 echo "fastboot boot at $(date +%T): $img"
 fastboot boot "$img" | tail -1
 back=""
-for i in $(seq 1 240); do
+for i in $(seq 1 "${BOOT_WAIT:-240}"); do
 	s=$(timeout 3 adb get-state 2>/dev/null || true)
 	if [ "$s" = "device" ]; then back="android"; break; fi
+	if [ "$s" = "recovery" ]; then back="twrp"; break; fi
 	if [ $i -gt 20 ] && fastboot devices 2>/dev/null | grep -q .; then back="fastboot"; break; fi
 	sleep 1
 done
 echo "+$(( $(date +%s)-t0 ))s: back in ${back:-nothing (hung? power key needed)}"
 [ -n "$back" ] || "$(cd "$(dirname "$0")" && pwd)/attention.sh" "Pixel 2 XL did not come back after the boot: check the screen, then hold power 10 seconds"
-if [ "$back" = "android" ]; then
+if [ "$back" = "android" ] || [ "$back" = "twrp" ]; then
 	echo "bootreason: $(timeout 5 adb shell getprop ro.boot.bootreason 2>/dev/null)"
 	"$P/tools/taimen/log-pull.sh" "$out/shim-log.txt" | grep -E 'LOADER|saved|EXC|wdt' || true
 	echo "=== XNU log (previous boot's ramoops console zone, via /dev/access-ramoops):"
