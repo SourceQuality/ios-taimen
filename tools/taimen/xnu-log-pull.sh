@@ -1,35 +1,45 @@
 #!/usr/bin/env bash
-# Pull the PREVIOUS boot's ramoops console zone from Android: Google's
-# access_ramoops driver exposes the alternate ramoops region (0xb0e00000,
-# 2 MiB) as /dev/access-ramoops, and Linux copies the main region there at
-# every boot before reusing it. XNU's early log (sweet_early.c, TAIMEN.h:
-# SWEET_EARLY_LOG_PRZ 0xb0080000) therefore shows up here right after the
-# watchdog reset that follows a kernel hang or panic. Layout of the 2 MiB
-# region: 4 x 128 KiB dump zones, then the 1 MiB console zone at +0x80000
-# (persistent_ram_buffer: sig "DBGC", start, size, text), then 512 KiB pmsg.
-# Usage: tools/taimen/xnu-log-pull.sh [OUT.txt]   (rooted ADB in Android)
+# Pull XNU's early log after a boot attempt, from Android (rooted ADB).
+#
+# XNU (sweet_early.c, TAIMEN.h: SWEET_EARLY_LOG_PRZ 0xb0080000) appends to the
+# ramoops console zone. RAM survives the watchdog reset, and the Android boot
+# that follows exposes that zone, with Linux's own console appended after it,
+# as /sys/fs/pstore/console-ramoops (seen 2026-10-22; the earlier boot showed
+# it only in the alt region, which the vendor ramoops_sh service then encrypts,
+# so /dev/access-ramoops is only a fallback here).
+# Usage: tools/taimen/xnu-log-pull.sh [OUT.txt]
 set -euo pipefail
-out=${1:-xnu-ramoops.txt}
+out=${1:-xnu-log.txt}
 adb root >/dev/null 2>&1 || true
 sleep 2
 adb wait-for-device
-adb exec-out "dd if=/dev/access-ramoops bs=4096 skip=128 count=256 2>/dev/null" > "$out.bin"
-python3 -I - "$out.bin" "$out" <<'EOF'
-import struct, sys
+raw="$out.raw"
+if adb shell 'test -r /sys/fs/pstore/console-ramoops' 2>/dev/null; then
+	adb exec-out 'cat /sys/fs/pstore/console-ramoops' > "$raw"
+	src=/sys/fs/pstore/console-ramoops
+else
+	adb exec-out "dd if=/dev/access-ramoops bs=4096 skip=128 count=256 2>/dev/null" > "$raw" || true
+	src=/dev/access-ramoops
+fi
+python3 -I - "$raw" "$out" "$src" <<'EOF'
+import re, struct, sys
 b = open(sys.argv[1], 'rb').read()
-sig, start, size = struct.unpack_from('<3I', b, 0)
-# The alt copy decays by a bit or two per reset on this phone (seen: "DBGC" -> 0x43434244),
-# so accept a near-miss signature when the sizes are sane.
-near = bin((sig ^ 0x43474244) & 0xffffffff).count('1') <= 2
-if sig != 0x43474244 and not (near and 0 < size <= 0x100000 - 12 and start <= size):
-    print(f'no persistent_ram record in the alt console zone (sig {sig:#x}, size {size})'); sys.exit(1)
-if sig != 0x43474244:
-    print(f'warning: signature {sig:#x} (bit errors), reading anyway', file=sys.stderr)
-data = b[12:12 + min(size, len(b) - 12)]
-# ring: data[start..size) + data[0..start) when it has wrapped
-text = (data[start:] + data[:start]) if start < size else data
-text = text.replace(b'\r', b'')
-open(sys.argv[2], 'wb').write(text)
-print(f'{sys.argv[2]}: {len(text)} bytes (record size {size}, start {start})')
+if sys.argv[3] != '/sys/fs/pstore/console-ramoops':
+    sig, start, size = struct.unpack_from('<3I', b, 0)
+    if bin((sig ^ 0x43474244) & 0xffffffff).count('1') > 2 or not (0 < size <= 0x100000 - 12):
+        print(f'no usable record in {sys.argv[3]} (sig {sig:#x}, size {size})'); sys.exit(1)
+    data = b[12:12 + min(size, len(b) - 12)]
+    b = (data[start:] + data[:start]) if start < size else data
+b = b.replace(b'\r', b'')
+# XNU's part: from the shim/kernel markers up to Linux's "Booting Linux" line that follows it
+m = re.search(rb'(TAIMEN SHIM was here\n)?SWEET EARLY 0: start\.s entered', b)
+if not m:
+    print(f'no XNU log in {sys.argv[3]} ({len(b)} bytes)'); sys.exit(1)
+tail = b[m.start():]
+e = tail.find(b'Booting Linux on physical CPU')
+if e > 0:
+    tail = tail[:e]
+open(sys.argv[2], 'wb').write(tail)
+print(f'{sys.argv[2]}: {len(tail)} bytes of XNU log from {sys.argv[3]}')
 EOF
-rm -f "$out.bin"
+rm -f "$raw"

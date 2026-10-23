@@ -54,9 +54,12 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # libfirehose_kernel is built arm64e-only with Xcode's default CPU (LSE atomics).
+          # Our kernels are plain arm64 on ARMv8.0 cores (Pixel 1 Kryo, Pixel 2 XL Kryo 280):
+          # build it arm64-only with -mcpu=kryo, as tools/xnu-build-local.sh does. (TAIMEN boot 2
+          # panicked on an LDADD in __firehose_buffer_tracepoint_flush.)
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS='"'"'$(inherited) -mcpu=kryo'"'"'/' dxb/build.sh
+          grep -c "OTHER_CFLAGS='\$(inherited) -mcpu=kryo'" dxb/build.sh
           # Shallow clones: the Apple source tags are all we ever check out
           sed -i '' 's/git clone --branch/git clone --depth 1 --branch/' dxb/build.sh
           grep -c 'git clone --depth 1 --branch' dxb/build.sh
@@ -108,7 +111,7 @@ jobs:
           path: |
             dxb/fakeroot
             !dxb/fakeroot/System/Library/Kernels
-          key: fakeroot-${{ env.CACHE_SALT }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.XCODE_VER }}
+          key: fakeroot-${{ env.CACHE_SALT }}-kryo1-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.XCODE_VER }}
 
       # 3. ccache for the kernel compile itself. A new entry is saved every run
       #    (unique key); the newest matching prefix is restored.
