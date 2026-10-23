@@ -21,6 +21,6 @@ if ! "$gh" run watch "$id" -R $R --exit-status --interval 20 > /dev/null 2>&1; t
 	exit 1
 fi
 d=$P/../out/kernels/taimen-r$n
-mkdir -p "$d"
+rm -rf "$d"; mkdir -p "$d"   # gh refuses to overwrite an earlier download
 "$gh" run download "$id" -R $R -n xnu-kernel -D "$(wslpath -w "$d")"
 (cd "$d" && sha256sum -c SHA256SUMS)
