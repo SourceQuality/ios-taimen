@@ -18,8 +18,13 @@ python3 -I - "$out.bin" "$out" <<'EOF'
 import struct, sys
 b = open(sys.argv[1], 'rb').read()
 sig, start, size = struct.unpack_from('<3I', b, 0)
+# The alt copy decays by a bit or two per reset on this phone (seen: "DBGC" -> 0x43434244),
+# so accept a near-miss signature when the sizes are sane.
+near = bin((sig ^ 0x43474244) & 0xffffffff).count('1') <= 2
+if sig != 0x43474244 and not (near and 0 < size <= 0x100000 - 12 and start <= size):
+    print(f'no persistent_ram record in the alt console zone (sig {sig:#x}, size {size})'); sys.exit(1)
 if sig != 0x43474244:
-    print(f'no persistent_ram record in the alt console zone (sig {sig:#x})'); sys.exit(1)
+    print(f'warning: signature {sig:#x} (bit errors), reading anyway', file=sys.stderr)
 data = b[12:12 + min(size, len(b) - 12)]
 # ring: data[start..size) + data[0..start) when it has wrapped
 text = (data[start:] + data[:start]) if start < size else data
