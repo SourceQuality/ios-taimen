@@ -1,0 +1,44 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 2a52deb..5ab27ea 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -85,10 +85,19 @@ rootfix_write(const char *path, const uint8_t *data, uint32_t len, uint32_t mode
+ 		vnode_put(vp);
+ 		return EEXIST;
+ 	}
+-	err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, (int)(mode & 07777), 0, &vp, ctx);
++	err = vnode_open(path, O_CREAT | FWRITE, (int)(mode & 07777), 0, &vp, ctx);
+ 	if (err) {
+ 		return err;
+ 	}
++	/*
++	 * vnode_open() leaves O_TRUNC to the caller (open1 does vnode_setsize). Boot 28 wrote
++	 * the 792 KB launchd.plist over the 1.45 MB original and kept its old tail, the binary
++	 * plist trailer included: launchd found "No service cache" and init exited.
++	 */
++	if ((err = vnode_setsize(vp, (off_t)0, 0, ctx)) != 0) {
++		(void)vnode_close(vp, FWRITE, ctx);
++		return err;
++	}
+ 	int resid = 0;
+ 	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0, UIO_SYSSPACE, IO_SYNC,
+ 	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+@@ -183,14 +192,15 @@ rootfix_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	unsigned waited = 0;
+ 	while (rootvnode == NULLVP || vfs_isrdonly(vnode_mount(rootvnode))) {
+-		if (waited >= 120 * 5) {
++		if (waited >= 120 * 20) {
+ 			printf("TAIMEN ROOTFIX: root still read-only after 120 s, nothing written\n");
+ 			return;         /* a kernel thread ends by returning */
+ 		}
+-		(void)tsleep(&rootfix_chan, PZERO, "rootfix", hz / 5);
++		/* 50 ms: launchd_cache_loader reads launchd.plist ~1.3 s after the remount (boot 28) */
++		(void)tsleep(&rootfix_chan, PZERO, "rootfix", hz / 20);
+ 		waited++;
+ 	}
+-	printf("TAIMEN ROOTFIX: root read-write after %u.%u s\n", waited / 5, (waited % 5) * 2);
++	printf("TAIMEN ROOTFIX: root read-write after %u ms\n", waited * 50);
+ 	rootfix_apply();
+ }
+ 
