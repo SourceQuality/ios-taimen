@@ -108,6 +108,47 @@ void shim_main(uint64_t dtb)
 	psci_reset();
 #endif
 	con_skip();
+	/* 0a. Does the ramoops console zone (0xb0080000) survive a reset AND an
+	 * Android boot in between? Log what is there, then leave a record of our
+	 * own (same layout as Linux persistent_ram: sig "DBGC", start, size, text).
+	 * If it survives, the kernel's early log can be rescued here next boot. */
+	{
+		volatile uint32_t *prz = (volatile uint32_t *)0xb0080000UL;
+		volatile uint8_t *txt = (volatile uint8_t *)0xb008000cUL;
+		char snip[49];
+		for (int i = 0; i < 48; i++) {
+			uint8_t c = txt[i];
+			snip[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+		}
+		snip[48] = 0;
+		log_printf("prz @b0080000: sig=%08x start=%u size=%u text=\"%s\"\n", prz[0], prz[1], prz[2], snip);
+		con_hex2("PRZ", "sig=", prz[0], "size=", prz[2]);
+		static const char msg[] = "TAIMEN SHIM was here\n";
+		for (unsigned i = 0; msg[i]; i++)
+			txt[i] = (uint8_t)msg[i];
+		prz[1] = sizeof(msg) - 1;
+		prz[2] = sizeof(msg) - 1;
+		prz[0] = 0x43474244u;
+		__asm__ volatile("dsb sy" ::: "memory");
+	}
+	/* 0b. Framebuffer readback: do the previous run's bands (rows 2000+) survive ABL? */
+	{
+		volatile uint32_t *fb = (volatile uint32_t *)0x9d400000UL;
+		unsigned runs = 0, y = 1990;
+		while (y < 2880 && runs < 12) {
+			uint32_t px = fb[(y * 5760u) / 4u + 720u];
+			if ((px & 0xffffffu) != 0) {
+				unsigned y0 = y;
+				while (y < 2880 && (fb[(y * 5760u) / 4u + 720u] & 0xffffffu) != 0)
+					y++;
+				log_printf("fb band rows %u-%u color %08x\n", y0, y - 1, px);
+				runs++;
+			} else {
+				y++;
+			}
+		}
+		log_printf("fb readback: %u non-black runs in rows 1990-2879\n", runs);
+	}
 	/* 0. Does DDR survive a reset through this bootloader? Read markers a previous
 	 * run left, then plant new ones: in the ramoops region, in low RAM, and in
 	 * the RAM above 4 GB. Compared on the next boot. */
