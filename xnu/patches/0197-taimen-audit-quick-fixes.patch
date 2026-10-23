@@ -1,0 +1,150 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1ebf60c..7ae9ef7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -426,6 +426,9 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	OSSafeReleaseNULL(es);
+ 	int bl_on = 1;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	bl_on = 0;      /* the DCS 0x51 sequence is the Pixel 1 panel's; unverified on taimen (audit 2026-10-23) */
++#endif
+ 	PE_parse_boot_argn("sweetbl", &bl_on, sizeof(bl_on));
+ 	AppleARMBacklight *bl = bl_on ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 	if (bl != NULL && bl->init() && bl->attach(this) && !bl->startBacklight()) {
+@@ -951,10 +954,21 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		sweet_fbcon_flip(fGpuPa[fGpuBack], fGpuStride);
+ 		fGpuBack ^= 1;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	} else {
++		/* 32 bpp, no scaled path: the frame was copied into the splash memory above, and the
++		 * command-mode panel shows nothing until CTL0 START (PP0 autorefresh is off). */
++		sweet_fbcon_kick(true);
++		if (fScaled) {
++			fGpuBack ^= fGpuTest;
++		}
++	}
++#else
+ 	} else if (fScaled) {
+ 		sweet_fbcon_kick(true);
+ 		fGpuBack ^= fGpuTest;
+ 	}
++#endif
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 9e485d7..24624ad 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,7 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ #include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -102,9 +103,33 @@ taimen_wdt_start(void)
+ }
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * PSCI SYSTEM_RESET (0x84000009, smc conduit per the Linux DTS; proven by the
++ * granule probe). Without a hook, reboot and panic-restart spin until the
++ * APSS watchdog bites ~32 s later.
++ */
++static int
++taimen_halt_restart(unsigned int type __unused)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("dsb sy; smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
++	for (;;) {
++		__asm__ volatile("wfi");
++	}
++	return 0;
++}
++#endif
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	PE_halt_restart = taimen_halt_restart;
++#endif
+ 	IOLog("SWEET: starting device-tree platform expert\n");
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 07813fd..8e5b872 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -57,6 +57,7 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
++static bool taimen_fiq_done;    /* diagnostics once, on the boot CPU; secondaries have a 5 s alive budget */
+ /* Bring-up diagnostics: GIC redistributor + CPU interface + timer state, from anywhere after pe_init_fiq. */
+ static vm_offset_t taimen_gicr_pe_base;
+ void
+@@ -94,8 +95,10 @@ find_gicr_pe_base()
+ 		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
+ 		uint32_t aff_value = (uint32_t) (gicr_typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-		printf("TAIMEN GIC: frame %lu TYPER 0x%llx (aff 0x%x) WAKER 0x%x, want aff 0x%x\n",
++		if (!taimen_fiq_done) {
++	printf("TAIMEN GIC: frame %lu TYPER 0x%llx (aff 0x%x) WAKER 0x%x, want aff 0x%x\n",
+ 		    (unsigned long)(offset / GICR_STRIDE), gicr_typer, aff_value, gicr_read32(GICR_WAKER), phys_id);
++	}
+ #endif
+ 
+ 		if (phys_id == aff_value) {
+@@ -270,6 +273,7 @@ pe_init_fiq()
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (!taimen_fiq_done) {
+ 	/* Bring-up: what is really in the redistributor window and the distributor header. */
+ 	printf("TAIMEN GIC: GICD_IIDR 0x%x GICD_TYPER 0x%x GICD_CTLR 0x%x; GICR window %u frames of 0x%x\n",
+ 	    gicd_read32(0x8), gicd_read32(0x4), gicd_read32(GICD_CTLR), (unsigned)(gicr_size / GICR_STRIDE), GICR_STRIDE);
+@@ -279,6 +283,7 @@ pe_init_fiq()
+ 		    (unsigned long)off, _gic_read32(f + 0x0), _gic_read32(f + 0x4), _gic_read64(f + 0x8), _gic_read32(f + 0x14),
+ 		    _gic_read32(f + 0x100), _gic_read32(f + 0x400), _gic_read32(f + 0xc04));
+ 	}
++	}
+ #endif
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 	/*
+@@ -330,7 +335,9 @@ pe_init_fiq()
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-	taimen_gic_dump("after enable");
++	if (!taimen_fiq_done) {
++		taimen_gic_dump("after enable");
++	}
+ #endif
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+@@ -377,6 +384,7 @@ pe_init_fiq()
+ 	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"),
+ 	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("DAIF"));
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (!taimen_fiq_done) {
+ 	/* kprintf has no sink this early (serial_init comes later): the saved early log instead,
+ 	 * and printf too in case the early log is already disabled (console mirrors into it). */
+ 	printf("TAIMEN GIC: vtimer intid %u gicr_pe_base 0x%lx GICD_CTLR 0x%x GICD_TYPER 0x%x GICR_WAKER 0x%x GICR_TYPER 0x%x ISENABLER0 0x%x IGROUPR0 0x%x\n",
+@@ -400,6 +408,8 @@ pe_init_fiq()
+ 	sweet_early_hex("GIC CNTV_CTL", __builtin_arm_rsr64("CNTV_CTL_EL0"));
+ 	sweet_early_hex("GIC CNTFRQ", __builtin_arm_rsr64("CNTFRQ_EL0"));
+ 	sweet_early_hex("GIC DAIF", __builtin_arm_rsr64("DAIF"));
++	}
++	taimen_fiq_done = true;
+ #endif
+ #else
+ 	// Enable the forwarding of the vtimer interrupt

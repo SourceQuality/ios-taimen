@@ -1,0 +1,30 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 079f2a4..4588cce 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2551,6 +2551,25 @@ pmap_virtual_region(
+ 		*size = LOW_GLOBAL_BASE_ADDRESS - *startp;
+ 		ret = TRUE;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (region_select == 4) {
++		/*
++		 * taimen: the early framebuffer/log/MDP block aliases (arm_vm_init.c
++		 * SWEET_EARLY_FB_VA, twenty 2 MB L2 blocks from LOW_GLOBAL_BASE + 2 MB)
++		 * extend past the 8 MB low-globals reservation above. Regions 2 and 3
++		 * leave [LOW_GLOBAL_BASE + 8 MB, physmap) free, and kernel_map carved
++		 * io_submap there (boot 12: pmap_ttne "Attempt to demote L2 block" at
++		 * 0xfffffff00099a000 from io_map). Reserve the rest of that slot.
++		 */
++		vm_map_offset_t lo = LOW_GLOBAL_BASE_ADDRESS + low_global_vr_size;
++		vm_map_offset_t hi = gVirtBase & low_global_vr_mask;
++		if (hi > lo) {
++			*startp = lo;
++			*size = hi - lo;
++			ret = TRUE;
++		}
++	}
++#endif
+ #endif /* defined(ARM_LARGE_MEMORY) */
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
+ 	return ret;
