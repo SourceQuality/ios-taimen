@@ -1,0 +1,892 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 416d75d..dccc08f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_perf.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/taimen_touch.c			standard
+ bsd/dev/sailfish_wlan.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index 2433a0a..6a88bdf 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -34,9 +34,23 @@ bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
+ static LCK_GRP_DECLARE(sweet_rpm_grp, "sweet_rpm");
+ static LCK_MTX_DECLARE(sweet_rpm_lock, &sweet_rpm_grp);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * MSM8998: the same GLINK transport (live DT glink-smem-native-xprt-rpm@778000, compatible
++ * qcom,glink-rpm-native-xprt), message RAM 0x778000 (28 KiB, TOC in the last 256 bytes), doorbell
++ * APCS IPC 0x17911008 bit 0 (mainline qcom-apcs-ipc-mailbox.c: msm8998 offset 8). Other bits of
++ * that register belong to SMP2P: write 1 only. docs/taimen-touch-plan.md 4.
++ */
++#define RPM_MSGRAM_PA   0x00778000u
++#define RPM_MSGRAM_SIZE 0x7000u
++#define RPM_IPC_PA      0x17911000u
++#define RPM_IPC_OFF     0x8u
++#else
+ #define RPM_MSGRAM_PA   0x00068000u
+ #define RPM_MSGRAM_SIZE 0x6000u
+ #define RPM_IPC_PA      0x09820000u     /* APCS GLB, +0x10 IPC */
++#define RPM_IPC_OFF     0x10u
++#endif
+ #define RPM_TOC_MAGIC   0x67727430u     /* grt0 */
+ #define RPM_FIFO_AP2R   0x61703272u
+ #define RPM_FIFO_R2AP   0x72326170u
+@@ -96,7 +110,7 @@ static void
+ rpm_kick(void)
+ {
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(rpm.ipc + 0x10) = 1u;
++	*(volatile uint32_t *)(rpm.ipc + RPM_IPC_OFF) = 1u;
+ }
+ 
+ /* n is a multiple of 4; the message is padded to 8 bytes. */
+@@ -348,6 +362,21 @@ rpm_request(const char *what, uint32_t set, uint32_t type, uint32_t id, const ui
+ 	return acked && !err;
+ }
+ 
++/* Vote LDOn on at uv in set `set` (0 active, 1 sleep); taimen's DT votes both (qcom,set = <3>). */
++bool sweet_rpm_ldoa_set(unsigned ldo, uint32_t uv, uint32_t set);
++bool
++sweet_rpm_ldoa_set(unsigned ldo, uint32_t uv, uint32_t set)
++{
++	uint32_t kv[4] = {0x6e657773u, 1u, 0x00007675u, uv};      /* swen = 1, uv */
++	char what[12];
++	snprintf(what, sizeof(what), "L%u/%u", ldo, set);
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request(what, set, 0x616f646cu, ldo, kv, 2);     /* "ldoa" */
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: L%u %u uV set %u: %s\n", ldo, uv, set, ok ? "ok" : "FAILED");
++	return ok;
++}
++
+ /* Vote PM8994 LDOn on at uv in the active set. */
+ bool
+ sweet_rpm_ldoa(unsigned ldo, uint32_t uv)
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 73d77c3..528ef74 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_perf_init(void);
+ extern void sweet_gpu_init(void);
+ extern void sweet_touch_init(void);
++extern void taimen_touch_init(void);
+ extern void sailfish_wlan_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -669,6 +670,8 @@ sweet_ufs_init(void)
+ 	 * each driver is retargeted (docs/taimen-boot-audit.md).
+ 	 */
+ 	printf("SWEET UFS: taimen: Pixel 1 keys/touch/usb/perf/gpu/wlan drivers not started\n");
++	/* retargeted to MSM8998 so far: touch (taimen_touch.c, docs/taimen-touch-plan.md) */
++	taimen_touch_init();
+ #else
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+diff --git a/bsd/dev/taimen_touch.c b/bsd/dev/taimen_touch.c
+new file mode 100644
+index 0000000..c1e13e0
+--- /dev/null
++++ b/bsd/dev/taimen_touch.c
+@@ -0,0 +1,718 @@
++/*
++ * Pixel 2 XL (taimen) touch: ST FTM4 ("stm,ftm4_fts") at I2C 0x49 on BLSP1 QUP5 (0xc179000),
++ * polled. Every value comes from port/docs/taimen-touch-plan.md, which cites the msm-4.4
++ * ftm4_ts.c and this phone's live DT for each of them. Call once after the root is mounted.
++ *   rails   PM8998 L28 3.3 V (AVDD) then L6 1.8 V (DVDD) through the RPM (sweet_rpm.c),
++ *           active and sleep sets (DT qcom,set = <3>); boot-arg taimentouchrpm=0 skips them
++ *   clocks  GCC BLSP1 AHB vote 0x152004 bit 17 (status 0x117004), QUP5 I2C CBCR 0x121008,
++ *           RCGR 0x121020/24 on XO 19.2 MHz
++ *   pins    TLMM 0x3400000 in tiles: SDA 87 / SCL 88 function 3, reset 89 and attention 125
++ *           (active low, 16 mA pull-up), I2C switch 75 (0 = AP, 1 = SLPI), charger hint 50 low
++ *   I2C     sweet_touch.c's QUP master: FIFO mode, v1 tags, 400 kHz, write-STOP-read
++ *   FTM4    "B6 hi lo" register writes, event FIFO: count at 0x0023, 8-byte events by 0x85
++ *           (one) or 0x86 (all); id 3 enter, 4 leave, 5 motion, x/y 12 bits; runs from its
++ *           own flash (no firmware download)
++ * Coordinates go to sweet_hid_touch as panel pixels 0..1439 x 0..2879 (SweetHID maps them onto
++ * the 1125x2436 canvas).
++ */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern bool sweet_rpm_ldoa_set(unsigned ldo, uint32_t uv, uint32_t set);
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++extern void sweet_spi_mask(uint32_t intid, bool masked);
++void taimen_touch_init(void);
++
++#define TT_GCC_VOTE_PA  0x00152000u     /* +4: APCS_CLOCK_BRANCH_ENA_VOTE, bit 17 BLSP1 AHB */
++#define TT_GCC_AHB_PA   0x00117000u     /* +4: BLSP1_AHB_CBCR, bit 31 CLK_OFF */
++#define TT_GCC_QUP_PA   0x00121000u     /* +8: QUP5 I2C APPS CBCR, +0x20/+0x24: CMD/CFG RCGR */
++#define TT_QUP_PA       0x0c179000u
++#define TT_ADDR         0x49u
++#define TT_MAX          10u             /* FINGER_MAX */
++#define TT_FIFO_MAX     32u
++
++/* idx into tt.gpio */
++enum { G_SDA, G_SCL, G_RESET, G_ATTN, G_SWITCH, G_TA, G_COUNT };
++static const uint32_t tt_gpio_pa[G_COUNT] = {
++	0x03d57000u,    /* 87 SDA, EAST tile */
++	0x03d58000u,    /* 88 SCL */
++	0x03d59000u,    /* 89 reset */
++	0x03d7d000u,    /* 125 attention */
++	0x0354b000u,    /* 75 I2C switch, WEST tile */
++	0x03932000u,    /* 50 charger hint, NORTH tile */
++};
++static const unsigned tt_gpio_num[G_COUNT] = {87, 88, 89, 125, 75, 50};
++
++/* QUP registers (mainline i2c-qup.c), as sweet_touch.c */
++#define QUP_CONFIG        0x000u
++#define QUP_STATE         0x004u
++#define QUP_IO_MODE       0x008u
++#define QUP_SW_RESET      0x00cu
++#define QUP_OPERATIONAL   0x018u
++#define QUP_ERROR_FLAGS   0x01cu
++#define QUP_HW_VERSION    0x030u
++#define QUP_MX_OUTPUT_CNT 0x100u
++#define QUP_OUT_FIFO      0x110u
++#define QUP_MX_WRITE_CNT  0x150u
++#define QUP_MX_INPUT_CNT  0x200u
++#define QUP_MX_READ_CNT   0x208u
++#define QUP_IN_FIFO       0x218u
++#define QUP_I2C_CLK_CTL   0x400u
++#define QUP_I2C_STATUS    0x404u
++#define QUP_I2C_MASTER_GEN 0x408u
++#define QUP_STATE_RESET   0u
++#define QUP_STATE_RUN     1u
++#define QUP_STATE_PAUSE   3u
++#define QUP_STATE_VALID   (1u << 2)
++#define QUP_STATE_MASTER  (1u << 4)
++#define QUP_IN_NOT_EMPTY  (1u << 5)
++#define QUP_OUT_SVC       (1u << 8)
++#define QUP_IN_SVC        (1u << 9)
++#define QUP_MX_OUTPUT_DONE (1u << 10)
++#define QUP_NO_INPUT      (1u << 7)
++#define QUP_MINI_CORE     (2u << 8)
++#define QUP_N_VAL         15u
++#define QUP_REPACK_EN     (3u << 14)
++#define QUP_TAG_START     (1u << 8)
++#define QUP_TAG_DATA      (2u << 8)
++#define QUP_TAG_STOP      (3u << 8)
++#define QUP_TAG_REC       (4u << 8)
++#define QUP_BUS_ACTIVE    (1u << 8)
++#define QUP_BUS_ERRORS    0x38000fcu
++#define QUP_ERRORS        0x7cu
++#define QUP_CLK_400K      ((14u << 16) | (3u << 8) | 28u)
++
++/* TLMM summary interrupt (INTID 240), GPIO 125 level low: plan 2.3 option A */
++#define TT_IRQ_INTID      240u
++#define TLMM_INTR_CFG     0x8u
++#define TLMM_INTR_STATUS  0xcu
++#define TLMM_INTR_CFG_ON  ((3u << 5) | (1u << 4))
++
++static int tt_sleep_chan;
++
++static struct {
++	bool started;
++	vm_offset_t vote, ahb, gccqup, qup, gpio[G_COUNT];
++	unsigned rx_max;
++	uint32_t active, palm;
++	int x[TT_MAX], y[TT_MAX];
++	uint32_t last_status, last_err;
++} tt;
++
++static uint32_t
++tt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++tt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++tt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&tt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static volatile bool tt_irq_on;
++static volatile uint32_t tt_irqs, tt_irq_others;
++
++static void
++tt_irq(__unused void *arg)
++{
++	vm_offset_t g = tt.gpio[G_ATTN];
++	if (tt_rd(g, TLMM_INTR_STATUS) & 1u) {
++		tt_wr(g, TLMM_INTR_CFG, TLMM_INTR_CFG_ON);      /* masked until the FIFO is drained */
++		tt_wr(g, TLMM_INTR_STATUS, 0);
++		tt_irqs++;
++		thread_wakeup(&tt_sleep_chan);
++	} else if (++tt_irq_others > 1000) {
++		sweet_spi_mask(TT_IRQ_INTID, true);     /* another pin holds the summary line */
++		tt_irq_on = false;
++		thread_wakeup(&tt_sleep_chan);
++	}
++}
++
++static void
++tt_irq_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&tt_sleep_chan, THREAD_UNINT, deadline);
++	tt_wr(tt.gpio[G_ATTN], TLMM_INTR_CFG, TLMM_INTR_CFG_ON | 1u);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* CFG: pull 1:0, function 5:2, drive 8:6 = mA/2 - 1, OE 9; IN_OUT bit 0 in, bit 1 out */
++static void
++tt_gpio(unsigned idx, unsigned func, unsigned pull, unsigned ma, bool out, bool high)
++{
++	vm_offset_t t = tt.gpio[idx];
++	if (out) {
++		tt_wr(t, 4, high ? 2u : 0u);    /* level first: reset is active low */
++	}
++	tt_wr(t, 0, (func << 2) | pull | ((ma / 2u - 1u) << 6) | (out ? 0x200u : 0u));
++}
++
++static unsigned
++tt_in(unsigned idx)
++{
++	return tt_rd(tt.gpio[idx], 4) & 1u;
++}
++
++static void
++tt_log_pins(const char *when)
++{
++	printf("TAIMEN TOUCH: %s: sda %#x/%u scl %#x/%u reset %#x/%u attn %#x/%u switch %#x/%u ta %#x/%u\n",
++	    when, tt_rd(tt.gpio[G_SDA], 0), tt_in(G_SDA), tt_rd(tt.gpio[G_SCL], 0), tt_in(G_SCL),
++	    tt_rd(tt.gpio[G_RESET], 0), tt_in(G_RESET), tt_rd(tt.gpio[G_ATTN], 0), tt_in(G_ATTN),
++	    tt_rd(tt.gpio[G_SWITCH], 0), tt_in(G_SWITCH), tt_rd(tt.gpio[G_TA], 0), tt_in(G_TA));
++}
++
++static bool
++tt_clocks(void)
++{
++	tt_wr(tt.vote, 4, tt_rd(tt.vote, 4) | (1u << 17));             /* BLSP1 AHB */
++	for (unsigned i = 0; i < 1000 && (tt_rd(tt.ahb, 4) & (1u << 31)); i++) {
++		delay(1);
++	}
++	uint32_t cfg = tt_rd(tt.gccqup, 0x24);
++	if (((cfg >> 8) & 7u) != 0 || (cfg & 0x1fu) != 1u) {
++		tt_wr(tt.gccqup, 0x24, 1u);                             /* XO, divide by 1 */
++		tt_wr(tt.gccqup, 0x20, tt_rd(tt.gccqup, 0x20) | 1u);    /* UPDATE */
++		for (unsigned i = 0; i < 1000 && (tt_rd(tt.gccqup, 0x20) & 1u); i++) {
++			delay(1);
++		}
++	}
++	tt_wr(tt.gccqup, 8, tt_rd(tt.gccqup, 8) | 1u);                 /* QUP5 I2C */
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(tt_rd(tt.gccqup, 8) & (1u << 31))) {
++			printf("TAIMEN TOUCH: clocks on (vote %#x ahb %#x cbcr %#x rcgr %#x/%#x, rcgr was %#x)\n",
++			    tt_rd(tt.vote, 4), tt_rd(tt.ahb, 4), tt_rd(tt.gccqup, 8),
++			    tt_rd(tt.gccqup, 0x20), tt_rd(tt.gccqup, 0x24), cfg);
++			return true;
++		}
++		delay(1);
++	}
++	printf("TAIMEN TOUCH: QUP5 I2C clock stays off (cbcr %#x ahb %#x rcgr %#x/%#x)\n",
++	    tt_rd(tt.gccqup, 8), tt_rd(tt.ahb, 4), tt_rd(tt.gccqup, 0x20), tt_rd(tt.gccqup, 0x24));
++	return false;
++}
++
++static bool
++qup_state(uint32_t state)
++{
++	for (unsigned i = 0; i < 100; i++) {
++		uint32_t s = tt_rd(tt.qup, QUP_STATE);
++		if ((s & QUP_STATE_VALID) && (s & 3u) == state) {
++			return true;
++		}
++		if (s & QUP_STATE_VALID) {
++			tt_wr(tt.qup, QUP_STATE, state);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* One message: write `len` bytes (STOP after the last) or read `len`. 0, ENXIO (NACK), EIO. */
++static int
++qup_msg(bool rd, uint8_t *buf, unsigned len)
++{
++	unsigned tx = rd ? 2u : len + 1u;
++	uint32_t a8 = (TT_ADDR << 1) | (rd ? 1u : 0u);
++	if (!qup_state(QUP_STATE_RESET) || !(tt_rd(tt.qup, QUP_STATE) & QUP_STATE_MASTER)) {
++		return EIO;
++	}
++	tt_wr(tt.qup, QUP_MX_OUTPUT_CNT, 0);
++	tt_wr(tt.qup, QUP_MX_WRITE_CNT, tx);
++	if (rd) {
++		tt_wr(tt.qup, QUP_MX_INPUT_CNT, 0);
++		tt_wr(tt.qup, QUP_MX_READ_CNT, len);
++	}
++	tt_wr(tt.qup, QUP_CONFIG, QUP_MINI_CORE | QUP_N_VAL | (rd ? 0u : QUP_NO_INPUT));
++	tt_wr(tt.qup, QUP_IO_MODE, QUP_REPACK_EN);
++	if (!qup_state(QUP_STATE_RUN)) {
++		return EIO;
++	}
++	tt_wr(tt.qup, QUP_I2C_CLK_CTL, QUP_CLK_400K);
++	if (!qup_state(QUP_STATE_PAUSE)) {
++		return EIO;
++	}
++	if (rd) {
++		tt_wr(tt.qup, QUP_OUT_FIFO, ((QUP_TAG_REC | len) << 16) | QUP_TAG_START | a8);
++	} else {
++		uint32_t w = QUP_TAG_START | a8;
++		for (unsigned i = 0; i < len; i++) {
++			uint32_t tag = ((i == len - 1) ? QUP_TAG_STOP : QUP_TAG_DATA) | buf[i];
++			if ((i & 1u) == 0) {
++				tt_wr(tt.qup, QUP_OUT_FIFO, w | (tag << 16));
++				w = 0;
++			} else {
++				w = tag;
++			}
++		}
++		if (!(len & 1u)) {
++			tt_wr(tt.qup, QUP_OUT_FIFO, w);
++		}
++	}
++	if (!qup_state(QUP_STATE_RUN)) {
++		return EIO;
++	}
++	unsigned pos = 0;
++	int err = EIO;
++	for (unsigned t = 0; t < 20000; t++) {
++		uint32_t bus = tt_rd(tt.qup, QUP_I2C_STATUS) & QUP_BUS_ERRORS;
++		uint32_t qerr = tt_rd(tt.qup, QUP_ERROR_FLAGS) & QUP_ERRORS;
++		uint32_t op = tt_rd(tt.qup, QUP_OPERATIONAL);
++		if (bus || qerr) {
++			tt.last_status = bus;
++			tt.last_err = qerr;
++			tt_wr(tt.qup, QUP_ERROR_FLAGS, qerr);
++			tt_wr(tt.qup, QUP_I2C_STATUS, bus);
++			err = (bus & (1u << 3)) ? ENXIO : EIO;
++			break;
++		}
++		if (op & (QUP_OUT_SVC | QUP_IN_SVC)) {
++			tt_wr(tt.qup, QUP_OPERATIONAL, op & (QUP_OUT_SVC | QUP_IN_SVC));
++		}
++		if (rd) {
++			while (pos < len && (tt_rd(tt.qup, QUP_OPERATIONAL) & QUP_IN_NOT_EMPTY)) {
++				uint32_t v = tt_rd(tt.qup, QUP_IN_FIFO);
++				buf[pos++] = (uint8_t)v;
++				if (pos < len) {
++					buf[pos++] = (uint8_t)(v >> 16);
++				}
++			}
++			if (pos == len) {
++				err = 0;
++				break;
++			}
++		} else if (op & QUP_MX_OUTPUT_DONE) {
++			err = 0;
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned t = 0; t < 1000 && (tt_rd(tt.qup, QUP_I2C_STATUS) & QUP_BUS_ACTIVE); t++) {
++		delay(1);
++	}
++	tt_wr(tt.qup, QUP_STATE, QUP_STATE_RESET);
++	return err;
++}
++
++static bool
++qup_init(void)
++{
++	tt_wr(tt.qup, QUP_SW_RESET, 1);
++	delay(10);
++	if (!qup_state(QUP_STATE_RESET)) {
++		printf("TAIMEN TOUCH: QUP does not reach RESET (state %#x)\n", tt_rd(tt.qup, QUP_STATE));
++		return false;
++	}
++	tt_wr(tt.qup, QUP_CONFIG, QUP_MINI_CORE | QUP_N_VAL);
++	tt_wr(tt.qup, QUP_I2C_MASTER_GEN, 0);  /* v1 tags */
++	uint32_t io = tt_rd(tt.qup, QUP_IO_MODE);
++	static const unsigned blk[4] = {4, 16, 32, 0};
++	unsigned in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u));
++	tt.rx_max = in_fifo / 2u;      /* FIFO mode, v1 tags: one 16-bit entry per byte */
++	printf("TAIMEN TOUCH: QUP hw %#x io %#x in-fifo %u bytes -> %u data bytes per read, state %#x\n",
++	    tt_rd(tt.qup, QUP_HW_VERSION), io, in_fifo, tt.rx_max, tt_rd(tt.qup, QUP_STATE));
++	return tt.rx_max >= 16;
++}
++
++static int
++ftm_write(const uint8_t *cmd, unsigned n)
++{
++	uint8_t b[8];
++	for (unsigned i = 0; i < n && i < sizeof(b); i++) {
++		b[i] = cmd[i];
++	}
++	return qup_msg(false, b, MIN(n, (unsigned)sizeof(b)));
++}
++
++/* Command, then a separate read (write-STOP-read; Linux uses a repeated start, plan 9.1). */
++static int
++ftm_read(const uint8_t *cmd, unsigned ncmd, uint8_t *buf, unsigned n)
++{
++	int err = ftm_write(cmd, ncmd);
++	return err ? err : qup_msg(true, buf, n);
++}
++
++static int
++ftm_reg_write(uint16_t reg, uint8_t val)
++{
++	uint8_t b[4] = {0xb6, (uint8_t)(reg >> 8), (uint8_t)reg, val};
++	return ftm_write(b, 4);
++}
++
++/* Event FIFO: one 8-byte event (0x85 pops it). */
++static int
++ftm_event(uint8_t e[8])
++{
++	static const uint8_t c = 0x85;
++	return ftm_read(&c, 1, e, 8);
++}
++
++/* Up to ~220 ms for CONTROLLER_READY (0x10), as fts_wait_for_ready. */
++static bool
++ftm_wait_ready(void)
++{
++	uint8_t e[8];
++	unsigned errors = 0;
++	for (unsigned tries = 0; tries < 12;) {
++		int err = ftm_event(e);
++		if (err == 0 && e[0] == 0x10) {
++			return true;
++		}
++		if (err == 0 && e[0] == 0x0f) {
++			printf("TAIMEN TOUCH: error event %02x %02x %02x %02x%s\n", e[1], e[2], e[3], e[4],
++			    e[1] == 0x03 ? " (flash corrupt)" : "");
++			if (++errors > 32) {
++				return false;
++			}
++			continue;
++		}
++		if (err) {
++			printf("TAIMEN TOUCH: ready read err %d status %#x flags %#x\n", err, tt.last_status, tt.last_err);
++		}
++		tries++;
++		tt_wait(20);
++	}
++	printf("TAIMEN TOUCH: no CONTROLLER_READY (last event %02x %02x %02x %02x)\n", e[0], e[1], e[2], e[3]);
++	return false;
++}
++
++/* fts_init / fts_reinit: INT off, system reset, ready, ids, sense on, flush, INT on. */
++static bool
++ftm_init(void)
++{
++	int err = EIO;
++	for (unsigned i = 0; i < 5 && (err = ftm_reg_write(0x002c, 0x08)); i++) {    /* INT disable */
++		tt_wait(10);
++	}
++	if (err) {
++		printf("TAIMEN TOUCH: INT disable err %d (%s) status %#x flags %#x\n", err,
++		    err == ENXIO ? "NACK: rails, switch gpio75 or address" : "bus", tt.last_status, tt.last_err);
++		return false;
++	}
++	(void)ftm_reg_write(0x001e, 0x20);     /* warm-boot CRC */
++	tt_wait(10);
++	(void)ftm_reg_write(0x0028, 0x80);     /* system reset */
++	tt_wait(10);
++	if (!ftm_wait_ready()) {
++		return false;
++	}
++	uint8_t id[8] = {0};
++	static const uint8_t cid[3] = {0xb6, 0x00, 0x04};
++	err = ftm_read(cid, 3, id, 7);         /* byte 0 is a dummy */
++	printf("TAIMEN TOUCH: chip id err %d: %02x %02x %02x %02x %02x %02x %02x\n", err,
++	    id[0], id[1], id[2], id[3], id[4], id[5], id[6]);
++	if (err || id[1] != 0x36 || id[2] != 0x70) {
++		return false;
++	}
++	if (id[5] == 0 && id[6] == 0) {
++		printf("TAIMEN TOUCH: no firmware in the FTM4 flash\n");
++		return false;
++	}
++	uint8_t v[8] = {0};
++	static const uint8_t ver[3] = {0xd0, 0x00, 0x56};
++	if (ftm_read(ver, 3, v, 7) == 0) {
++		printf("TAIMEN TOUCH: fw %#x config %#x main %#x\n", v[1] | v[2] << 8, v[3] | v[4] << 8, v[6] | v[5] << 8);
++	}
++	static const uint8_t sense_on = 0x93, flush = 0xa1;
++	(void)ftm_write(&sense_on, 1);
++	tt_wait(50);
++	int cal = 0;
++	(void)PE_parse_boot_argn("taimentouchcal", &cal, sizeof(cal));
++	if (cal) {
++		static const uint8_t calibrate = 0xa2;
++		(void)ftm_write(&calibrate, 1);
++		tt_wait(200);
++	}
++	(void)ftm_write(&flush, 1);
++	(void)ftm_reg_write(0x002c, 0x48);     /* INT enable */
++	uint8_t s[4] = {0};
++	static const uint8_t status = 0x84;
++	(void)ftm_read(&status, 1, s, 4);
++	printf("TAIMEN TOUCH: sense on, status %02x %02x %02x %02x, attention %u\n", s[0], s[1], s[2], s[3], tt_in(G_ATTN));
++	return true;
++}
++
++uint32_t taimen_touch_moves;
++
++/* sweet_touch.c's reporter: downs and ups at once, moves at most sweettouchhz a second. */
++static uint64_t tt_move_gap, tt_move_last;
++static int tt_sent_x[TT_MAX], tt_sent_y[TT_MAX];
++
++static void
++tt_report(uint32_t mask, const int *x, const int *y)
++{
++	static unsigned logged;
++	uint64_t now = mach_absolute_time();
++	bool move_ok = now - tt_move_last >= tt_move_gap;
++	for (unsigned id = 0; id < TT_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			bool down = !(tt.active & bit);
++			if (down || ((x[id] != tt_sent_x[id] || y[id] != tt_sent_y[id]) && move_ok)) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				tt_sent_x[id] = x[id];
++				tt_sent_y[id] = y[id];
++				tt_move_last = now;
++				taimen_touch_moves++;
++				if (down && logged++ < 60) {
++					printf("TAIMEN TOUCH: down %u at %d,%d\n", id, x[id], y[id]);
++				}
++			}
++		} else if (tt.active & bit) {
++			sweet_hid_touch((int)id, 0, tt_sent_x[id], tt_sent_y[id]);
++			if (logged++ < 60) {
++				printf("TAIMEN TOUCH: up %u\n", id);
++			}
++		}
++	}
++	tt.active = mask;
++}
++
++static bool tt_reset_needed;
++
++/* One event record (plan 5.5). */
++static void
++tt_event(const uint8_t *e, uint32_t *mask, int *x, int *y)
++{
++	static unsigned others;
++	unsigned type = e[0] & 0x0fu, id = e[0] >> 4;
++	if (e[0] == 0x16 && e[1] == 0xed) {
++		tt_reset_needed = true;
++		return;
++	}
++	/* 0x13-0x15 are also finger 1 (Linux parses them the same way, plan 5.5) */
++	if ((type == 3 || type == 4 || type == 5) && id < TT_MAX) {
++		uint32_t bit = 1u << id;
++		if (type == 4) {
++			*mask &= ~bit;
++			tt.palm = 0;
++			return;
++		}
++		if (tt.palm) {
++			return;
++		}
++		if (type == 5 && !(*mask & bit)) {
++			return;         /* motion of a finger that is not down */
++		}
++		if (e[4] == 255) {      /* palm: release everything until the next leave */
++			*mask = 0;
++			tt.palm = 1;
++			return;
++		}
++		*mask |= bit;
++		x[id] = (e[1] << 4) | (e[3] >> 4);
++		y[id] = (e[2] << 4) | (e[3] & 0x0f);
++		return;
++	}
++	if (e[0] != 0 && others++ < 40) {
++		printf("TAIMEN TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++	}
++}
++
++/* Drain the event FIFO (attention releases when it is empty). */
++static int
++tt_poll(void)
++{
++	uint8_t c[2] = {0}, d[TT_FIFO_MAX * 8];
++	static const uint8_t cnt[3] = {0xb6, 0x00, 0x23}, all = 0x86;
++	uint32_t mask = tt.active;
++	int x[TT_MAX], y[TT_MAX];
++	for (unsigned i = 0; i < TT_MAX; i++) {
++		x[i] = tt_sent_x[i];
++		y[i] = tt_sent_y[i];
++	}
++	for (unsigned round = 0; round < 4; round++) {
++		int err = ftm_read(cnt, 3, c, 2);
++		if (err) {
++			return err;
++		}
++		unsigned n = MIN((unsigned)(c[1] >> 1), TT_FIFO_MAX);
++		if (n == 0) {
++			break;
++		}
++		if (n * 8u <= tt.rx_max) {
++			if ((err = ftm_read(&all, 1, d, n * 8u))) {
++				return err;
++			}
++		} else {
++			for (unsigned i = 0; i < n; i++) {
++				if ((err = ftm_event(d + 8 * i))) {
++					return err;
++				}
++			}
++		}
++		for (unsigned i = 0; i < n; i++) {
++			tt_event(d + 8 * i, &mask, x, y);
++		}
++	}
++	tt_report(mask, x, y);
++	return 0;
++}
++
++static bool
++tt_power_and_reset(bool rails)
++{
++	tt_gpio(G_RESET, 0, 3, 16, true, false);       /* reset asserted */
++	tt_gpio(G_SWITCH, 0, 1, 2, true, false);       /* I2C to the AP */
++	tt_gpio(G_TA, 0, 1, 2, true, false);           /* no charger */
++	if (rails) {
++		/* AVDD then DVDD, each in the active and the sleep set */
++		static const struct { unsigned ldo; uint32_t uv; } on[] = {{28, 3300000}, {6, 1800000}};
++		unsigned failed = 0;
++		for (unsigned i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
++			for (uint32_t set = 0; set < 2; set++) {
++				if (!sweet_rpm_ldoa_set(on[i].ldo, on[i].uv, set)) {
++					failed++;
++				}
++			}
++		}
++		if (failed) {
++			printf("TAIMEN TOUCH: %u rail votes failed\n", failed);
++		}
++	}
++	tt_gpio(G_ATTN, 0, 3, 16, false, false);       /* input, pull-up */
++	tt_gpio(G_SDA, 3, 0, 2, false, false);         /* blsp_i2c5, board pull-ups */
++	tt_gpio(G_SCL, 3, 0, 2, false, false);
++	tt_wait(20);
++	tt_log_pins("powered, reset low");
++	tt_gpio(G_RESET, 0, 3, 16, true, true);
++	tt_wait(20);
++	tt_log_pins("reset high");
++	return tt_in(G_SDA) && tt_in(G_SCL);
++}
++
++static void
++tt_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 5;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("TAIMEN TOUCH: starting in %u s\n", delay_s);
++	tt_wait(delay_s * 1000u);
++	tt.vote = ml_io_map(TT_GCC_VOTE_PA, 0x1000);
++	tt.ahb = ml_io_map(TT_GCC_AHB_PA, 0x1000);
++	tt.gccqup = ml_io_map(TT_GCC_QUP_PA, 0x1000);
++	tt.qup = ml_io_map(TT_QUP_PA, 0x1000);
++	bool mapped = tt.vote && tt.ahb && tt.gccqup && tt.qup;
++	for (unsigned i = 0; i < G_COUNT; i++) {
++		tt.gpio[i] = ml_io_map(tt_gpio_pa[i], 0x1000);
++		mapped = mapped && tt.gpio[i];
++	}
++	if (!mapped) {
++		printf("TAIMEN TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	tt_log_pins("before");
++	int rails = 1;
++	(void)PE_parse_boot_argn("taimentouchrpm", &rails, sizeof(rails));
++	if (!tt_power_and_reset(rails != 0)) {
++		printf("TAIMEN TOUCH: SDA/SCL low after power-up (rails off or bus held; gpio%u/%u)\n",
++		    tt_gpio_num[G_SDA], tt_gpio_num[G_SCL]);
++	}
++	if (!tt_clocks() || !qup_init()) {
++		goto out;
++	}
++	if (!ftm_init()) {
++		goto out;
++	}
++	uint32_t hz = 60;
++	(void)PE_parse_boot_argn("sweettouchhz", &hz, sizeof(hz));
++	if (hz) {
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &tt_move_gap);
++	}
++	int irq = 0;
++	(void)PE_parse_boot_argn("sweettouchirq", &irq, sizeof(irq));
++	if (irq) {
++		tt_wr(tt.gpio[G_ATTN], TLMM_INTR_CFG, TLMM_INTR_CFG_ON);
++		tt_wr(tt.gpio[G_ATTN], TLMM_INTR_STATUS, 0);
++		tt_irq_on = sweet_spi_attach(TT_IRQ_INTID, false, tt_irq, NULL);
++	}
++	printf("TAIMEN TOUCH: running, %s on attention gpio%u\n", tt_irq_on ? "interrupt" : "poll 10 ms",
++	    tt_gpio_num[G_ATTN]);
++	unsigned errors = 0, ticks = 0;
++	for (;;) {
++		/* Attention is low while the FIFO holds events; read anyway every 200 ms. */
++		if (!tt_in(G_ATTN) || tt_irq_on || (++ticks % 20u) == 0) {
++			int err = tt_poll();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("TAIMEN TOUCH: read err %d status %#x flags %#x\n", err, tt.last_status, tt.last_err);
++				}
++				if (errors == 10) {
++					tt_report(0, tt.x, tt.y);
++				}
++				(void)qup_init();
++			} else {
++				errors = 0;
++			}
++			if (tt_reset_needed) {
++				tt_reset_needed = false;
++				printf("TAIMEN TOUCH: controller asks for a reset (status 16 ed)\n");
++				tt_report(0, tt.x, tt.y);
++				(void)tt_power_and_reset(false);
++				(void)ftm_init();
++			}
++		}
++		if (tt_irq_on) {
++			tt_irq_wait(1000);
++		} else {
++			tt_wait(10);
++		}
++	}
++out:
++	printf("TAIMEN TOUCH: stopped\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++taimen_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (tt.started) {
++		return;
++	}
++	tt.started = true;
++	(void)PE_parse_boot_argn("taimentouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("TAIMEN TOUCH: disabled (taimentouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(tt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("TAIMEN TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index defe307..7d4413b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -355,9 +355,16 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
+  * app-switcher gesture.
+  */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/* FTM4 reports panel pixels 0..1439 x 0..2879; 3 mm at 21.2 px/mm (docs/taimen-touch-plan.md 7) */
++#define SWEET_TOUCH_EDGE_PX 64
++#define SWEET_TOUCH_PANEL_W 1440
++#define SWEET_TOUCH_PANEL_H 2880
++#else
+ #define SWEET_TOUCH_EDGE_PX 48
+ #define SWEET_TOUCH_PANEL_W 1080
+ #define SWEET_TOUCH_PANEL_H 1920
++#endif
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -439,6 +446,20 @@ SweetHIDTouch::start(IOService *provider)
+ 	 * whole presented 750x1334 display scaled (SweetFramebuffer.cpp), so
+ 	 * normalized panel coordinates are display coordinates.
+ 	 */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * Taimen: the 1125x2436 canvas sits 1:1 in the middle of the 1440x2880 panel
++	 * (SweetFramebuffer fOffX/fOffY = -157/-222); touches in the black border land
++	 * on the canvas edge. The surface is the visible canvas, 53 x 115 mm.
++	 */
++	fLogicalW = 1125;
++	fLogicalH = 2436;
++	fOffX = -157;
++	fOffY = -222;
++	setProperty("DisplayIntegrated", kOSBooleanTrue);
++	setProperty("SurfaceWidth", (unsigned long long)(53 << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceHeight", (unsigned long long)(115 << 16), 32);
++#else
+ 	fLogicalW = SWEET_TOUCH_PANEL_W;
+ 	fLogicalH = SWEET_TOUCH_PANEL_H;
+ 	fOffX = 0;
+@@ -447,6 +468,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(62 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(111 << 16), 32);
++#endif
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
+@@ -468,17 +490,20 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> normalized display coordinates. */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/* Panel pixels -> display pixels (clamped onto the display) -> normalized. */
++	int lx = x + fOffX, ly = y + fOffY;
++	lx = lx < 0 ? 0 : (lx > fLogicalW - 1 ? fLogicalW - 1 : lx);
++	ly = ly < 0 ? 0 : (ly > fLogicalH - 1 ? fLogicalH - 1 : ly);
++	IOFixed nx = (IOFixed)(((int64_t)lx << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)ly << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > SWEET_TOUCH_PANEL_W - 1 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_TOUCH_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = lx < SWEET_TOUCH_EDGE_PX || lx > fLogicalW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    ly < SWEET_TOUCH_EDGE_PX || ly > fLogicalH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
