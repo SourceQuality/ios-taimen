@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 56541f4..33dc57c 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -43,6 +43,57 @@ extern "C" void taimen_thread_dump(const char *tag);
+ extern "C" void sweet_fbcon_regs(uint32_t r[10]);
+ extern "C" uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
+ 
++/*
++ * Boot 19: the MDP takes every kickoff (PP0 done for each) with the shim's exact register
++ * state, yet the panel keeps the shim's picture, so the question is what the panel memory
++ * in RAM holds. Uncached (Device) one-row windows on rows 60 (kernel console), 1440 (middle
++ * of the 1125x2436 canvas, columns 157..1281) and 2870 (bottom border, cleared to 0xff000000
++ * by AppleCLCD; the shim cleared it to 0). Once: a write through a write-combine alias read
++ * back through the Device window.
++ */
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++#define TAIMEN_FB_PA            0x9d400000ULL
++#define TAIMEN_FB_STRIDE        5760ULL
++static const int taimen_fb_rows[3] = { 60, 1440, 2870 };
++static volatile uint32_t *taimen_fb_win[3];
++
++static void
++taimen_fb_probe(int t)
++{
++	for (int i = 0; i < 3; i++) {
++		uint64_t pa = TAIMEN_FB_PA + (uint64_t)taimen_fb_rows[i] * TAIMEN_FB_STRIDE;
++		if (taimen_fb_win[i] == NULL) {
++			vm_offset_t va = ml_io_map((vm_offset_t)trunc_page_64(pa), 2 * PAGE_SIZE);
++			if (va == 0) {
++				IOLog("TAIMEN FBRAM: no window for row %d\n", taimen_fb_rows[i]);
++				return;
++			}
++			taimen_fb_win[i] = (volatile uint32_t *)(va + (pa & PAGE_MASK));
++		}
++		volatile uint32_t *p = taimen_fb_win[i];
++		uint32_t sum = 0;
++		for (int x = 0; x < 1024; x++) {
++			sum = sum * 31 + p[x];
++		}
++		IOLog("TAIMEN FBRAM %d: row %d %08x %08x %08x sum %08x\n",
++		    t, taimen_fb_rows[i], p[0], p[200], p[1000], sum);
++	}
++	static bool tested;
++	if (!tested) {
++		tested = true;
++		uint64_t pa = TAIMEN_FB_PA + (uint64_t)taimen_fb_rows[2] * TAIMEN_FB_STRIDE;
++		vm_offset_t va = ml_io_map_wcomb((vm_offset_t)trunc_page_64(pa), PAGE_SIZE);
++		if (va != 0) {
++			volatile uint32_t *wc = (volatile uint32_t *)(va + (pa & PAGE_MASK));
++			uint32_t before = taimen_fb_win[2][8];
++			wc[8] = 0x5a5a1234;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			IOLog("TAIMEN FBRAM: WC write 5a5a1234 over %08x, Device reads %08x, WC reads %08x\n",
++			    before, taimen_fb_win[2][8], wc[8]);
++		}
++	}
++}
++
+ /* Three short lines: the on-screen log viewer shows 90 columns. */
+ static void
+ taimen_fb_report(int t)
+@@ -55,6 +106,7 @@ taimen_fb_report(int t)
+ 	IOLog("TAIMEN FB %d: CTL0 LAYER 0x%x TOP 0x%x FLUSH 0x%x\n", t, r[2], r[3], r[4]);
+ 	IOLog("TAIMEN FB %d: VIG0 SIZE 0x%x SRC0 0x%x YSTR 0x%x DSI0 0x%x 0x%x\n",
+ 	    t, r[5], r[6], r[7], r[8], r[9]);
++	taimen_fb_probe(t);
+ }
+ 
+ #define TAIMEN_WDT_PA    0x17817000
