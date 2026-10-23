@@ -1,0 +1,27 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index d418057..7fb03a9 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -278,6 +278,22 @@ pe_init_fiq()
+ 		    (unsigned long)off, _gic_read32(f + 0x0), _gic_read32(f + 0x4), _gic_read64(f + 0x8), _gic_read32(f + 0x14),
+ 		    _gic_read32(f + 0x100), _gic_read32(f + 0x400), _gic_read32(f + 0xc04));
+ 	}
++#endif
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * taimen: ABL hands over with GICD_CTLR = 0. With ARE_NS clear the
++	 * redistributors' SGI/PPI registers are RAZ/WI from Non-secure state, so
++	 * the IGROUPR0/IPRIORITYR/ISENABLER0 writes below were ignored and the
++	 * timer PPI never arrived (boots 3-8). Enable affinity routing first, as
++	 * Linux's gic_dist_init does; the group enables follow further down.
++	 */
++	if (!(gicd_read32(GICD_CTLR) & GICD_CTLR_ARE_NS)) {
++		gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ARE_NS);
++		while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++			;
++		}
++		printf("TAIMEN GIC: ARE_NS was clear; GICD_CTLR now 0x%x\n", gicd_read32(GICD_CTLR));
++	}
+ #endif
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
