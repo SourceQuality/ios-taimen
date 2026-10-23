@@ -380,3 +380,20 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   pixel screen" (the 1125x2436 canvas is shown 1:1 in the middle). 30 touches logged, 14008 frames / 14008 done / 0 DSI
   resets in 20 minutes; crashes: assetsd x2, driverkitd. Next: CPU clock (0216 measures it), secondary cores
   (docs/taimen-smp-plan.md, in progress), MDP hardware scaling (docs/taimen-display-scaling-plan.md, in progress).
+- 2026-10-23 boot 32 (r37 = +0216 CPU clock; ROOTFIX, 5 min): CPU0 is a Kryo 280 **silver** core (MIDR 0x51af8014,
+  part 0x801) at **~1554 MHz** (20M-iteration loop in 12.86 ms at 0 s and at 60 s). The lag is one small core plus
+  software rendering. Lock screen: 27 frames in 5 min (an idle lock screen draws little; the 5600-7400 of boots 27-29
+  were the migration's progress bar).
+- 2026-10-23 boot 33 (r38 = +0217): the calendar comes from the PC (getGMTTimeOfDay = taimenepoch + 25 s). launchd's
+  log and the status bar show the right date and time in iOS's default zone (Cupertino, PC time - 3 h).
+- 2026-10-23 boot 34 (r39 = +0218, taimenhwscale=1 = scaling plan stage E2): each iOS frame is copied into a scan buffer
+  below 4 GB (SCAN0 0x9e400000, stride 4608: the SSPP source address is 32-bit and iOS surfaces sit above 4 GB), VIG0
+  shows it 1:1 at (157,222) (geometry 2). VIG0 SIZE 0x9840465 SRC0 0x9e400000 YSTR 0x1200, CURRENT_SRC0 = SCAN0 at
+  60 s; 144 kicks / 144 done / 0 timeouts / 0 DSI resets; the user went to Settings > General > About (end screenshot).
+  Census: one mixer LM0 (out 0x0b4005a0 = 1440x2880), DSC0 on and DSC1 zero, QSEED3 HW_VERSION 0x1002, ABL's VIG0
+  SRC_OP_MODE 0x80000000 (scaler off).
+- 2026-10-23 boot 35 (r40 = +0219, cpus=2, 180 s): **PSCI over smc works from XNU** in every context (thread; IRQs
+  off; IRQs off with PMR 0): VERSION 0x10000 (PSCI 1.0), FEATURES CPU_ON / AFFINITY_INFO / SYSTEM_RESET all 0,
+  AFFINITY_INFO 0 (on) for 0x0 and 1 (off) for 0x1-0x3 and 0x100-0x103. The probe's single **hvc** PSCI_VERSION never
+  returned: the log ends there and ABL reported bootreason=watchdog. **Never hvc on taimen** (the hypervisor does not
+  take it). CPU_ON was never sent. 0220: the hvc probe only runs with taimenpscihvc=1.

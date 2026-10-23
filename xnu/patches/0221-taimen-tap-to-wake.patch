@@ -1,0 +1,63 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ef3595c..76f364c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -911,6 +911,10 @@ AppleCLCD::presentPending(void)
+ 	sweet_fb_stat_presents++;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++int sweet_fb_blanked;   /* SweetHID: a touch on the dark panel presses the side button (0221) */
++#endif
++
+ /* Display sleep/wake (lock button): black panel, frames held back meanwhile. */
+ void
+ AppleCLCD::setPower(bool on)
+@@ -921,6 +925,9 @@ AppleCLCD::setPower(bool on)
+ 		return;
+ 	}
+ 	fBlanked = !on;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	sweet_fb_blanked = !on;
++#endif
+ 	sweet_fbcon_blank(!on);
+ 	if (on && fDirty) {
+ 		presentPending();
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 2b6a5f8..cad9f59 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -357,6 +357,7 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ extern "C" int sweet_fb_scaled;        /* SweetFramebuffer.cpp: hardware-scaled canvas on the panel */
++extern "C" int sweet_fb_blanked;       /* SweetFramebuffer.cpp: iOS switched the display off */
+ /* FTM4 reports panel pixels 0..1439 x 0..2879; 3 mm at 21.2 px/mm (docs/taimen-touch-plan.md 7) */
+ #define SWEET_TOUCH_EDGE_PX 64
+ #define SWEET_TOUCH_PANEL_W 1440
+@@ -573,6 +574,25 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	}
+ 	dispatchEvent(collection);
+ 	collection->release();
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * Tap to wake (0221): the side button has no driver on taimen yet (sweetkeys=0), so
++	 * once iOS switched the display off nothing woke it (boot 36). A new touch on the dark
++	 * panel presses the side button once; 3 s apart, so a burst of taps cannot switch the
++	 * display off again before iOS has turned it on.
++	 */
++	static uint64_t last_wake;
++	if (!was && down && sweet_fb_blanked && gSweetButtons) {
++		uint64_t gap;
++		nanoseconds_to_absolutetime(3 * NSEC_PER_SEC, &gap);
++		if (last_wake == 0 || now - last_wake > gap) {
++			last_wake = now;
++			IOLog("SWEET HID: touch on the dark panel: side button press\n");
++			gSweetButtons->key(kHIDUsage_Csmr_Power, true);
++			gSweetButtons->key(kHIDUsage_Csmr_Power, false);
++		}
++	}
++#endif
+ }
+ 
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
