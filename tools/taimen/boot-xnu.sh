@@ -28,7 +28,10 @@ python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
 # (xnu 0187) and their boot-args are set to 0 as well (docs/taimen-boot-audit.md).
 safe="sweetkeys=0 sweettouch=0 sweetusb=0 sweetperf=0 sweetbattery=0 sweetcharge=0 sweetbl=0"
 cmdline="debug=0x10000c serial=3 cpus=1 keepsyms=1 -noprogress ${safe} ${args}"
-python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline"
+# ROOTFIX=FILE: files the kernel writes into the iOS root before launchd (tools/taimen/mkrootfix.py, xnu 0210)
+blobs=()
+[ -n "${ROOTFIX:-}" ] && blobs+=(--blob "ROOTFIX=$(realpath "$ROOTFIX")")
+python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline" "${blobs[@]}"
 ls -l "$out/payload" | awk '{print "payload: " $5 " bytes"}'
 EXTRA_CFLAGS=-DSTAGE2 OUT_NAME=taimen-xnu "$P/shim/build-taimen.sh" "$P/../backup/boot_a.img" "$out/payload" | tail -2
 img="$P/shim/out/taimen-xnu.img"
