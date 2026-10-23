@@ -12,13 +12,13 @@ prefs, sweet NOTES); with it the sweet sentinel makes it run once (~30 min on ta
 registers the app extensions: wallpapers, widgets).
 
 Records: "RFX1", count, then {op, mode, uid, gid, path length, data length, path, data}
-(op 1 write, 2 write if absent, 3 mkdir if absent; 4-byte padding).
+(op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present; 4-byte padding).
 """
 import argparse, os, plistlib, struct, subprocess, sys, tempfile
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
-WRITE, CREATE, MKDIR = 1, 2, 3
+WRITE, CREATE, MKDIR, REMOVE = 1, 2, 3, 4
 SEVENZIP = os.environ.get('SEVENZIP', '/mnt/c/Program Files/7-Zip/7z.exe')
 
 
@@ -123,6 +123,10 @@ def main():
     else:
         b.plist(WRITE, prefs + '/ByHost/com.apple.migration.@HOSTUUID@.plist',
                 {'LastSystemVersion': BUILD}, 0o600, MOBILE, MOBILE)
+        # boot 29: still migrating. datamigrator creates this sentinel when it starts and
+        # removes it when done ("Migration sentinel present. Migration necessary.", sweet
+        # NOTES); every run so far was cut short by a reset, so it stays behind.
+        b.add(REMOVE, '/private/var/datamigrator/migrate')
     for name, values in (
             ('com.apple.springboard', {'BKNoWatchdogs': True,
                                        'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},

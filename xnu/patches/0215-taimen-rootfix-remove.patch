@@ -1,0 +1,67 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 5ab27ea..f86b81c 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -6,8 +6,8 @@
+  *   blob     "RFX1", u32 count, then records: u32 op, mode, uid, gid, path length, data
+  *            length, the NUL-terminated path, the data (both padded to 4 bytes)
+  *   ops      1 write (create or replace), 2 write only if absent (prefs iOS may own later),
+- *            3 mkdir if absent; owner and mode set on what was written or created;
+- *            "@HOSTUUID@" in a path is replaced by IOPlatformUUID
++ *            3 mkdir if absent, 4 remove if present; owner and mode set on what was written
++ *            or created; "@HOSTUUID@" in a path is replaced by IOPlatformUUID
+  * Without the blob nothing happens. Boot-arg taimenrootfix=0 skips it.
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+@@ -30,12 +30,14 @@
+ extern vm_map_address_t phystokv(uint64_t pa);
+ extern kern_return_t IOBSDGetPlatformUUID(__darwin_uuid_t uuid, mach_timespec_t timeoutp);
+ extern int taimen_mkdir(const char *path, int mode, vfs_context_t ctx);   /* vfs_syscalls.c */
++extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
+ void taimen_rootfix(void);
+ 
+ #define RFX_MAGIC       0x31584652u     /* "RFX1" */
+ #define RFX_WRITE       1u
+ #define RFX_CREATE      2u
+ #define RFX_MKDIR       3u
++#define RFX_REMOVE      4u
+ 
+ /*
+  * "@HOSTUUID@" in a path becomes IOPlatformUUID (gethostuuid; from the ADT's unique-chip-id
+@@ -128,6 +130,18 @@ rootfix_mkdir(const char *path, uint32_t mode, uint32_t uid, uint32_t gid, vfs_c
+ 	return err;
+ }
+ 
++/* EEXIST when there is nothing to remove (counted with "already present"). */
++static int
++rootfix_remove(const char *path, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return EEXIST;
++	}
++	vnode_put(vp);
++	return unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
++
+ static const uint8_t *rootfix_blob;
+ static uint64_t rootfix_len;
+ static int rootfix_chan;
+@@ -162,6 +176,7 @@ rootfix_apply(void)
+ 			continue;
+ 		}
+ 		int err = op == RFX_MKDIR ? rootfix_mkdir(path, mode, uid, gid, ctx) :
++		    op == RFX_REMOVE ? rootfix_remove(path, ctx) :
+ 		    (op == RFX_WRITE || op == RFX_CREATE) ?
+ 		    rootfix_write(path, data, dlen, mode, uid, gid, op == RFX_CREATE, ctx) : EINVAL;
+ 		if (err == 0) {
+@@ -173,7 +188,8 @@ rootfix_apply(void)
+ 		}
+ 		if (err != EEXIST) {
+ 			printf("TAIMEN ROOTFIX: %s %s (%u bytes, %o %u:%u): %s%d\n",
+-			    op == RFX_MKDIR ? "mkdir" : op == RFX_CREATE ? "create" : "write", path, dlen, mode,
++			    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" : "write",
++			    path, dlen, mode,
+ 			    uid, gid, err ? "error " : "ok ", err);
+ 		}
+ 	}
