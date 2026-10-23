@@ -397,3 +397,15 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   AFFINITY_INFO 0 (on) for 0x0 and 1 (off) for 0x1-0x3 and 0x100-0x103. The probe's single **hvc** PSCI_VERSION never
   returned: the log ends there and ABL reported bootreason=watchdog. **Never hvc on taimen** (the hypervisor does not
   take it). CPU_ON was never sent. 0220: the hvc probe only runs with taimenpscihvc=1.
+- 2026-10-23 boot 36 (r40, taimenhwscale=2 = stage E3: QSEED3 scales the canvas to 1330x2880 at x 55, one scan
+  buffer; cpus=1, 240 s): **the user: "the screen was filled"**. Geometry 3 from the first present on, 0 DSI resets,
+  0 frame timeouts, 20 frames in 240 s. At ~88 s, after two swipes up from the bottom edge and a touch-and-hold, iOS
+  asked for display off (IOMFB power change: "SWEET FB: display off", CTL0 LAYER 0x1000000); SpringBoard then logged
+  "Unbalanced calls to begin/end appearance transitions for SBSwitcherViewController" and AccessibilityUIServer
+  started. Why iOS switched off is not known. The 60 touches after it did not wake it and the side button has no
+  driver (sweetkeys=0): black until the deadline. 0221: a new touch on the dark panel sends one side-button press
+  (kHIDUsage_Csmr_Power through SweetHIDButtons), at most every 3 s.
+- 2026-10-23 **boot 37 (r41 = +0220, cpus=2, 180 s): the second core runs.** CPU_ON (smc, thread context, target 0x1,
+  entry_pa 0x100429000) rc=0; `cpu=1 mpidr=0x1 came alive; SGI1 OK`, `2/2 CPUs initialized`. iOS ran the whole 180 s
+  with no panic, ROOTFIX applied; the lock screen came ~20 s after the first log tick (30-45 s with cpus=1). CPU0
+  still ~1554 MHz.
