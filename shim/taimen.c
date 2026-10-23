@@ -59,9 +59,11 @@ static void delay_ms(unsigned ms)
 static uint32_t probe(const char *label, const char *name, uintptr_t a)
 {
 	con_hex2(label, name, (uint32_t)a, "..", 0);
+	con_flush();	/* autorefresh is off: one CTL0 START per line */
 	__asm__ volatile("dsb sy" ::: "memory");
 	uint32_t v = rd32(a);
 	con_hex2(label, name, (uint32_t)a, "=", v);
+	con_flush();
 	log_printf("%s %s @%08x = %08x\n", label, name, (uint32_t)a, v);
 	return v;
 }
@@ -92,6 +94,7 @@ void shim_main(uint64_t dtb)
 	con_hex("MIDR", rsr("midr_el1"));
 	con_hex("EL", rsr("CurrentEL"));
 	con_hex("SCTLR", rsr("sctlr_el1"));
+	con_flush();
 #ifdef DIAG_MIN
 	con_str("MIN", "no wdt/mdp access; reset 10s");
 	delay_ms(10000);
@@ -142,6 +145,7 @@ void shim_main(uint64_t dtb)
 	probe("WDT", "en", APSS_WDT + WDT_EN);
 	/* 5. UFS: bring up the host ABL left running and save the log so far. */
 	con_str("UFS", "init ..");
+	con_flush();
 	ufs_ok = !ufs_init();
 	con_hex2("UFS", "ok=", (uint32_t)ufs_ok, 0, 0);
 	save("after probes");
@@ -153,6 +157,7 @@ void shim_main(uint64_t dtb)
 	save("after kick");
 	con_skip();
 	con_str("RESET", "in 15s");
+	con_flush();
 	delay_ms(15000);
 	psci_reset();
 }
@@ -171,6 +176,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("ESR", rsr("esr_el1"));
 	con_hex("FAR", rsr("far_el1"));
 	con_hex("ELR", rsr("elr_el1"));
+	con_flush();
 	save("exception");
 	delay_ms(15000);
 	psci_reset();

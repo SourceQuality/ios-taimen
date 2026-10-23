@@ -10,7 +10,7 @@
 #define FB_BASE		0x9d400000UL	/* reserved-memory splash_region (reg, not the node name) */
 #define FB_W		1440
 #define FB_H		2880
-#define FB_BPP		3		/* assumed RGB888 like Pixel 1; stage-1 diag reads VIG0 SRC_FORMAT */
+#define FB_BPP		4		/* VIG0 SRC_FORMAT 0x237ff, UNPACK 0x03020001: bytes B G R A, YSTRIDE 0x1680 */
 #else
 #define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
 #define FB_W		1080
