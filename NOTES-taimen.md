@@ -21,7 +21,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (one DTB, `d00dfeed`, ~376-392 KB). cmdline carries `androidboot.dtbo_idx=12`: ABL applies dtbo entry 12.
 - AVB hash footer present on both (image padded to 41943040 = 40 MiB). Not yet proven required for `fastboot boot`;
   we add it anyway (`avbtool add_hash_footer --partition_size 41943040 --partition_name boot`).
-- Packing: `port/tools/mkboot-v0.sh` (gzip Image + stock DTB kept from the template) then avbtool.
+- Packing: `tools/mkboot-v0.sh` (gzip Image + stock DTB kept from the template) then avbtool.
   `tools/granule-probe-taimen.sh` does this; `PROBE_SRC=` picks the probe source.
 
 ## Memory map (live FDT as patched by ABL, `../research/taimen/live.dts`)
@@ -85,3 +85,66 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   EL1 (`CurrentEL`=4), SCTLR_EL1=0xc00800 (MMU off), MIDR=0x51af8014 (Qualcomm Kryo 280 silver, part 0x801),
   CNTFRQ 19.2 MHz. **ID_AA64MMFR0_EL1 = 0x1122: TGran16 = 0 (no 16K), TGran64 = 0 (64K yes), TGran4 = 0 (4K yes).**
   Definitive; 4K pages it is.
+- 2026-10-22 **FIRST XNU BOOT ON TAIMEN.** TAIMEN kernel (CI run 39892141965, patches 0184+0185, 4K pages, link
+  0xfffffff007004000), payload via the boot-image ramdisk, STAGE2 shim, 512 MiB RAM at 0x100000000, `cpus=1`.
+  Rescued early log (sweet_early PRZ at 0xb0080000): stage 0 (MMU off) .. 20 "kprintf startup complete" all passed:
+  arm_init, PE_init_platform, cpu topology, cpu_bootstrap, kernel_startup_bootstrap, cpu_init, arm_vm_init (bootstrap
+  TTBR0 left, log alias live, TLB flushed, physmap rebound, pmap_bootstrap, early I/O page tables), serial_init with the
+  fbcon mapped. Then `panic: pmap_map_bd @pmap.c:1885` from initialize_screen -> io_map -> pmap_map_bd (pmap_pte ==
+  NULL: no L3 table for the IO-region VA). Watchdog reset ~37 s later (bootreason=watchdog).
+- **Kernel log channel found:** Linux copies ramoops main (0xb0000000) -> alt (0xb0e00000) at every boot and Google's
+  access_ramoops driver exposes the alt region as `/dev/access-ramoops` (console zone at +0x80000). So XNU's PRZ
+  survives watchdog reset + Android boot and is read with `tools/taimen/xnu-log-pull.sh`. Also seen by the shim at
+  0xb0e80000. RAM survives resets on this phone; only Linux re-initialising the main zone hid it before.
+- IMEM restart_reason confirmed at 0x146bf65c (imem@146bf000 + 0x65c); writing 0x77665500 + PSCI reset still booted
+  Android, so ABL must take the reason from the PMIC PON (PM8998 SOFT_RB_SPARE) instead. Not needed now.
+- 2026-10-22 boot 2 (kernel r3 = 0184-0186, ADT fb_size 16 MiB): past initialize_screen; pmap_startup, vm_page_bootstrap
+  (122642 free pages), VM maps, zone_init (zones 24G, compressor 8G, kmem ranges) all fine at 512 MiB, "Firehose
+  configured", then **panic: Undefined kernel instruction pc=0xfffffff007274a0c instr=f8280128** =
+  `ldadd x8, x8, [x9]` (LSE, ARMv8.1) in `__firehose_buffer_tracepoint_flush` (libfirehose_kernel.a built by CI with
+  Xcode's default CPU). Fix: build libfirehose arm64-only with -mcpu=kryo (as tools/xnu-build-local.sh), fakeroot
+  cache rekeyed. The watchdog reset came ~37 s after the panic.
+- Log channel, corrected: after the Android boot that follows an XNU run, `/sys/fs/pstore/console-ramoops` holds
+  XNU's PRZ text followed by Linux's console (548 KB this time). `/dev/access-ramoops` (alt region) is encrypted by
+  the vendor `ramoops_sh` service after boot, so it is unreliable. `tools/taimen/xnu-log-pull.sh` now reads pstore.
+- 2026-10-22 iOS root inputs ready: IPSW iPhone10,3 16.7.16 (sha1 verified) in `research/ipsw-x/`, the three images
+  extracted to `research/ipsw-x/ipsw/` (OS root 087-86698-044.dmg 4.7 GB, SystemOS cryptex 087-86593-047.dmg 2.7 GB,
+  AppOS 087-86715-047.dmg). `apfs-fuse` built from source into `~/.local/bin` (zlib/bz2/fuse3 headers pulled as RPMs
+  into a scratch sysroot, no root needed); an unprivileged `apfs-fuse -o ro` mount of the OS image works and shows
+  owners (mobile 501:501), symlinks and decompressed files (LZBITMAP). 7-Zip 26 also reads the APFS but skips
+  LZBITMAP resource-fork files (6 in SystemOS incl. dyld linkedit subcaches) and refuses `..` symlinks: not usable.
+  Building the HFS+ root image (`tools/mkiosroot.sh OS SYSOS APPOS out.img 16G`) still needs sudo for the loop
+  mount and the root rsync.
+- 2026-10-22 boot 3 (kernel r4: 0184-0186 + libfirehose built with -mcpu=kryo): **no panic**. Firehose, OSLog,
+  log queues, timeslicing, mig, kdp, "iBoot version: sweet-shim", SWEET AMFI, vnguard, platform expert, AKS, WDT
+  (IOWatchdog), IOCoreSurfaceRoot, HID buttons/touch, static battery, `SWEET FB: AppleCLCD 1440x2880 stride 5760 at
+  0x9d400000`, SweetGPU registered; then the log ends (5.8 KB) and the phone reset at the usual +67 s with
+  bootreason=watchdog. The APSS WDT BARK/BITE registers are 20 bits (defaults 0x7ffff / 0xfffff = 16 / 32 s), so the
+  shim's "120 s" (0x3c0000) truncated to 0xc0000 = 24 s after the arm: the kernel must pet it (or the shim must arm
+  the 32 s maximum and the kernel pet it). `debug_log_init: gPanicBase not initialized` x2 is cosmetic.
+- 2026-10-23 **iOS root image built** (user granted passwordless sudo): `tools/mkiosroot.sh` with apfs-fuse, OS root +
+  SystemOS + AppOS cryptexes into a 16 GiB journaled HFS+ (`research/ipsw-x/ios16-root.img`, 12 GB used), 19 cryptex
+  hard-link fixups, `fsck.hfsplus -y` once (Linux leaves the unmounted bit), sparse copy `ios16-root.simg` (~12 GB).
+  Install plan: `tools/taimen/install-root.sh ROOT.simg TWRP.img` = TWRP into boot_a (so resets never boot Android,
+  which would reformat the HFS+ userdata) + `fastboot flash userdata`. Not run yet: the kernel must schedule threads
+  first (boot 4: pet thread created but never ran; no "SWEET IRQ" lines; timer interrupt suspected).
+- 2026-10-23 boot 4 (kernel r5 = +0187 gates, +0188 wdt pet, `rd=ufsroot0 taimenreboot=90`): "TAIMEN WDT: petting
+  every 5 s" logged at 19.974 s, then the usual IOKit registrations to "SweetGPU registered" at 19.997 s, then nothing;
+  watchdog reset at 31 s (the shim's arm). No "SWEET UFS" lines, so bsd_init / IOFindBSDRoot was never reached.
+  Build 6 (pet logging) was cancelled by the push of 0189 (GIC state dump into the early log); build 7 has both.
+- 2026-10-23 boot 5 (kernel r7: +0188 pet logging +0189) and boot 6 (r8: GIC dump via printf), both `rd=ufsroot0
+  taimenreboot=90`: **threads do run** ("TAIMEN WDT: pet thread running", "pet at 0 s" at 20.0 s) but the thread never
+  wakes from its first IOSleep, nothing else progresses, watchdog at 31 s. No "SWEET IRQ" lines ever. GIC state right
+  after pe_init_fiq (runs from PE_init_cpu at arm_init.c:623, after mark 20, so the sweet_early_hex lines are dropped):
+  `vtimer intid 19 gicr_pe_base 0xfffffff0369e6000 GICD_CTLR 0x12 GICD_TYPER 0x7b04f3 GICR_WAKER 0x0 GICR_TYPER 0x1
+  ISENABLER0 0x0 IGROUPR0 0x0 | ICC_SRE 0x1 IGRPEN1 0x1 PMR 0xf0 CTLR 0x440 CNTV_CTL 0x0 CNTFRQ 0x124f800 DAIF 0x3c0`.
+  **GICR_ISENABLER0 reads 0 right after the kernel wrote (1<<19)|(1<<1), IGROUPR0 reads 0 after 0xFFFFFFFF**: the
+  redistributor ignores the non-secure enable for PPI 19 (and IGROUPR0 is RAZ/WI from NS with DS=0). Hypotheses:
+  wrong redistributor frame for this CPU, or the PPI not assigned to NS Group 1 by TZ for the frame we touch. Linux on the
+  same phone uses hwirq 19 for arch_timer, so the hardware can deliver it. Next: per-frame GICR_TYPER affinity dump,
+  readback after each write, GICR_IIDR, ISPENDR0/ISACTIVER0, and compare with /proc/interrupts on Android.
+- Screen (user's photos, 2026-10-23): the panel keeps showing the shim's stage-1 text; XNU's stage-0 band (row 2600)
+  and the sweet_early stripes (rows 2000+) never appear; a ~100-row band of colour noise appears at the very top.
+  The kernel's frame kicks or FB writes do not reach the panel: the on-screen console is not usable yet.
+- The scratch xnu tree used to generate patches was lost with a session restart; regenerate with
+  `git clone --depth 1 --branch xnu-8796.141.3 apple-oss-distributions/xnu` + apply port/xnu/patches in sorted order.
