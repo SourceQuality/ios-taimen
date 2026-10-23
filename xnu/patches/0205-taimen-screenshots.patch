@@ -1,0 +1,145 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 17934ba..bf5fad3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -346,6 +346,81 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * TAIMEN: the panel has never shown a kernel frame, so look at the pixels another way.
++ * sweet_fb_screenshot() prints RGB thumbnails of the last surface backboardd swapped and of
++ * the panel memory into the console log, which the UFS log and the log reader bring back:
++ * "SHOT name w h", base64 "SHOT64" lines, "SHOT END name" (tools/taimen/shots.py -> PNG).
++ */
++static uintptr_t sweet_fb_panel;
++static uint32_t sweet_fb_panel_w, sweet_fb_panel_h, sweet_fb_panel_bpr;
++static uint32_t sweet_fb_last_id;
++
++static void
++sweet_fb_shot(const char *what, uintptr_t base, uint32_t w, uint32_t h, uint32_t bpr, uint32_t step)
++{
++	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++	uint32_t ow = w / step, oh = h / step;
++	char line[97];
++	uint8_t acc[3];
++	int n = 0, na = 0;
++
++	IOLog("SHOT %s %u %u\n", what, ow, oh);
++	for (uint32_t y = 0; y < oh; y++) {
++		const volatile uint32_t *row = (const volatile uint32_t *)(base + (uint64_t)y * step * bpr);
++		for (uint32_t x = 0; x < ow; x++) {
++			uint32_t p = row[x * step];     /* BGRA in memory: 0xAARRGGBB */
++			uint8_t rgb[3] = { (uint8_t)(p >> 16), (uint8_t)(p >> 8), (uint8_t)p };
++			for (int k = 0; k < 3; k++) {
++				acc[na++] = rgb[k];
++				if (na < 3) {
++					continue;
++				}
++				line[n++] = b64[acc[0] >> 2];
++				line[n++] = b64[((acc[0] & 3) << 4) | (acc[1] >> 4)];
++				line[n++] = b64[((acc[1] & 15) << 2) | (acc[2] >> 6)];
++				line[n++] = b64[acc[2] & 63];
++				na = 0;
++				if (n == 96) {
++					line[n] = 0;
++					IOLog("SHOT64 %s\n", line);
++					n = 0;
++				}
++			}
++		}
++	}
++	if (n != 0) {   /* ow * oh * 3 bytes: whole groups, no padding */
++		line[n] = 0;
++		IOLog("SHOT64 %s\n", line);
++	}
++	IOLog("SHOT END %s\n", what);
++}
++
++extern "C" void sweet_fb_screenshot(const char *tag);
++void
++sweet_fb_screenshot(const char *tag)
++{
++	char name[48];
++	int muted = sweet_console_muted;
++
++	sweet_console_muted = 1;        /* the log only; drawing ~6000 lines would take seconds */
++	SweetSurface *s = sweet_fb_last_id ? sweet_surface_copy(sweet_fb_last_id) : NULL;
++	if (s != NULL && s->kernelAddress() != 0 && (s->bytesPerElement == 4 || s->bytesPerElement == 0)) {
++		snprintf(name, sizeof(name), "%s-surface%u", tag, s->id);
++		sweet_fb_shot(name, s->kernelAddress() + s->offset, s->width, s->height, s->bytesPerRow, 5);
++	} else {
++		IOLog("SHOT %s: no swapped surface (last id %u)\n", tag, sweet_fb_last_id);
++	}
++	OSSafeReleaseNULL(s);
++	if (sweet_fb_panel != 0) {
++		snprintf(name, sizeof(name), "%s-panel", tag);
++		sweet_fb_shot(name, sweet_fb_panel, sweet_fb_panel_w, sweet_fb_panel_h, sweet_fb_panel_bpr, 10);
++	}
++	sweet_console_muted = muted;
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -460,6 +535,12 @@ AppleCLCD::start(IOService *provider)
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+ 	    fScaled ? ", scaled to the 24 bpp panel" : "");
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	sweet_fb_panel_w = fWidth;
++	sweet_fb_panel_h = fHeight;
++	sweet_fb_panel_bpr = fRowBytes;
++	sweet_fb_panel = fPixels;
++#endif
+ 	return true;
+ }
+ 
+@@ -872,6 +953,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		if (layer == 0) {
++			sweet_fb_last_id = id;
++		}
++#endif
+ 		/* Log swaps outside backboardd's steady two-surface alternation. */
+ 		static uint32_t seen[2], odd_logged;
+ 		bool odd = mask != 1 || (id != seen[0] && id != seen[1]);
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 33dc57c..8940c7a 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -41,6 +41,8 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void taimen_gic_dump(const char *tag);
+ extern "C" void taimen_thread_dump(const char *tag);
+ extern "C" void sweet_fbcon_regs(uint32_t r[10]);
++extern "C" void sweet_fb_screenshot(const char *tag);  /* SweetFramebuffer.cpp */
++extern "C" void sweet_log_kick(void);                  /* bsd/dev/sweet_ufs.c */
+ extern "C" uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
+ 
+ /*
+@@ -141,12 +143,19 @@ taimen_wdt_thread(void *arg)
+ 		if (t == 10 || t == 40) {
+ 			taimen_thread_dump(t == 10 ? "10s" : "40s");
+ 		}
++		if (t == 60) {
++			sweet_fb_screenshot("60s");
++		}
+ 		IOSleep(TAIMEN_WDT_PET_S * 1000);
+ 	}
+ 	IOLog("TAIMEN WDT: taimenreboot=%d reached: WDT EN 0x%x STS 0x%x BARK 0x%x BITE 0x%x; reset ladder follows\n",
+ 	    reboot_s, wdt[TAIMEN_WDT_EN / 4], wdt[0x0c / 4], wdt[TAIMEN_WDT_BARK / 4], wdt[TAIMEN_WDT_BITE / 4]);
+ 	taimen_fb_report(reboot_s);
+-	IOSleep(500);
++	wdt[TAIMEN_WDT_RST / 4] = 1;
++	sweet_fb_screenshot("end");
++	/* the UFS log thread flushes every 10 s: boot 19's last 5 s never reached it */
++	sweet_log_kick();
++	IOSleep(2000);
+ 	IOLog("TAIMEN RESET: PS_HOLD = 0\n");
+ 	IOSleep(300);
+ 	taimen_halt_restart(0);

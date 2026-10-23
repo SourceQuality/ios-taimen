@@ -46,6 +46,9 @@ for f in glob.glob(sys.argv[1] + '/pstore-console-ramoops*'):
 open(sys.argv[2], 'wb').write(best)
 print(f'{sys.argv[2]}: {len(best)} bytes of XNU log from pstore')
 EOF
+for f in "$out/sweetlog.txt" "$out/pstore-xnu.txt"; do
+	[ -s "$f" ] && grep -q '^SHOT ' "$f" && python3 -I "$P/tools/taimen/shots.py" "$f" "$out/shots"
+done
 say "logs in $out; waiting for the reader's reboot into fastboot"
 waitfb 90 && { say "phone back in fastboot"; exit 0; }
 say "phone not back in fastboot"
