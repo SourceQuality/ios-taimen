@@ -73,3 +73,15 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Ramoops is not a log channel on taimen; use the screen now and the UFS log ring later.
 - Linux dmesg: `mdss version = 0x30000001`, `fb0: split_mode:1 left:720 right:720` (two LM/PP/DSC, one DSI),
   `bootloader display is on`, DSI ctrl rev 0x20000000, PHY rev 0x3.
+- 2026-10-22 staged diag (`shim/taimen.c`, correct MDSS offsets from the DTS: ctl 0x2000, vig 0x5000, lm 0x45000,
+  intf 0x6b000+, pp 0x71000+, dsc 0x81000): ran to the end, `bootreason=reboot`. So the MDSS reads, the WDT
+  write and the CTL0 START kick are all fine; shim 1 died on the two wrong offsets (INTF 0x6a800 / PP 0x70000).
+- 2026-10-22 **UFS log channel works.** Pixel 4 shim's UFSHCI driver ported to 0x1da4000 (`shim/ufs_taimen.c`);
+  log written to `align_parti` (sda12, 6 MiB all-zero GPT pad, backed up to `../backup/align_parti.img`), read back
+  with `tools/taimen/log-pull.sh` from rooted Android. ABL leaves the host enabled: ver=0x210 (UFSHCI 2.1),
+  cap=0x1587001f, hce=1, hcs=0x10f, its UTRL at 0x9bc39000. TUR ok, GPT parsed, partition first=0x14aa08
+  blocks=0x5f8 (4K units), WRITE(10)+SYNC ok. Replaces ramoops.
+- Entry facts: image at 0x80080000 (`_end`=0x80118000 for a 0x98000 image), DTB passed in x0 at 0x85300000,
+  EL1 (`CurrentEL`=4), SCTLR_EL1=0xc00800 (MMU off), MIDR=0x51af8014 (Qualcomm Kryo 280 silver, part 0x801),
+  CNTFRQ 19.2 MHz. **ID_AA64MMFR0_EL1 = 0x1122: TGran16 = 0 (no 16K), TGran64 = 0 (64K yes), TGran4 = 0 (4K yes).**
+  Definitive; 4K pages it is.
