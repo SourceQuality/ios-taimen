@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..22f4cbd 100644
+index 0631685..1dce730 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -22,6 +22,69 @@ public:
+@@ -22,6 +22,71 @@ public:
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
  
@@ -31,8 +31,10 @@ index 0631685..22f4cbd 100644
 +	volatile uint32_t *wdt = (volatile uint32_t *)arg;
 +	int reboot_s = 0;
 +	PE_parse_boot_argn("taimenreboot", &reboot_s, sizeof(reboot_s));
++	IOLog("TAIMEN WDT: pet thread running\n");
 +	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += TAIMEN_WDT_PET_S) {
 +		wdt[TAIMEN_WDT_RST / 4] = 1;
++		IOLog("TAIMEN WDT: pet at %d s\n", t);
 +		IOSleep(TAIMEN_WDT_PET_S * 1000);
 +	}
 +	IOLog("TAIMEN WDT: taimenreboot=%d reached, no more pets: reset follows\n", reboot_s);
@@ -72,7 +74,7 @@ index 0631685..22f4cbd 100644
  bool
  SweetPlatformExpert::start(IOService *provider)
  {
-@@ -29,6 +92,9 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -29,6 +94,9 @@ SweetPlatformExpert::start(IOService *provider)
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}
