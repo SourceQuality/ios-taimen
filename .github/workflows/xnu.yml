@@ -60,6 +60,10 @@ jobs:
           # Shallow clones: the Apple source tags are all we ever check out
           sed -i '' 's/git clone --branch/git clone --depth 1 --branch/' dxb/build.sh
           grep -c 'git clone --depth 1 --branch' dxb/build.sh
+          # xnu's makedefs run the kernel compiler as "$(CCACHE) $(CC)"; build.sh exports its own
+          # CC, so hand ccache over through that make variable on the kernel make line.
+          sed -i '' 's/make install -j8 VERBOSE=YES/make install -j8 VERBOSE=YES CCACHE=ccache/' dxb/build.sh
+          grep -c 'VERBOSE=YES CCACHE=ccache' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
@@ -141,12 +145,7 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: |
-          # xnu's makedefs honour CC/CXX from the environment (origin != default)
-          export CC="ccache $(xcrun -sdk macosx -find clang)"
-          export CXX="ccache $(xcrun -sdk macosx -find clang++)"
-          echo "CC=$CC"
-          bash build.sh
+        run: bash build.sh
 
       - name: ccache stats
         if: always()
