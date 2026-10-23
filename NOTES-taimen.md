@@ -148,3 +148,29 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   The kernel's frame kicks or FB writes do not reach the panel: the on-screen console is not usable yet.
 - The scratch xnu tree used to generate patches was lost with a session restart; regenerate with
   `git clone --depth 1 --branch xnu-8796.141.3 apple-oss-distributions/xnu` + apply port/xnu/patches in sorted order.
+- 2026-10-23 boots 7-8 (kernels r10/r11, 0190 diagnostics): GICR window scan from inside XNU: RD frames at +0x00000,
+  +0x20000, ... +0xe0000 with GICR_IIDR 0x1143b (Arm GIC-500) and TYPER affinities 0,1,2,3,0x100..0x103 (frame 7 has
+  Last); CPU0 = frame 0 as assumed. But every SGI/PPI register (ISENABLER0, IPRIORITYR, ICFGR1, ISPENDR0) reads 0 even
+  right after XNU writes them, and **GICD_CTLR reads 0x0 at handoff** (sweet/sailfish/flame bootloaders leave ARE_NS
+  set; the sweet code relies on that and only sets ARE_NS|EnableGrp1A after the redistributor writes). With ARE_NS
+  clear the redistributor SGI/PPI registers are RAZ/WI from Non-secure state -> the vtimer PPI 19 was never enabled ->
+  no timer interrupt -> the scheduler never woke anything (threads ran once, IOSleep never returned). Fix 0191: set
+  GICD_CTLR.ARE_NS (RWP wait) before the redistributor writes, TAIMEN only. Linux's gic_dist_init does the same order.
+- 2026-10-23 root image verified (agent, read-only mount): launchd/dyld arm64 Mach-O, 44 dyld cache files hard-linked
+  from the SystemOS cryptex (no 0-byte files), cryptex symlinks relative, owners (mobile 501, uuidtext/diagnostics 272,
+  keybag 0600), SystemVersion 16.7.16/20H392, 181767 files / 137195 dirs / 2328 symlinks, 11.67 GiB used; every path of
+  the IPSW listing present (22 renamed by fsck Unicode normalisation; 2 Thai-named shortcuts unresolvable under Linux
+  hfsplus only). `fsck.hfsplus -n` keeps saying "minor repair" after a clean -y; Linux mounts it without complaint.
+- 2026-10-23 boot 9 (r12 = 0191 ARE_NS first): `GICD_CTLR now 0x10`, then **ISENABLER0 0x80002, IPRIO 0xa0a0a0a0**
+  (the PPI enable finally sticks), ISPENDR0 0x40200000 (PPIs 21 and 30 already pending from firmware). The log ends
+  right there, as in boots 7-8 (first boots with 0190): the dump reads ICC_HPPIR0_EL1 (Group 0 = TrustZone; traps to
+  EL3 when SCR_EL3.FIQ is set) and CNTP_CTL_EL0 (physical timer, trapped by the hypervisor) -> immediate reset
+  (+43 s cycle, "watchdog"). 0192 drops both reads.
+- 2026-10-23 **boot 10 (r13 = 0191 ARE_NS first + 0192): TIMER INTERRUPTS WORK.** "TAIMEN WDT: pet at 0 s .. 115 s"
+  every 5 s, `taimenreboot=120 reached, no more pets: reset follows`, phone back at +195 s by the watchdog exactly as
+  designed. Scheduler, IOSleep and the vtimer are all functional on the 4K kernel. Root cause of boots 3-9: GICD_CTLR
+  ARE_NS clear at handoff on taimen (0191). After the dump: ICC_IGRPEN1 reads 0 (enabled later), HPPIR1 0x3ff.
+- 2026-10-23 display: the agent's analysis (saved in docs/taimen-display-kicks.md) shows all three XNU paint paths
+  write the right addresses; the fault is cadence: ~20 bare CTL0 STARTs ~1 ms apart during the first command-mode
+  frame desync the DSC panel (noise band at the top, picture frozen). 0193: early kicks wait for PP0 done, clear it,
+  then START (the shim's sequence); start.s no longer STARTs at all.

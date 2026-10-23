@@ -1,0 +1,94 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..f9a76f6 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -476,6 +476,9 @@ bsd_rooted_ramdisk(void)
+ void
+ bsd_init(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	printf("TAIMEN: bsd_init entered\n");
++#endif
+ 	struct uthread *ut;
+ 	vnode_t init_rootvnode = NULLVP;
+ 	struct proc_ro_data kernproc_ro_data = {
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 7562510..c4acb0c 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -62,6 +62,10 @@ taimen_wdt_thread(void *arg)
+ 	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += TAIMEN_WDT_PET_S) {
+ 		wdt[TAIMEN_WDT_RST / 4] = 1;
+ 		IOLog("TAIMEN WDT: pet at %d s\n", t);
++		if (t == 10 || t == 40) {
++			extern "C" void taimen_thread_dump(const char *tag);
++			taimen_thread_dump(t == 10 ? "10s" : "40s");
++		}
+ 		IOSleep(TAIMEN_WDT_PET_S * 1000);
+ 	}
+ 	IOLog("TAIMEN WDT: taimenreboot=%d reached, no more pets: reset follows\n", reboot_s);
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..c8edc7c 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -655,6 +655,10 @@ kern_return_t
+ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+     dev_t * root, u_int32_t * oflags )
+ {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	IOLog("TAIMEN: IOFindBSDRoot entered\n");
++#endif
++
+ 	mach_timespec_t     t;
+ 	IOService *         service;
+ 	IORegistryEntry *   regEntry;
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 1ceb39c..2b58a92 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -16,6 +16,9 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ #include <mach/vm_param.h>
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/queue.h>
+ 
+ /* persistent_ram_buffer: "DBGC", start, size, then the text (no ECC) */
+ #define PRZ_OFF         (SWEET_EARLY_LOG_PRZ - SWEET_EARLY_LOG_BLOCK)
+@@ -270,4 +273,21 @@ sweet_early_disable(void)
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/* Bring-up: where is every kernel thread? (state, wait event, continuation; symbolicate with tools/taimen/symbolicate.py) */
++extern queue_head_t threads;
++extern lck_mtx_t tasks_threads_lock;
++void
++taimen_thread_dump(const char *tag)
++{
++	thread_t th;
++	unsigned n = 0;
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&threads, th, thread_t, threads) {
++		printf("TAIMEN THR [%s] #%u tid %llu state 0x%x pri %d wait_event 0x%llx cont 0x%llx\n", tag, n++, thread_tid(th),
++		    th->state, th->sched_pri, (unsigned long long)th->wait_event, (unsigned long long)(uintptr_t)th->continuation);
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++}
++#endif
+ #endif /* SWEET */
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 546c0d0..e8636e6 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -7,6 +7,9 @@
+ #include <stdint.h>
+ 
+ #if defined(SWEET)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++void taimen_thread_dump(const char *tag);
++#endif
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ /* Same log, also after sweet_early_disable: the console mirrors into it. */
