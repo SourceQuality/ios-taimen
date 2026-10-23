@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 302c324..14de358 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -948,6 +948,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (!fGpu) {
+ 		sweet_fbcon_wait_idle();        /* no CPU copy during a transfer (pe_serial.c) */
+ 	}
++	/* Boot 23: the console text drawn before this first swap muted it stayed in the borders. */
++	static bool borders_cleared;
++	if (!borders_cleared && sweet_console_muted && (fOffX < 0 || fOffY < 0)) {
++		borders_cleared = true;
++		volatile uint64_t *px = (volatile uint64_t *)fPixels;
++		for (size_t i = 0; i < (size_t)fRowBytes * fHeight / 8; i++) {
++			px[i] = 0xff000000ff000000ULL;
++		}
++	}
+ #endif
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
