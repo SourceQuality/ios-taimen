@@ -1,0 +1,411 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 83b5916..ef3595c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -99,6 +99,10 @@ extern "C" bool sweet_fbcon_dcs(uint8_t cmd, uint8_t param);
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ extern "C" void sweet_fbcon_wait_idle(void);
+ extern "C" bool sweet_fbcon_gui_started;       /* pe_serial.c, 0212 */
++extern "C" void sweet_fbcon_geometry(int geom);        /* pe_serial.c, 0218 */
++extern "C" int sweet_fbcon_geom;
++extern "C" bool sweet_fbcon_scale_failed;
++extern "C" int sweet_fb_scaled;                 /* below; read by SweetHID's touch mapping */
+ #endif
+ #include "../../../bsd/dev/sweet_gpu.h"
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+@@ -925,6 +929,105 @@ AppleCLCD::setPower(bool on)
+ 	IOLog("SWEET FB: display %s\n", on ? "on" : "off");
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * Hardware scaling (boot-arg taimenhwscale, docs/taimen-display-scaling-plan.md): the
++ * 1125x2436 frame is copied into a scan buffer below 4 GB in the splash region (iOS's
++ * surfaces sit above 4 GB, out of the MDP's 32-bit reach) and VIG0 shows it
++ *   1  1:1 at (157,222) from the scan buffer, scaler off (E2)
++ *   2  scaled to 1330x2880 at (55,0) by QSEED3, one buffer (E3)
++ *   3  as 2, double-buffered SCAN0/SCAN1, the copy overlaps the transfer (E4)
++ * pe_serial.c restores ABL's VIG0 on a frame timeout; then this goes back to the 1:1 copy.
++ */
++#define TAIMEN_SCAN0_PA         0x9e400000ULL   /* past the 16 MiB panel buffer */
++#define TAIMEN_SCAN1_PA         0x9d400000ULL   /* over the panel buffer (mode 3) */
++#define TAIMEN_CANVAS_W         1125u
++#define TAIMEN_CANVAS_H         2436u
++#define TAIMEN_CANVAS_BPR       4608u           /* backboardd's bytesPerRow: one memcpy per frame */
++int sweet_fb_scaled;
++static int taimen_hwscale = -1;
++static SweetSurface *taimen_scan[2];
++static unsigned taimen_back;
++
++static bool
++taimen_present_scaled(const uint8_t *rec, uint32_t mask, uintptr_t panel, uint32_t panel_bpr, uint32_t panel_h)
++{
++	if (taimen_hwscale < 0) {
++		int m = 0;
++		(void)PE_parse_boot_argn("taimenhwscale", &m, sizeof(m));
++		taimen_hwscale = (m >= 1 && m <= 3) ? m : 0;
++		static const uint64_t pa[2] = {TAIMEN_SCAN0_PA, TAIMEN_SCAN1_PA};
++		for (int i = 0; i < (taimen_hwscale == 3 ? 2 : 1) && taimen_hwscale; i++) {
++			taimen_scan[i] = sweet_surface_create_physical(pa[i], TAIMEN_CANVAS_W, TAIMEN_CANVAS_H,
++			    TAIMEN_CANVAS_BPR, SWEET_FB_FORMAT_BGRA);
++			if (taimen_scan[i] == NULL || taimen_scan[i]->kernelAddress() == 0) {
++				IOLog("TAIMEN SCALE: scan buffer %d at 0x%llx failed, 1:1 copy\n", i, pa[i]);
++				taimen_hwscale = 0;
++			}
++		}
++		if (taimen_hwscale) {
++			sweet_console_muted = 1;        /* SCAN1 is the old panel buffer */
++			IOLog("TAIMEN SCALE: mode %d (%s)\n", taimen_hwscale, taimen_hwscale == 1 ? "1:1 from SCAN0" :
++			    taimen_hwscale == 2 ? "QSEED3 1330x2880, one buffer" : "QSEED3 1330x2880, double-buffered");
++		}
++	}
++	if (taimen_hwscale == 0) {
++		return false;
++	}
++	if (sweet_fbcon_scale_failed) {
++		IOLog("TAIMEN SCALE: frame timeout in geometry %d: ABL's VIG0 restored, back to the 1:1 copy\n", taimen_hwscale);
++		taimen_hwscale = 0;
++		sweet_fb_scaled = 0;
++		volatile uint64_t *px = (volatile uint64_t *)panel;
++		for (size_t i = 0; i < (size_t)panel_bpr * panel_h / 8; i++) {
++			px[i] = 0xff000000ff000000ULL;
++		}
++		return false;
++	}
++	uint32_t id = get32(rec, 0x54);
++	SweetSurface *s = (mask & 1u) && id ? sweet_surface_copy(id) : NULL;
++	if (s == NULL || s->width != TAIMEN_CANVAS_W || s->height != TAIMEN_CANVAS_H || s->kernelAddress() == 0 ||
++	    (s->bytesPerElement != 4 && s->bytesPerElement != 0) ||
++	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * (TAIMEN_CANVAS_H - 1) + TAIMEN_CANVAS_W * 4 >
++	    s->memory->getLength()) {
++		static unsigned odd;
++		if (s != NULL && odd++ < 20) {
++			IOLog("TAIMEN SCALE: swap of surface %u %ux%u bpr %u not shown\n", id, s->width, s->height, s->bytesPerRow);
++		}
++		OSSafeReleaseNULL(s);
++		return true;
++	}
++	sweet_fb_last_id = id;
++	SweetSurface *dst = taimen_scan[taimen_back];
++	if (taimen_hwscale != 3) {
++		sweet_fbcon_wait_idle();        /* one buffer: not while it is being sent */
++	}
++	uint8_t *d = (uint8_t *)dst->kernelAddress();
++	const uint8_t *src = (const uint8_t *)(s->kernelAddress() + s->offset);
++	if (s->bytesPerRow == TAIMEN_CANVAS_BPR) {
++		memcpy(d, src, (size_t)TAIMEN_CANVAS_BPR * TAIMEN_CANVAS_H);
++	} else {
++		for (uint32_t y = 0; y < TAIMEN_CANVAS_H; y++) {
++			memcpy(d + (size_t)y * TAIMEN_CANVAS_BPR, src + (size_t)y * s->bytesPerRow, TAIMEN_CANVAS_W * 4);
++		}
++	}
++	s->release();
++	sweet_fb_panel = (uintptr_t)d;          /* the "panel" screenshot shows the scan buffer */
++	sweet_fb_panel_w = TAIMEN_CANVAS_W;
++	sweet_fb_panel_h = TAIMEN_CANVAS_H;
++	sweet_fb_panel_bpr = TAIMEN_CANVAS_BPR;
++	if (sweet_fbcon_geom == 0) {
++		sweet_fbcon_geometry(taimen_hwscale == 1 ? 2 : 3);
++		sweet_fb_scaled = taimen_hwscale >= 2;
++	}
++	sweet_fbcon_flip(taimen_hwscale == 3 && taimen_back ? TAIMEN_SCAN1_PA : TAIMEN_SCAN0_PA, TAIMEN_CANVAS_BPR);
++	if (taimen_hwscale == 3) {
++		taimen_back ^= 1u;
++	}
++	return true;
++}
++#endif
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -947,6 +1050,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 	sweet_fbcon_gui_started = true;         /* from now on frames go to the panel (0212) */
++	if (taimen_present_scaled(rec, mask, fPixels, fRowBytes, fHeight)) {
++		return;
++	}
+ 	if (!fGpu) {
+ 		sweet_fbcon_wait_idle();        /* no CPU copy during a transfer (pe_serial.c) */
+ 	}
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 46ebaba..e021978 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -160,6 +160,54 @@ taimen_disp_dump(const char *tag)
+ 	IOLog("DISP %s busy of 20000 reads: engine %u mdp %u nonzero %u\n", tag, eng, mdp, any);
+ }
+ 
++/*
++ * MDP register census for the hardware scaling (docs/taimen-display-scaling-plan.md E0):
++ * only the ranges of this phone's DT qcom,regs-dump-mdp list (what Linux dumps with the
++ * MDP clocked), MDSS-relative, in the "DISP" line format. At 0 s (ABL's state) and 60 s
++ * (after AppleCLCD's geometry change, if taimenhwscale asked for one).
++ */
++extern "C" int sweet_fbcon_geom;
++extern "C" bool sweet_fbcon_scale_failed;
++static const struct { const char *name; uint32_t off, end; } taimen_mdp_ranges[] = {
++	{"VIG0", 0x5000, 0x5158}, {"QSEED3", 0x5a00, 0x5b00}, {"CTL0", 0x2000, 0x2098},
++	{"LM0", 0x45000, 0x452c0}, {"LM1", 0x46000, 0x462c0}, {"DSC0", 0x81000, 0x81140},
++	{"DSC1", 0x81400, 0x81540}, {"PP1", 0x71800, 0x718d8}, {"MDPTOP", 0x1000, 0x1458},
++};
++
++static void
++taimen_mdp_census(const char *tag)
++{
++	static uint32_t page_pa[8];
++	static vm_offset_t page_va[8];
++	for (unsigned r = 0; r < sizeof(taimen_mdp_ranges) / sizeof(taimen_mdp_ranges[0]); r++) {
++		uint32_t pa = 0xc900000u + (taimen_mdp_ranges[r].off & ~0xfffu);
++		vm_offset_t va = 0;
++		for (unsigned i = 0; i < 8; i++) {
++			if (page_pa[i] == pa) {
++				va = page_va[i];
++				break;
++			}
++			if (page_pa[i] == 0) {
++				va = ml_io_map(pa, PAGE_SIZE);
++				page_pa[i] = pa;
++				page_va[i] = va;
++				break;
++			}
++		}
++		if (va == 0) {
++			IOLog("MDP %s %s: no mapping\n", tag, taimen_mdp_ranges[r].name);
++			continue;
++		}
++		for (uint32_t o = taimen_mdp_ranges[r].off; o < taimen_mdp_ranges[r].end; o += 0x20) {
++			volatile uint32_t *d = (volatile uint32_t *)(va + (o & 0xfffu));
++			uint32_t rel = o - taimen_mdp_ranges[r].off;
++			IOLog("MDP %s %s+0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag,
++			    taimen_mdp_ranges[r].name, rel, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
++		}
++	}
++	IOLog("MDP %s: geometry %d%s\n", tag, sweet_fbcon_geom, sweet_fbcon_scale_failed ? ", scaling failed (ABL's restored)" : "");
++}
++
+ /*
+  * Boot 31: iOS reaches the home screen but is very slow. How fast does CPU0 run? A
+  * subs/b.ne loop is about one iteration per cycle on these cores; timed against the
+@@ -192,8 +240,9 @@ taimen_fb_report(int t)
+ 	sweet_fbcon_regs(r);
+ 	IOLog("TAIMEN FB %d: kicks %llu done %llu timeout %llu INTR_EN 0x%x STS 0x%x\n",
+ 	    t, sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout, r[0], r[1]);
+-	IOLog("TAIMEN FB %d: DSI resets %llu, last FIFO_STATUS 0x%x\n",
+-	    t, sweet_fbcon_stat_dsi_resets, sweet_fbcon_last_dsi_fifo);
++	IOLog("TAIMEN FB %d: DSI resets %llu, last FIFO_STATUS 0x%x, geometry %d%s\n",
++	    t, sweet_fbcon_stat_dsi_resets, sweet_fbcon_last_dsi_fifo, sweet_fbcon_geom,
++	    sweet_fbcon_scale_failed ? " (scaling failed)" : "");
+ 	IOLog("TAIMEN FB %d: CTL0 LAYER 0x%x TOP 0x%x FLUSH 0x%x\n", t, r[2], r[3], r[4]);
+ 	IOLog("TAIMEN FB %d: VIG0 SIZE 0x%x SRC0 0x%x YSTR 0x%x DSI0 0x%x 0x%x\n",
+ 	    t, r[5], r[6], r[7], r[8], r[9]);
+@@ -232,6 +281,7 @@ taimen_wdt_thread(void *arg)
+ 		if (t == 0 || t == 60) {
+ 			taimen_disp_dump(t == 0 ? "xnu-0s" : "xnu-60s");
+ 			taimen_cpu_speed(t == 0 ? "0s" : "60s");
++			taimen_mdp_census(t == 0 ? "0s" : "60s");
+ 		}
+ 		if (t == 10 || t == 40) {
+ 			taimen_thread_dump(t == 10 ? "10s" : "40s");
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7d4413b..2b6a5f8 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,7 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
++extern "C" int sweet_fb_scaled;        /* SweetFramebuffer.cpp: hardware-scaled canvas on the panel */
+ /* FTM4 reports panel pixels 0..1439 x 0..2879; 3 mm at 21.2 px/mm (docs/taimen-touch-plan.md 7) */
+ #define SWEET_TOUCH_EDGE_PX 64
+ #define SWEET_TOUCH_PANEL_W 1440
+@@ -492,6 +493,12 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> display pixels (clamped onto the display) -> normalized. */
+ 	int lx = x + fOffX, ly = y + fOffY;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (sweet_fb_scaled) {  /* QSEED3: the canvas fills 1330x2880 at x 55 (SweetFramebuffer, 0218) */
++		lx = (x - 55) * 1125 / 1330;
++		ly = y * 2436 / 2880;
++	}
++#endif
+ 	lx = lx < 0 ? 0 : (lx > fLogicalW - 1 ? fLogicalW - 1 : lx);
+ 	ly = ly < 0 ? 0 : (ly > fLogicalH - 1 ? fLogicalH - 1 : ly);
+ 	IOFixed nx = (IOFixed)(((int64_t)lx << 16) / fLogicalW);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 4b694f4..33bad24 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -802,6 +802,10 @@ static bool fbcon_kick_pending = true;  /* the shim's last frame may still be ou
+ #define DSI_FIFO_HS_UNDERFLOW   0x88880000u     /* DLN0..3_HS_FIFO_UNDERFLOW */
+ uint64_t sweet_fbcon_stat_dsi_resets;
+ uint32_t sweet_fbcon_last_dsi_fifo;
++/* hardware scaling state (fbcon_geom_apply below) */
++static uint32_t fbcon_geom_next;        /* 0 nothing, 1 restore ABL, 2 canvas 1:1, 3 scaled */
++int sweet_fbcon_geom;                   /* geometry on the panel: 0 ABL's, 2, 3 */
++bool sweet_fbcon_scale_failed;
+ 
+ static void
+ fbcon_dsi_recover(void)
+@@ -850,6 +854,12 @@ fbcon_frame_done(uint64_t now)
+ 	}
+ 	if (now - fbcon_kick_last >= gPEClockFrequencyInfo.timebase_frequency_hz / 20) {
+ 		sweet_fbcon_stat_timeout++;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		if (sweet_fbcon_geom != 0 && !sweet_fbcon_scale_failed) {
++			sweet_fbcon_scale_failed = true;        /* this kick restores ABL's VIG0 */
++			fbcon_geom_next = 1;
++		}
++#endif
+ 		return true;
+ 	}
+ 	return false;
+@@ -864,6 +874,120 @@ fbcon_frame_done(uint64_t now)
+  */
+ bool sweet_fbcon_gui_started;
+ static int fbcon_console_kicks = -1;
++
++/*
++ * VIG0 geometry for hardware scaling (docs/taimen-display-scaling-plan.md, boot-arg
++ * taimenhwscale, AppleCLCD): ABL's VIG0 state is saved at probe; a geometry change is
++ * written inside the kick's "previous frame done" gate together with the new source,
++ * latched by CTL0_FLUSH bit 0 and sent by the START. In a changed geometry a 50 ms
++ * timeout is a failure: the next kick restores ABL's VIG0 and AppleCLCD goes back to the
++ * 1:1 copy (sweet_fbcon_scale_failed).
++ *   2  1125x2436 canvas buffer, 1:1 at (157,222), scaler off (plan E2)
++ *   3  1125x2436 -> 1330x2880 at (55,0) through QSEED3, bilinear, no LUT (plan E3)
++ */
++#define VIG_SRC_SIZE    (0x000 / 4)
++#define VIG_SRC_IMG     (0x004 / 4)
++#define VIG_SRC_XY      (0x008 / 4)
++#define VIG_OUT_SIZE    (0x00c / 4)
++#define VIG_OUT_XY      (0x010 / 4)
++#define VIG_SRC0        (0x014 / 4)
++#define VIG_YSTRIDE0    (0x024 / 4)
++#define VIG_YSTRIDE1    (0x028 / 4)
++#define VIG_FORMAT      (0x030 / 4)
++#define VIG_UNPACK      (0x034 / 4)
++#define VIG_SRC_OP      (0x038 / 4)
++#define VIG_DECIMATION  (0x0b4 / 4)
++#define VIG_PE_FIRST    (0x100 / 4)     /* SW_PIX_EXT C0 LR/TB/REQ, C1C2 +0x10, C3 +0x20 */
++#define VIG_QSEED       (0xa00 / 4)
++#define QS_OP_MODE      (0x04 / 4)
++#define QS_PHASE_INIT   (0x0c / 4)
++#define QS_STEP_Y_H     (0x10 / 4)
++#define QS_STEP_Y_V     (0x14 / 4)
++#define QS_STEP_UV_H    (0x18 / 4)
++#define QS_STEP_UV_V    (0x1c / 4)
++#define QS_PRELOAD      (0x20 / 4)
++#define QS_SRC_Y        (0x40 / 4)
++#define QS_SRC_UV       (0x44 / 4)
++#define QS_DST          (0x48 / 4)
++#define CANVAS_SIZE     0x09840465u     /* 2436 << 16 | 1125 */
++#define SCALED_SIZE     0x0b400532u     /* 2880 << 16 | 1330 */
++static uint32_t fbcon_vig0_abl[0x130 / 4], fbcon_qseed_abl[0x50 / 4];
++static bool fbcon_vig0_saved;
++void sweet_fbcon_geometry(int geom);
++
++static void
++fbcon_vig0_save(void)
++{
++	volatile uint32_t *v = fbcon_vig0;
++	for (unsigned i = 0; i < sizeof(fbcon_vig0_abl) / 4; i++) {
++		fbcon_vig0_abl[i] = v[i];
++	}
++	for (unsigned i = 0; i < sizeof(fbcon_qseed_abl) / 4; i++) {
++		fbcon_qseed_abl[i] = v[VIG_QSEED + i];
++	}
++	fbcon_vig0_saved = true;
++}
++
++/* fbcon_kick_lock held, previous frame done: the caller flushes bit 0 and STARTs. */
++static void
++fbcon_geom_apply(uint32_t g)
++{
++	volatile uint32_t *v = fbcon_vig0, *q = fbcon_vig0 + VIG_QSEED;
++	if (g == 1) {
++		q[QS_OP_MODE] = fbcon_qseed_abl[QS_OP_MODE];
++		static const unsigned keep[] = {VIG_SRC_SIZE, VIG_SRC_IMG, VIG_SRC_XY, VIG_OUT_SIZE, VIG_OUT_XY,
++			                        VIG_SRC0, VIG_YSTRIDE0, VIG_YSTRIDE1, VIG_FORMAT, VIG_UNPACK, VIG_SRC_OP, VIG_DECIMATION};
++		for (unsigned i = 0; i < sizeof(keep) / sizeof(keep[0]); i++) {
++			v[keep[i]] = fbcon_vig0_abl[keep[i]];
++		}
++		for (unsigned i = 0; i < 12; i++) {
++			v[VIG_PE_FIRST + i] = fbcon_vig0_abl[VIG_PE_FIRST + i];
++		}
++		sweet_fbcon_geom = 0;
++		return;
++	}
++	bool scaled = g == 3, pe = scaled || (fbcon_vig0_abl[VIG_SRC_OP] & (1u << 31));
++	v[VIG_SRC_SIZE] = CANVAS_SIZE;
++	v[VIG_SRC_IMG] = CANVAS_SIZE;
++	v[VIG_SRC_XY] = 0;
++	v[VIG_OUT_SIZE] = scaled ? SCALED_SIZE : CANVAS_SIZE;
++	v[VIG_OUT_XY] = scaled ? 55u : (222u << 16 | 157u);
++	v[VIG_YSTRIDE1] = 0;
++	v[VIG_DECIMATION] = 0;
++	if (pe) {               /* pixel extension override: REQ_PIXELS = fetched size per plane */
++		v[VIG_SRC_OP] = fbcon_vig0_abl[VIG_SRC_OP] | (1u << 31);
++		for (unsigned c = 0; c < 3; c++) {
++			v[VIG_PE_FIRST + 4 * c + 0] = 0;
++			v[VIG_PE_FIRST + 4 * c + 1] = 0;
++			v[VIG_PE_FIRST + 4 * c + 2] = CANVAS_SIZE;
++		}
++	}
++	if (scaled) {           /* 21-bit fraction: floor(2^21 * 1125 / 1330), floor(2^21 * 2436 / 2880) */
++		q[QS_PHASE_INIT] = 0;
++		q[QS_STEP_Y_H] = 0x001b1152u;
++		q[QS_STEP_Y_V] = 0x001b1111u;
++		q[QS_STEP_UV_H] = 0x001b1152u;
++		q[QS_STEP_UV_V] = 0x001b1111u;
++		q[QS_PRELOAD] = 0x03040304u;
++		q[QS_SRC_Y] = CANVAS_SIZE;
++		q[QS_SRC_UV] = CANVAS_SIZE;
++		q[QS_DST] = SCALED_SIZE;
++		__builtin_arm_dsb(DSB_SY);
++		q[QS_OP_MODE] = 0x80034001u;    /* EN | 8-bit | bilinear Y/RGB | blend_cfg, last */
++	} else {
++		q[QS_OP_MODE] = fbcon_qseed_abl[QS_OP_MODE];
++	}
++	sweet_fbcon_geom = (int)g;
++}
++
++/* AppleCLCD: change the geometry at the next kick (2, 3) or go back to ABL's (1). */
++void
++sweet_fbcon_geometry(int geom)
++{
++	if (fbcon_vig0 != NULL && fbcon_vig0_saved && geom >= 1 && geom <= 3) {
++		os_atomic_store(&fbcon_geom_next, (uint32_t)geom, release);
++	}
++}
+ #endif
+ 
+ static bool
+@@ -894,6 +1018,16 @@ fbcon_try_kick(void)
+ 		uint64_t src = os_atomic_xchg(&fbcon_src_next, 0ull, relaxed);
+ 		uint32_t layer = os_atomic_xchg(&fbcon_layer_next, 0u, relaxed);
+ 		uint32_t flush = 0;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		uint32_t geom = os_atomic_xchg(&fbcon_geom_next, 0u, relaxed);
++		if (geom != 0 && fbcon_vig0 != NULL) {
++			fbcon_geom_apply(geom);
++			flush |= 1u;                                    /* VIG0 (and its QSEED3) */
++			if (geom == 1) {
++				src = 0;                                /* ABL's source came back with it */
++			}
++		}
++#endif
+ 		if (src != 0 && fbcon_vig0 != NULL) {
+ 			fbcon_vig0[0x14 / 4] = (uint32_t)src;           /* SRC0_ADDR */
+ 			fbcon_vig0[0x24 / 4] = fbcon_src_stride;        /* SRC_YSTRIDE0 */
+@@ -1186,6 +1320,9 @@ fbcon_probe(void)
+ 		page = ml_io_map(trunc_page_64(vig), PAGE_SIZE);
+ 		if (page != 0) {
+ 			fbcon_vig0 = (volatile uint32_t *)(page + (vig & PAGE_MASK));
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++			fbcon_vig0_save();      /* ABL's geometry, the scaling fallback */
++#endif
+ 		}
+ 		/* MDP top (mdss base + 0x1000) INTR_STATUS +0x14, CLEAR +0x18 */
+ 		uint64_t intr = (*kick & ~0xffffull) + 0x1014;
