@@ -218,6 +218,113 @@ static void logview(void)
 }
 #endif
 
+#if defined(STAGE2) && defined(WATCH)
+/*
+ * Watcher (boot-xnu.sh SHIM_WATCH=1): CPU 7 stays in the shim while XNU boots
+ * on the other seven (the ADT lists only those, mkadt TAIMEN_NCPU=7) and copies
+ * what XNU appends to the ramoops console zone. If the zone stops growing while
+ * UFS is still the shim's (UTRLBA unchanged: XNU's driver has not started), XNU
+ * is taken as hung: the copy goes into the shim log, the log to UFS, then
+ * PS_HOLD. The zone itself rarely survives the reset (boots 71 and 88, more
+ * than 1 GiB of RAM, came back with none of it); the shim log does.
+ */
+#define WATCH_CPU	7
+#define WATCH_MPIDR	0x103UL		/* gold cluster, core 3 */
+#define WATCH_FIRST_S	12		/* jump -> XNU's first byte (stage 0, MMU off) */
+#define WATCH_IDLE_S	8		/* between bytes; the APSS WDT bites 31 s after arming */
+#define WATCH_MAX_S	240
+#define WATCH_PRZ	0xb0080000UL	/* sweet_early.c: SWEET_EARLY_LOG_PRZ */
+#define WATCH_PRZ_MAX	(0x100000u - 12u)
+#define WATCH_SIG	0x43474244u
+#define WATCH_UTRLBA	(0x01da4000UL + 0x50)	/* ufshc@1da4000 */
+#define PS_HOLD		0x10ac000UL	/* xnu SweetPlatformExpert: pulling it low resets */
+
+static volatile uint32_t watch_state;	/* 1: watcher up; 2: the boot CPU saved its log and jumps */
+static char watch_buf[192 * 1024];	/* the newest XNU bytes, a ring */
+static uint32_t watch_n;		/* bytes copied in all */
+
+static uint64_t watch_smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	register uint64_t x0 __asm__("x0") = fn;
+	register uint64_t x1 __asm__("x1") = a1;
+	register uint64_t x2 __asm__("x2") = a2;
+	register uint64_t x3 __asm__("x3") = a3;
+	__asm__ volatile("dsb sy; smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+			 "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+			 "x16", "x17", "memory");
+	return x0;
+}
+
+static void watch_start(void)
+{
+	extern char secondary_entry[];
+	int64_t rc = (int64_t)watch_smc(0xc4000003UL, WATCH_MPIDR, (uint64_t)(uintptr_t)secondary_entry, WATCH_CPU);
+	for (int i = 0; i < 1000 && watch_state != 1; i++)
+		delay_ms(1);
+	log_printf("watch: PSCI CPU_ON %lx -> %ld, watcher %s\n", WATCH_MPIDR, (long)rc,
+		   watch_state == 1 ? "up" : "silent");
+}
+
+static void __attribute__((noreturn)) watch_fire(const char *why, uint64_t ms, uint32_t sig, uint32_t start,
+						 uint32_t size)
+{
+	uint32_t keep = watch_n < sizeof(watch_buf) ? watch_n : (uint32_t)sizeof(watch_buf);
+	log_printf("WATCH: %s at +%lu ms after the jump; zone sig %08x start %u size %u; %u bytes of XNU log, "
+		   "the last %u follow\n", why, ms, sig, start, size, watch_n, keep);
+	for (uint32_t i = watch_n - keep; i != watch_n && log_len < LOG_SIZE - 256; i++)
+		log_buf[log_len++] = watch_buf[i % sizeof(watch_buf)];
+	log_printf("\nWATCH: end of the XNU log; PS_HOLD\n");
+	save("watcher");
+	wr32(PS_HOLD, 0);
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
+/* XNU's UFS driver has the controller (its log ring takes over), or XNU ran long enough. */
+static void __attribute__((noreturn)) watch_off(void)
+{
+	watch_smc(0x84000002UL, 0, 0, 0);	/* PSCI CPU_OFF */
+	for (;;)
+		__asm__ volatile("wfi");
+}
+
+static void __attribute__((noreturn)) watch_main(void)
+{
+	watch_state = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	while (watch_state != 2)
+		;
+	volatile uint32_t *prz = (volatile uint32_t *)WATCH_PRZ;
+	volatile uint8_t *txt = (volatile uint8_t *)(WATCH_PRZ + 12);
+	const uint64_t per_ms = rsr("cntfrq_el0") / 1000, t0 = rsr("cntpct_el0");
+	const uint32_t utrlba = rd32(WATCH_UTRLBA);
+	uint32_t pos = (prz[0] == WATCH_SIG && prz[1] < WATCH_PRZ_MAX) ? prz[1] : 0, seen = 0;
+	uint64_t last = t0;
+	log_printf("WATCH: up; zone sig %08x start %u size %u, UFS UTRLBA %08x\n", prz[0], prz[1], prz[2], utrlba);
+	for (;;) {
+		uint32_t sig = prz[0], cur = prz[1], size = prz[2];
+		uint64_t now = rsr("cntpct_el0");
+		if (sig == WATCH_SIG && cur < WATCH_PRZ_MAX) {
+			if (cur < pos && size < WATCH_PRZ_MAX)	/* a new record, not a wrap */
+				pos = 0;
+			for (; pos != cur; pos = (pos + 1) % WATCH_PRZ_MAX)
+				watch_buf[watch_n++ % sizeof(watch_buf)] = (char)txt[pos];
+		}
+		if (watch_n != seen) {
+			seen = watch_n;
+			last = now;
+		}
+		uint64_t ms = (now - t0) / per_ms;
+		if (rd32(WATCH_UTRLBA) != utrlba || ms > WATCH_MAX_S * 1000u)
+			watch_off();
+		if (watch_n == 0 ? ms > WATCH_FIRST_S * 1000u : (now - last) / per_ms > WATCH_IDLE_S * 1000u)
+			watch_fire(watch_n == 0 ? "no XNU log" : "XNU log idle", ms, sig, cur, size);
+		delay_ms(1);
+	}
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
 #ifdef LOGVIEW
@@ -384,7 +491,14 @@ void shim_main(uint64_t dtb)
 	log_printf("wdt armed: %u s (bite reg %08x)\n", (unsigned)WDT_SECS, rd32(APSS_WDT + WDT_BITE));
 	con_flush();
 	disp_dump("shim");
+#ifdef WATCH
+	watch_start();
+#endif
 	save("before loader");
+#ifdef WATCH
+	watch_state = 2;	/* from here on the shim log is the watcher's */
+	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	con_str("LOADER", "payload from initrd ..");
 	con_flush();
 	const char *why = loader_boot(dtb);
@@ -407,6 +521,10 @@ void shim_main(uint64_t dtb)
 
 void secondary_main(uint64_t idx)
 {
+#if defined(STAGE2) && defined(WATCH)
+	if (idx == WATCH_CPU)
+		watch_main();
+#endif
 	(void)idx;
 }
 

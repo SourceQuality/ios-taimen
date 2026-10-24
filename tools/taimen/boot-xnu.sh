@@ -45,10 +45,18 @@ if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 	args="sweetgpu=8 sweetgpuclk=600 taimengpucopy=1 taimengpuheap=256 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB sweetnull=backboardd ${args}"
 	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), TAIMEN_MEM $TAIMEN_MEM"
 fi
+# SHIM_WATCH=1: CPU 7 stays in the shim as a watcher (shim/taimen.c WATCH): XNU gets 7 cores, and
+# if its early log stops growing before its UFS driver starts, the watcher saves the log to the
+# shim log on UFS and pulls PS_HOLD (early hangs otherwise end in a watchdog reset with no log).
+shim_cflags=-DSTAGE2
+if [ "${SHIM_WATCH:-0}" = 1 ]; then
+	shim_cflags="-DSTAGE2 -DWATCH"
+	args="${args} cpus=7"
+fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"
 # TAIMEN_MEM=BYTES: XNU RAM at 0x100000000 (mkadt.py; default 512 MiB)
-TAIMEN_MEM=${TAIMEN_MEM:-} python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
+TAIMEN_NCPU=$([ "${SHIM_WATCH:-0}" = 1 ] && echo 7) TAIMEN_MEM=${TAIMEN_MEM:-} python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
 # cpus=1 and no root yet: the first milestone is XNU painting its own bands.
 # debug 0x10000c: 0xc plus DB_REBOOT_ALWAYS; DB_NMI alone sets panicDebugging, which parks a
 # panicked kernel instead of resetting (no watchdog bite since boot 13), so a panic now ends in
@@ -91,7 +99,7 @@ if [ "$(stat -c %s "$out/payload")" -gt $abl_max ] && [ -n "${SWEETGL_ROOTFIX:-}
 fi
 [ "$(stat -c %s "$out/payload")" -le $abl_max ] || { echo "payload over the $abl_max bytes ABL starts" >&2; exit 1; }
 ls -l "$out/payload" | awk '{print "payload: " $5 " bytes"}'
-EXTRA_CFLAGS=-DSTAGE2 OUT_NAME=taimen-xnu "$P/shim/build-taimen.sh" "$P/../backup/boot_a.img" "$out/payload" | tail -2
+EXTRA_CFLAGS=$shim_cflags OUT_NAME=taimen-xnu "$P/shim/build-taimen.sh" "$P/../backup/boot_a.img" "$out/payload" | tail -2
 img="$P/shim/out/taimen-xnu.img"
 # Get to fastboot from wherever the phone is.
 state=$(timeout 5 adb get-state 2>/dev/null || true)

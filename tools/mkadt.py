@@ -196,7 +196,9 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
             ('fixed-frequency', u32(timebase)),
         ]))
     # Pixel 1: 2 + 2 Kryo (same core, different clocks) as one SMP cluster too.
-    for core, (mpidr, cluster, hz) in enumerate(PIXEL1['cpus'] if pixel1 else TAIMEN['cpus'] if taimen else []):
+    # TAIMEN_NCPU=N (boot-xnu.sh SHIM_WATCH=1): only the first N cores; the shim's watcher keeps CPU 7.
+    ncpu = int(os.environ.get('TAIMEN_NCPU') or 8) if taimen else 8
+    for core, (mpidr, cluster, hz) in enumerate(PIXEL1['cpus'] if pixel1 else TAIMEN['cpus'][:ncpu] if taimen else []):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
