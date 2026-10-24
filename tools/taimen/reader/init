@@ -70,8 +70,13 @@ if [ -n "$vd" ] && [ -b "/dev/$vd" ]; then
 		for f in /vendor/firmware/a5*; do
 			[ -f "$f" ] && cp "$f" "/out/fw-$(basename "$f")"
 		done
+		# the WLAN PD firmware the modem fetches over TFTP (docs/taimen-wifi-plan.md stage 4), ~3.8 MB
+		for f in wlanmdsp.mbn bdwlan.bin bdwlan.b09 modemuw.jsn; do
+			[ -f "/vendor/firmware/$f" ] && cp "/vendor/firmware/$f" "/out/fw-$f"
+		done
+		ls -lR /vendor/firmware/wlan > /out/fw-wlan-list.txt 2>&1
 		umount /vendor
-		log "vendor /dev/$vd: $(ls /out | grep -c '^fw-a5') GPU firmware files copied"
+		log "vendor /dev/$vd: $(ls /out | grep -c '^fw-a5') GPU and $(ls /out | grep -c '^fw-wlanmdsp\|^fw-bdwlan\|^fw-modemuw') WLAN firmware files copied"
 	else
 		log "vendor /dev/$vd: mount failed"
 	fi

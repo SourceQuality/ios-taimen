@@ -1,0 +1,85 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index d9fed08..8050237 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -37,10 +37,12 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <sys/errno.h>
+ #include <sys/param.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" vm_map_address_t phystokv(uint64_t pa);
+ extern "C" void taimen_modem_init(void);
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN MODEM: " fmt "\n", ##__VA_ARGS__)
+@@ -1847,7 +1849,8 @@ pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *
+ struct tftp_sess {
+ 	bool used, write;
+ 	uint32_t port, node, rport;
+-	struct fat_file ff;                     /* the modem_a file (rw < 0) */
++	struct fat_file ff;                     /* the modem_a file (rw < 0, mem NULL) */
++	const uint8_t *mem;                     /* or a payload blob (/vendor/firmware files) */
+ 	int rw;                                 /* /readwrite file in RAM, -1 = none */
+ 	uint64_t size, sent;
+ 	uint32_t blk, rsize, wsize, seek;
+@@ -1938,6 +1941,8 @@ tftp_data(struct tftp_sess *s, uint32_t block, uint64_t offset, uint32_t resp_si
+ 		n = (uint32_t)MIN((uint64_t)n, s->size - offset);
+ 		if (s->rw >= 0) {
+ 			memcpy(b + 4, rw_files[s->rw].data + offset, n);
++		} else if (s->mem != NULL) {
++			memcpy(b + 4, s->mem + offset, n);
+ 		} else if (fat_read(&modem_fs, &s->ff, offset, b + 4, n) != 0) {
+ 			LOG("M6: tftp sess %#x: read FAILED at %llu", s->port, offset);
+ 			IOFree(b, s->blk + 4);
+@@ -1973,6 +1978,33 @@ tftp_opt(char *p, char *end, const char *name, uint64_t val)
+ 	return p + a + b;
+ }
+ 
++/*
++ * 0277: the /vendor/firmware files the modem asks for (wlanmdsp.mbn, bdwlan.*, modemuw.jsn) are
++ * not on modem_a: boot-xnu.sh passes them as payload blobs (/chosen/memory-map WLAN-*), taken by
++ * the request's last path component.
++ */
++static const uint8_t *
++tftp_blob(const char *path, uint64_t *size)
++{
++	static const struct { const char *file, *blob; } map[] = {
++		{ "wlanmdsp.mbn", "WLAN-MDSP" }, { "bdwlan.bin", "WLAN-BDF" }, { "bdwlan.b09", "WLAN-BDF09" },
++		{ "modemuw.jsn", "WLAN-UWJSN" },
++	};
++	const char *base = strrchr(path, '/');
++	base = base != NULL ? base + 1 : path;
++	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++		DTEntry node;
++		uint64_t const *v;
++		unsigned int sz;
++		if (fat_name_eq(base, map[i].file) && SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) == kSuccess &&
++		    SecureDTGetProperty(node, map[i].blob, (void const **)&v, &sz) == kSuccess && sz == 16 && v[1] != 0) {
++			*size = v[1];
++			return (const uint8_t *)phystokv(v[0]);
++		}
++	}
++	return NULL;
++}
++
+ /* the modem's path -> a modem_a path: /readonly/firmware/image/x -> image/x */
+ static const char *
+ tftp_map(const char *path)
+@@ -2075,7 +2107,13 @@ tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+ 		LOG("M6: t=%u ms: tftp RRQ %s (RAM, %llu B)", g_ms, file, s->size);
+ 	} else {
+ 		const char *rel = tftp_map(file);
+-		if (rel == NULL || !fat_open_path(&modem_fs, rel, &s->ff) || s->ff.dir) {
++		uint64_t bsz = 0;
++		if ((rel == NULL || !fat_open_path(&modem_fs, rel, &s->ff) || s->ff.dir) &&
++		    (s->mem = tftp_blob(file, &bsz)) != NULL) {
++			s->ff.size = (uint32_t)bsz;         /* served from the payload */
++			s->ff.dir = false;
++			rel = file;
++		} else if (rel == NULL || s->ff.dir || s->ff.size == 0) {
+ 			tftp_missing++;
+ 			LOG("M6: t=%u ms: tftp RRQ %s: not found", g_ms, file);
+ 			tftp_error(s, 1, "file not found");
