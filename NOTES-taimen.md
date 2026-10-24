@@ -783,3 +783,15 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   596). Ran to its deadline, hottest 70.8 C. sweetgpuclk=710 is the default. Hand-off 5 (ended early by
   the user): brightness 79/1/28 from the slider, the battery 98 -> 96 % and the charger restarted on its own
   (chgr 0x46 inhibit -> 0x03 full-on). The user: two hours of hand-off is wasted time; hand-offs stay short.
+- 2026-10-24 boot 107 (r83, the defaults + mkrootfix --migrate --stage-apps, 40 min): the data migration ran,
+  but all 32 renames came back "already present" (a skip was not logged then). Boot 108 never ran: 0265-0267
+  did not build (EIO, then MIN undeclared in TaimenModem.cpp; 0267, 0268 add the includes).
+- 2026-10-24 boot 109 (r88 = +0263-0268, the defaults + taimenwifi=3 + the --stage-apps ROOTFIX, 240 s): every
+  rename says "not there": the apps are no longer in /private/var/staged_system_apps. There is no data volume
+  here ("mount: data volume missing"), so /private/var is the root's own directory: iOS's first boot moved or
+  removed them. 0271 adds ROOTFIX op 7 (list a directory into the log) to find them.
+  Wi-Fi M0: SMEM v11 (version word 0xb0000), initialized, ptable $TOC v1 with 12 partitions, hwlock 3 free;
+  partition 1 is APPS<->2 and 2 is APPS<->3 at 0x1cf000/0x19f000 (0x30000 each, cacheline 32, empty). The log
+  stopped there: partition 3's header belongs to two other hosts, is XPU-protected, and reading it hung that
+  CPU while iOS ran on (0270: M0 only reads partitions APPS is a host of). The phone came back to fastboot by
+  itself after the deadline reset.
