@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 2e3731a..c0fd85e 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -912,6 +912,15 @@ static const struct {
+ 
+ static vm_offset_t to_cprh, to_saw, to_gcc, to_apcs, to_apm;
+ 
++/* Before a step that can hang the phone: the UFS log ring flushes every 10 s, so flush it now. */
++extern void sweet_log_kick(void);
++static void
++to_flush(void)
++{
++	sweet_log_kick();
++	delay(400000);
++}
++
+ /* One SMC64 to TZ, atomic calls only (no INTERRUPTED, no retry) [5.11]. Returns x0; *r1 = x1. */
+ static int64_t
+ to_smc(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t *r1)
+@@ -1072,6 +1081,8 @@ to_step(unsigned r, uint64_t *buf, size_t words, uint64_t ref)
+ 	unsigned want = (to_lut[r].freq & 0xffu) * 192 / 10;
+ 	char tag[16], line[120];
+ 	int len = 0;
++	printf("TAIMEN OSM: to row %u (%u MHz)\n", r, want);
++	to_flush();
+ 	clk_wr(to_osm, 0x1f10, r);
+ 	(void)clk_rd(to_osm, 0x0);
+ 	delay(2000);
+@@ -1160,6 +1171,7 @@ taimen_osm(unsigned row)
+ 		return false;
+ 	}
+ 	/* S3: the L2 SAW's AVS settings, as Linux's SPM driver writes them [2] */
++	to_flush();
+ 	printf("TAIMEN OSM: S13 %u mV; saw version %#x pmic %#x\n", v0, clk_rd(to_saw, 0xfd0), clk_rd(to_saw, 0xc18));
+ 	clk_wr(to_saw, 0x904, 0x01010031);
+ 	clk_wr(to_saw, 0x908, 0x04700470);
+@@ -1178,6 +1190,8 @@ taimen_osm(unsigned row)
+ 		return false;
+ 	}
+ 	/* S9: row 0, enable [5.10] */
++	printf("TAIMEN OSM: enabling the gold OSM at row 0\n");
++	to_flush();
+ 	clk_wr(to_osm, 0x1f10, 0);
+ 	(void)clk_rd(to_osm, 0x0);
+ 	clk_wr(to_osm, 0x1004, 1);
