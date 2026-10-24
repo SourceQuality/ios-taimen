@@ -1,0 +1,274 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 6915920..afd7363 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -31,15 +31,17 @@ bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ /*
+  * Taimen (0225): qcom,spmi@800f000, arbiter v3, which Linux drives like v2 (PPID map at core +
+  * 0x800 + 4n for 512 APIDs, owners at cnfg + 0x700 + 4n, observer channel at obsrvr + 0x8000 *
+- * APID for EE 0); PM8998 PON at SID 0 0x800 as on PM8994. TLMM is pinctrl@3400000, volume up
+- * GPIO 126 as on the Pixel 1; volume down is PON RESIN (RT_STS bit 1), not a GPIO.
++ * APID for EE 0); PM8998 PON at SID 0 0x800 as on PM8994. Volume up is GPIO 126 as on the Pixel 1,
++ * but the msm8998 TLMM is three tiles and 126 is in EAST (0x3400000 + 0x900000, pinctrl-msm8998.c;
++ * boot 45 read the flat address as 0 and could not set it); volume down is PON RESIN (RT_STS bit
++ * 1), not a GPIO.
+  */
+ #define KEYS_CORE_PA     0x0800f000u
+ #define KEYS_OBS_PA      0x09400000u
+ #define KEYS_CNFG_PA     0x0800a000u
+ #define KEYS_CHNLS_PA    0x08400000u     /* write channels, EE 0 */
+ #define KEYS_APIDS       512u            /* core is 0x1000: map 0x800 + 4n */
+-#define KEYS_TLMM_PA     0x03400000u
++#define KEYS_TLMM_PA     0x03d00000u     /* EAST tile: GPIO n at + 0x1000 * n */
+ #else
+ /* qcom,spmi@400f000: core, obsrvr, cnfg */
+ #define KEYS_CORE_PA     0x0400f000u
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 56ce213..400be5c 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -660,14 +660,223 @@ taimen_rail(const char *name, uint16_t ppid)
+ 	    v[0], v[1], v[2], v[3], v[4], (unsigned)v[4] << 8 | v[3], v[5], v[6]);
+ }
+ 
++/*
++ * G1 (taimengold=MHZ, needs cpus=8): the gold cluster from GPLL0 / 2 (300 MHz) onto its own PLL
++ * at the voltage XBL left (docs/taimen-clocks-plan.md 3.2). Boots 44-45: gold OSM off, GFMUX cfg
++ * 0x403 (GPLL0 / 2), gold PLL already running at L 0x20 with silver's USER/CONFIG values, MEM-ACC
++ * 0 (level 2), APM 0 (arrays on MX), S13 at 896 mV. Bin-2 rows at constant MEM-ACC level 2, rail
++ * needed = open-loop + 16 mV (plan section 2); the cap is 1728 MHz, the highest row below the
++ * 800 mV APM and 852 mV MEM-ACC thresholds. One step per row; after each, every gold core must
++ * run at 19.2 x L (1 %) and give CPU0's self-test result, or gold goes back to GPLL0 and the
++ * kernel panics with the step. The perf loop parks gold above 90 C (no OSM, LMh or thermal driver).
++ */
++#define TG_PLL_PA       0x17816000u     /* gold PLL: MODE +0, L +4, USER +0xc, CONFIG_LO +0x10, STATUS +0x2c */
++#define TS_PLL_PA       0x17916000u     /* silver PLL: the template */
++#define TG_MUX_PA       0x17811000u     /* gold GFMUX: cmd +0x50, cfg +0x54 */
++#define TS_MUX_PA       0x17911000u
++#define TG_CFG_GPLL0    0x403u          /* SRC_SEL 4 (hmss_gpll0), div 2 */
++
++static vm_offset_t tg_pll, tg_mux;
++static unsigned tg_mhz;                 /* 0: on GPLL0 */
++
++static bool
++tg_poll(vm_offset_t b, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i <= us; i++) {
++		if ((clk_rd(b, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++taimen_gold_mux(uint32_t src_div)
++{
++	clk_wr(tg_mux, 0x54, (clk_rd(tg_mux, 0x54) & ~0x71fu) | src_div);
++	clk_wr(tg_mux, 0x50, 0x3);                      /* ROOT_EN | UPDATE */
++	return tg_poll(tg_mux, 0x50, 1u, 0u, 500);
++}
++
++static void
++taimen_gold_park(const char *why)
++{
++	bool ok = taimen_gold_mux(TG_CFG_GPLL0);
++	tg_mhz = 0;
++	printf("TAIMEN CLK: gold back on GPLL0 (%s): %s\n", why, ok ? "ok" : "mux update timeout");
++}
++
++static uint64_t
++taimen_selftest(uint64_t *p, size_t words)
++{
++	uint64_t x = 0x9e3779b97f4a7c15ULL, h = 0xcbf29ce484222325ULL, m;
++	for (size_t i = 0; i < words; i++) {
++		x ^= x << 13;
++		x ^= x >> 7;
++		x ^= x << 17;
++		p[i] = x;
++	}
++	for (int r = 0; r < 10; r++) {
++		for (size_t i = 0; i < words; i++) {
++			h = (h ^ p[i]) * 0x100000001b3ULL;
++		}
++	}
++	m = h | 1;
++	for (int i = 0; i < 1000000; i++) {
++		m = m * 0x5851f42d4c957f2dULL + 1;
++	}
++	return h ^ m;
++}
++
++static void
++taimen_gold(unsigned cap_mhz)
++{
++	static const struct {
++		uint32_t l, need_mv;
++	} step[] = {{47, 664}, {59, 664}, {70, 716}, {82, 776}, {90, 812}};
++	const size_t words = (1u << 20) / 8;
++	if (ml_get_cpu_count() < 8) {
++		printf("TAIMEN CLK: gold left at 300 MHz: needs cpus=8\n");
++		return;
++	}
++	tg_pll = ml_io_map(TG_PLL_PA, 0x1000);
++	tg_mux = ml_io_map(TG_MUX_PA, 0x1000);
++	vm_offset_t sp = ml_io_map(TS_PLL_PA, 0x1000), sm = ml_io_map(TS_MUX_PA, 0x1000);
++	uint32_t osm = taimen_rd1(0x179c3004), acc = taimen_rd1(0x179d1370), apm = taimen_rd1(0x179d0018);
++	uint8_t lo = 0, hi = 0;
++	bool vok = sweet_pmic_read(0x138, 0x40, &lo) && sweet_pmic_read(0x138, 0x41, &hi);
++	unsigned mv = (unsigned)hi << 8 | lo;
++	if (!tg_pll || !tg_mux || !sp || !sm) {
++		printf("TAIMEN CLK: gold left at 300 MHz: map failed\n");
++		return;
++	}
++	uint32_t cfg = clk_rd(tg_mux, 0x54), cmd = clk_rd(tg_mux, 0x50), scfg = clk_rd(sm, 0x54);
++	printf("TAIMEN CLK: gold osm %#x cfg %#x cmd %#x acc %#x apm %#x S13 %u mV%s; pll user %#x/%#x cfg %#x/%#x\n",
++	    osm, cfg, cmd, acc, apm, mv, vok ? "" : " (unread)", clk_rd(tg_pll, 0xc), clk_rd(sp, 0xc),
++	    clk_rd(tg_pll, 0x10), clk_rd(sp, 0x10));
++	const char *refuse = (osm & 1u) ? "the OSM is on" :
++	    ((cfg >> 8) & 7u) != 4u || (cmd & 1u) ? "GFMUX not on GPLL0" :
++	    !vok || mv < 568 || mv > 1136 ? "rail voltage unknown" :
++	    acc != 0 ? "MEM-ACC not at level 2" :
++	    (apm & 0x1fu) != 0 && (apm & 0x1fu) != 3 ? "APM state unknown" :
++	    ((scfg >> 8) & 7u) != 3u && ((scfg >> 8) & 7u) != 5u ? "silver GFMUX not on its PLL" :
++	    clk_rd(tg_pll, 0xc) != clk_rd(sp, 0xc) || clk_rd(tg_pll, 0x10) != clk_rd(sp, 0x10) ?
++	    "gold PLL USER/CONFIG differ from silver's" : NULL;
++	if (refuse != NULL) {
++		printf("TAIMEN CLK: gold left at 300 MHz: %s\n", refuse);
++		return;
++	}
++	unsigned last = 0;
++	for (unsigned s = 0; s < sizeof(step) / sizeof(step[0]); s++) {
++		if (step[s].l * 192 / 10 <= cap_mhz && step[s].need_mv <= mv) {
++			last = s + 1;
++		}
++	}
++	if (last == 0) {
++		printf("TAIMEN CLK: gold left at 300 MHz: no row fits %u MHz / %u mV\n", cap_mhz, mv);
++		return;
++	}
++	uint64_t *buf = kalloc_data(words * 8, Z_WAITOK);
++	if (buf == NULL) {
++		return;
++	}
++	thread_bind(cpu_to_processor(0));
++	thread_block(THREAD_CONTINUE_NULL);
++	uint64_t ref = taimen_selftest(buf, words);
++	for (unsigned s = 0; s < last; s++) {
++		uint32_t l = step[s].l;
++		unsigned want = l * 192 / 10;
++		if (tg_mhz != 0) {
++			taimen_gold_park("reprogramming the PLL");
++		}
++		printf("TAIMEN CLK: gold step L=%u %u.%u MHz (needs %u mV, have %u)\n", l, l * 192 / 10, l * 192 % 10,
++		    step[s].need_mv, mv);
++		clk_wr(tg_pll, 0x0, 0x0);                       /* off: nothing uses it while gold is on GPLL0 */
++		clk_wr(tg_pll, 0x4, l);
++		clk_wr(tg_pll, 0x0, 0x2);                       /* BYPASSNL */
++		delay(10);
++		clk_wr(tg_pll, 0x0, 0x6);                       /* + RESET_N */
++		delay(60);
++		if (!tg_poll(tg_pll, 0x2c, 1u << 16, 1u << 16, 200)) {
++			printf("TAIMEN CLK: gold PLL L=%u did not lock (mode %#x status %#x)\n", l,
++			    clk_rd(tg_pll, 0x0), clk_rd(tg_pll, 0x2c));
++			clk_wr(tg_pll, 0x0, 0x0);
++			break;
++		}
++		clk_wr(tg_pll, 0x0, 0x7);                       /* + OUTCTRL */
++		if (!taimen_gold_mux(scfg & 0x71fu)) {
++			taimen_gold_park("GFMUX update timeout");
++			break;
++		}
++		tg_mhz = want;
++		char line[120];
++		int len = 0;
++		for (int c = 4; c < 8; c++) {
++			thread_bind(cpu_to_processor(c));
++			thread_block(THREAD_CONTINUE_NULL);
++			uint64_t mhz = perf_mhz(), r = taimen_selftest(buf, words);
++			len += snprintf(line + len, sizeof(line) - (size_t)len, " cpu%d %llu MHz %s", c, mhz,
++			    r == ref ? "ok" : "MISMATCH");
++			if (r != ref || mhz * 100 < (uint64_t)want * 99 || mhz * 100 > (uint64_t)want * 101) {
++				thread_bind(cpu_to_processor(0));
++				thread_block(THREAD_CONTINUE_NULL);
++				taimen_gold_park("self-test");
++				panic("TAIMEN CLK: gold cpu%d at L=%u: %llu MHz, self-test %s", c, l, mhz,
++				    r == ref ? "ok" : "mismatch");
++			}
++		}
++		thread_bind(cpu_to_processor(0));
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("TAIMEN CLK: gold at %u MHz:%s\n", want, line);
++	}
++	thread_bind(NULL);
++	kfree_data(buf, words * 8);
++}
++
++/* Every perf tick while gold runs off GPLL0: any TSENS sensor above 90.0 C parks it. */
++static void
++taimen_gold_watch(void)
++{
++	static vm_offset_t ts[2];
++	static const uint32_t base[2] = {0x10aa000u, 0x10ad000u}, n[2] = {14, 8};
++	if (tg_mhz == 0) {
++		return;
++	}
++	for (int t = 0; t < 2; t++) {
++		if (ts[t] == 0 && (ts[t] = ml_io_map(base[t], 0x2000)) == 0) {
++			continue;
++		}
++		for (uint32_t i = 0; i < n[t]; i++) {
++			uint32_t v = clk_rd(ts[t], 0x10a0 + 4 * i);
++			int dc = (int)(v & 0xfffu);
++			if (!(v & (1u << 21))) {
++				continue;
++			}
++			if (dc & 0x800) {
++				dc -= 0x1000;
++			}
++			if (dc > 900) {
++				printf("TAIMEN CLK: tsens%d sensor %u at %d.%d C\n", t, i, dc / 10, dc % 10);
++				thread_bind(cpu_to_processor(0));
++				thread_block(THREAD_CONTINUE_NULL);
++				taimen_gold_park("hot");
++				thread_bind(NULL);
++				return;
++			}
++		}
++	}
++}
++
+ static void
+ taimen_clocks(void)
+ {
+-	int dump = 0, measure = 0, ddr = 0, vread = 0;
++	int dump = 0, measure = 0, ddr = 0, vread = 0, gold = 0;
+ 	(void)PE_parse_boot_argn("taimenclkdump", &dump, sizeof(dump));
+ 	(void)PE_parse_boot_argn("taimenclkmeasure", &measure, sizeof(measure));
+ 	(void)PE_parse_boot_argn("taimenddr", &ddr, sizeof(ddr));
+ 	(void)PE_parse_boot_argn("taimenvread", &vread, sizeof(vread));
++	(void)PE_parse_boot_argn("taimengold", &gold, sizeof(gold));
+ 	if (vread > 0) {
+ 		taimen_rail("pm8998 s10 (silver)", 0x12f);
+ 		taimen_rail("pm8998 s13 (gold)", 0x138);
+@@ -693,6 +902,9 @@ taimen_clocks(void)
+ 	if (dump > 1) {
+ 		taimen_clk_dump(2);
+ 	}
++	if (gold > 0) {
++		taimen_gold((unsigned)gold);
++	}
+ }
+ #endif
+ 
+@@ -762,6 +974,9 @@ perf_thread(void *arg, wait_result_t result)
+ 		printf("SWEET PERF: panel kicks %llu (after done %llu, after 50 ms timeout %llu)\n",
+ 		    sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout);
+ 		perf_top(perf_ns(now - t));
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		taimen_gold_watch();
++#endif
+ 		swaps = sweet_fb_stat_swaps;
+ 		presents = sweet_fb_stat_presents;
+ 		pabs = sweet_fb_stat_present_abs;
