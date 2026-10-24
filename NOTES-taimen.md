@@ -837,3 +837,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (2020-05-20). Then no FW_READY and no pin-connect indication: the WLAN rails were never voted (m7_on was set
   after M3; 0280). The apps: not on the home screen (end screenshot: the same 6), so removing LastBuildInfo.plist
   does not make installd register them; 0280's op 9 removes LaunchServices' database instead.
+- 2026-10-24 boot 113 (r100 = +0263-0280, the defaults + LaunchServices database removal + taimenwifi=8, 360 s): the
+  WLAN rails were voted before the MBA (L5 0.8 V, L7 1.8 V, L17 1.304 V, L25 3.312 V, all acked), M0-M6 as boot
+  112, M7 again to CAP and no further: no pin-connect indication, no FW_READY in 200 s. Android reaches FW_READY
+  3.8 s after "QMI Server Connected" (dmesg:3542, 3639). Differences found: (1) Android's WCN3990 supplies L7,
+  L17, L25 are the pin-ctrl twins (qcom,enable-with-pin-ctrl <0 4>, init-pin-ctrl-mode 4: enable and HPM follow
+  HW_EN2; L5's mode follows EN0), a bare swen vote is probably low-power mode; (2) after CAP icnss sends
+  DYNAMIC_FEATURE_MASK (FW_REJUVENATE) and VBATT (icnss_init_vph_monitor). 0282: rails with a 100 mA load, both
+  messages. The LaunchServices database was not under /private/var/containers/Data/System (depth 4) nor mobile's
+  Library/Caches: 0 removed; boot 114 searches wider.
