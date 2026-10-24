@@ -1,0 +1,220 @@
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index 04f9d49..9298c41 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -426,6 +426,21 @@ sweet_rpm_rail_level(uint32_t type, uint32_t level)
+ 	return ok;
+ }
+ 
++/* LDOn's software enable off in the active set (TaimenModem's WLAN power cycle, icnss_hw_power_off). */
++bool sweet_rpm_ldoa_off(unsigned ldo);
++bool
++sweet_rpm_ldoa_off(unsigned ldo)
++{
++	uint32_t kv[2] = {0x6e657773u, 0u};                     /* swen = 0 */
++	char what[8];
++	snprintf(what, sizeof(what), "L%u", ldo);
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request(what, 0, 0x616f646cu, ldo, kv, 1);       /* "ldoa" */
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: L%u off: %s\n", ldo, ok ? "ok" : "FAILED");
++	return ok;
++}
++
+ /* LDOn on at uv with a load of ma (key "ma": the RPM picks high-power mode for it). */
+ bool
+ sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma)
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 6099fbd..c390197 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2514,6 +2514,8 @@ svc_summary(void)
+ 
+ extern "C" bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
+ extern "C" bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
++extern "C" bool sweet_rpm_ldoa_off(unsigned ldo);
++static void w_rails(void);
+ 
+ /* ---------------------------------------------------------------- M7: WLFW (QMI 0x45) */
+ 
+@@ -2808,6 +2810,19 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		} else if (msg == WLFW_FW_READY_IND) {
+ 			w_fw_ready = true;
+ 			LOG("M7: t=%u ms: FW_READY", g_ms);
++			/*
++			 * 0288: icnss_driver_event_fw_ready_ind powers the WLAN hardware off (icnss_hw_power_off:
++			 * rails and the XO clock) and the WLAN driver's probe powers it on again before WLAN_CFG
++			 * and the mission mode. Boots 116-119 kept it on and the modem starved 9.5 s later.
++			 */
++			{
++				bool o5 = sweet_rpm_ldoa_off(5), o7 = sweet_rpm_ldoa_off(7);
++				bool o17 = sweet_rpm_ldoa_off(17), o25 = sweet_rpm_ldoa_off(25);
++				LOG("M7: t=%u ms: WLAN power off (as icnss at FW_READY): L5 %s L7 %s L17 %s L25 %s", g_ms,
++				    o5 ? "off" : "FAILED", o7 ? "off" : "FAILED", o17 ? "off" : "FAILED", o25 ? "off" : "FAILED");
++				IOSleep(10);
++				w_rails();
++			}
+ 			wm_new(&m, WLFW_WLAN_CFG);
+ 			wm_array(&m, 0x11, 12, w_tgt_ce, sizeof(w_tgt_ce));
+ 			wm_array(&m, 0x12, (uint8_t)(sizeof(w_svc_ce) / sizeof(w_svc_ce[0])), w_svc_ce, sizeof(w_svc_ce));
+@@ -4298,6 +4313,142 @@ rmb_wait(uint32_t want, unsigned ms)
+  */
+ static bool m5_on, m5_ok, m4_alive;
+ 
++/*
++ * 0288: after a FATAL, what the 80-byte SFR does not say. The modem is stopped the way pil_mss_shutdown
++ * stops it (the three AXI halt ports, then the restart BCR), the MPSS carve-out goes back to HLOS,
++ * and the starved task's address ("task 0x...", a modem virtual address) is turned into a physical
++ * one through the modem.mdt phdrs: its control block is dumped (hex and text). The carve-out is
++ * then searched for the whole error message ("triage") and DOG_HB lines, printed with their context.
++ */
++static struct elf32_phdr m4_ph[40];
++static uint32_t m4_nph, m4_reloc;
++
++static uint64_t
++mss_va2pa(uint32_t va)
++{
++	for (uint32_t i = 0; i < m4_nph; i++) {
++		const struct elf32_phdr *q = &m4_ph[i];
++		if (loadable(q) && va >= q->p_vaddr && va - q->p_vaddr < q->p_memsz) {
++			return MPSS_PA + (q->p_paddr - m4_reloc) + (va - q->p_vaddr);
++		}
++	}
++	return 0;
++}
++
++static void
++mss_text(const char *what, const uint8_t *p, uint32_t n)
++{
++	char line[200];
++	uint32_t k = 0;
++	for (uint32_t i = 0; i < n && k + 1 < sizeof(line); i++) {
++		line[k++] = (p[i] >= 0x20 && p[i] < 0x7f) ? (char)p[i] : (p[i] == 0 ? '|' : '.');
++	}
++	line[k] = 0;
++	LOG("M4: dump %s: %s", what, line);
++}
++
++static void
++mss_dump(struct smem_part_hdr *part)
++{
++	static const uint64_t halt_pa[3] = { MSS_HALT_Q6_PA, MSS_HALT_MODEM_PA, MSS_HALT_NC_PA };
++	for (unsigned i = 0; i < 3; i++) {
++		volatile uint32_t *h = (volatile uint32_t *)ml_io_map(halt_pa[i], 0x1000);
++		if (h == NULL) {
++			continue;
++		}
++		h[0] = 1;                                   /* AXI_HALTREQ */
++		mb();
++		unsigned n;
++		for (n = 0; n < 10000 && h[1] == 0; n++) {   /* AXI_HALTACK, 10 ms */
++			IODelay(1);
++		}
++		LOG("M4: dump: AXI port %u halt ack %u idle %u (%u us)", i, h[1], h[2], n);
++		h[0] = 0;
++		mb();
++	}
++	volatile uint32_t *restart = (volatile uint32_t *)ml_io_map(MSS_RESTART_PA, 0x1000);
++	if (restart != NULL) {
++		restart[0] = 1;                             /* the MSS held in reset */
++		mb();
++		IODelay(2);
++	}
++	static const uint32_t hlos[] = {VMID_HLOS}, msa[] = {VMID_MSS_MSA}, rwx[] = {PERM_RWX};
++	uint64_t ar = scm_assign(MPSS_PA, MPSS_SIZE, msa, 1, hlos, rwx, 1);
++	LOG("M4: dump: modem stopped, MPSS back to HLOS -> %#llx", ar);
++	if (ar != 0) {
++		return;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(MPSS_PA, MPSS_SIZE, kIODirectionIn);
++	IOMemoryMap *mm = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	uint8_t *buf = (uint8_t *)IOMalloc(0x100000 + 256);
++	if (mm == NULL || buf == NULL) {
++		LOG("M4: dump: map failed");
++		OSSafeReleaseNULL(mm);
++		if (buf != NULL) {
++			IOFree(buf, 0x100000 + 256);
++		}
++		return;
++	}
++	const uint8_t *mv = (const uint8_t *)mm->getVirtualAddress();
++	/* the starved task's control block */
++	uint32_t sz = 0;
++	const char *sfr = (const char *)smem_global_get(ITEM_MSS_CRASH, &sz);
++	if (sfr == NULL) {
++		sfr = (const char *)smem_part_get(part, ITEM_MSS_CRASH, &sz);
++	}
++	char s[96] = {};
++	if (sfr != NULL) {
++		memcpy(s, sfr, MIN(sz, (uint32_t)sizeof(s) - 1));
++	}
++	const char *t = strnstr(s, "task 0x", sizeof(s));
++	uint32_t va = 0;
++	for (const char *c = t != NULL ? t + 7 : s + sizeof(s) - 1; *c != 0; c++) {
++		uint32_t d = *c >= '0' && *c <= '9' ? (uint32_t)(*c - '0') : *c >= 'a' && *c <= 'f' ? (uint32_t)(*c - 'a' + 10) :
++		    *c >= 'A' && *c <= 'F' ? (uint32_t)(*c - 'A' + 10) : 16u;
++		if (d == 16) {
++			break;
++		}
++		va = va << 4 | d;
++	}
++	uint64_t pa = va != 0 ? mss_va2pa(va) : 0;
++	LOG("M4: dump: starved task %#x -> pa %#llx", va, pa);
++	if (pa != 0 && pa + 512 <= MPSS_PA + MPSS_SIZE) {
++		memcpy(buf, mv + (pa - MPSS_PA), 512);
++		for (unsigned r = 0; r < 512; r += 32) {
++			const uint32_t *w = (const uint32_t *)(buf + r);
++			LOG("M4: dump tcb +%03x: %08x %08x %08x %08x %08x %08x %08x %08x", r, w[0], w[1], w[2], w[3], w[4], w[5],
++			    w[6], w[7]);
++		}
++		mss_text("tcb text", buf, 192);
++		mss_text("tcb text+192", buf + 192, 192);
++	}
++	/* the whole message, and DOG_HB's other lines */
++	static const char *const needle[] = { "triage", "DOG_HB" };
++	unsigned hits = 0;
++	for (uint64_t off = 0; off < MPSS_SIZE && hits < 6; off += 0x100000) {
++		uint32_t n = (uint32_t)MIN((uint64_t)0x100000 + 128, MPSS_SIZE - off);
++		memcpy(buf, mv + off, n);
++		for (uint32_t i = 128; i + 16 < n && hits < 6; i++) {
++			for (unsigned k = 0; k < 2; k++) {
++				size_t l = strlen(needle[k]);
++				if (buf[i] == (uint8_t)needle[k][0] && memcmp(buf + i, needle[k], l) == 0) {
++					char what[48];
++					snprintf(what, sizeof(what), "'%s' at %#llx", needle[k], MPSS_PA + off + i);
++					mss_text(what, buf + i - 96, (uint32_t)MIN((uint32_t)176, n - (i - 96)));
++					hits++;
++					i += 64;
++					break;
++				}
++			}
++		}
++	}
++	LOG("M4: dump: %u message hits", hits);
++	IOFree(buf, 0x100000 + 256);
++	mm->unmap();
++	OSSafeReleaseNULL(mm);
++}
++
+ static bool
+ m4(unsigned watch_s)
+ {
+@@ -4433,6 +4584,9 @@ m4(unsigned watch_s)
+ 		}
+ 		uint8_t *mv = (uint8_t *)mm->getVirtualAddress();
+ 		uint32_t reloc = relocate ? min_a : (uint32_t)MPSS_PA, length = 0;
++		m4_nph = MIN((uint32_t)eh->e_phnum, (uint32_t)(sizeof(m4_ph) / sizeof(m4_ph[0])));
++		memcpy(m4_ph, ph, m4_nph * sizeof(struct elf32_phdr));
++		m4_reloc = reloc;
+ 		uint64_t t0 = mach_absolute_time();
+ 		bool segs = true;
+ 		for (uint32_t i = 0; i < eh->e_phnum && segs; i++) {
+@@ -4531,6 +4685,7 @@ m4(unsigned watch_s)
+ 				}
+ 				if (sk_last & 1) {
+ 					mss_crash_reason(part);
++					mss_dump(part);
+ 					ok = false;
+ 					break;
+ 				}
