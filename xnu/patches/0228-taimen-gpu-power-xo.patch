@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 4a8e3ed..a66fa7e 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -872,6 +872,105 @@ taimen_gpu_census(void)
+ 	printf("TAIMEN GPU: census done\n");
+ }
+ 
++/*
++ * GPU power-up E1 at XO (taimengpu=1, docs/taimen-gpu-plan.md 2.2 steps 1-9). Boot 48 (E0): GCC
++ * cfg_ahb, gpu_bimc_gfx and iref on, bimc_gfx off; GPU CC readable; CX and GX GDSCs collapsed
++ * (0x222001), GX clamped (GX_DOMAIN_MISC 0x1), gfx3d and rbbmtimer RCGs and branches off, GPUPLL0
++ * off at L 0x1a; S1 at 752 mV, which covers XO (and the 257 MHz corner, ceiling 724 mV), so no
++ * rail write. Every block is logged before it is touched and every poll has a timeout; a failure
++ * stops there and leaves the rest as it is. The GPU's own registers are read only at the end,
++ * with the GX GDSC on and gfx3d running.
++ */
++#define TGPU_CC_PA      0x05065000u     /* GPU CC, 0x2000 */
++#define TGPU_PA         0x05000000u     /* Adreno 540; byte offset = 4 x the a5xx.xml dword offset */
++
++static bool
++tgpu_poll(vm_offset_t b, uint32_t off, uint32_t mask, uint32_t want, unsigned us, const char *what)
++{
++	if (tg_poll(b, off, mask, want, us)) {
++		return true;
++	}
++	printf("TAIMEN GPU: %s: timeout (%#x = %#x)\n", what, off, clk_rd(b, off));
++	return false;
++}
++
++static void
++taimen_gpu_power(void)
++{
++	vm_offset_t g146 = ml_io_map(0x146000, 0x1000), cc = ml_io_map(TGPU_CC_PA, 0x2000);
++	if (g146 == 0 || cc == 0) {
++		printf("TAIMEN GPU: map failed\n");
++		return;
++	}
++	printf("TAIMEN GPU: power-up at XO (taimengpu=1)\n");
++	clk_wr(g146, 0x40, clk_rd(g146, 0x40) | 1u);                    /* gcc_bimc_gfx_clk */
++	if (!tgpu_poll(g146, 0x40, 1u << 31, 0, 200, "gcc bimc_gfx on")) {
++		return;
++	}
++	printf("TAIMEN GPU: gcc bimc_gfx on (%#x)\n", clk_rd(g146, 0x40));
++
++	printf("TAIMEN GPU: cx gdsc %#x hw_ctrl %#x: on\n", clk_rd(cc, 0x1004), clk_rd(cc, 0x1008));
++	clk_wr(cc, 0x1004, clk_rd(cc, 0x1004) & ~1u);                   /* SW_COLLAPSE off */
++	if (!tgpu_poll(cc, 0x1008, 1u << 31, 1u << 31, 500, "cx gdsc")) {
++		return;
++	}
++	delay(10);
++	printf("TAIMEN GPU: cx gdsc on (gdscr %#x hw_ctrl %#x)\n", clk_rd(cc, 0x1004), clk_rd(cc, 0x1008));
++
++	clk_wr(cc, 0x1074, 0);                                          /* gfx3d RCG: XO, no divider */
++	clk_wr(cc, 0x1070, 0x3);                                        /* ROOT_EN | UPDATE */
++	if (!tgpu_poll(cc, 0x1070, 1u, 0, 500, "gfx3d rcg update")) {
++		return;
++	}
++	clk_wr(cc, 0x10b4, 0);                                          /* rbbmtimer RCG: XO */
++	clk_wr(cc, 0x10b0, 0x3);
++	if (!tgpu_poll(cc, 0x10b0, 1u, 0, 500, "rbbmtimer rcg update")) {
++		return;
++	}
++	clk_wr(cc, 0x10d0, clk_rd(cc, 0x10d0) | 1u);
++	if (!tgpu_poll(cc, 0x10d0, 1u << 31, 0, 200, "rbbmtimer cbcr")) {
++		return;
++	}
++	printf("TAIMEN GPU: gfx3d rcg %#x/%#x, rbbmtimer rcg %#x/%#x cbcr %#x\n", clk_rd(cc, 0x1070),
++	    clk_rd(cc, 0x1074), clk_rd(cc, 0x10b0), clk_rd(cc, 0x10b4), clk_rd(cc, 0x10d0));
++
++	printf("TAIMEN GPU: gx: bcr pulse, gmem reset pulse, clamp off, gdsc on\n");
++	clk_wr(cc, 0x1090, 1u);                                         /* GX BCR */
++	delay(1);
++	clk_wr(cc, 0x1090, 0);
++	clk_wr(cc, 0x130, clk_rd(cc, 0x130) | (1u << 4));               /* GMEM reset */
++	delay(1);
++	clk_wr(cc, 0x130, clk_rd(cc, 0x130) & ~(1u << 4));
++	clk_wr(cc, 0x130, clk_rd(cc, 0x130) & ~1u);                     /* GMEM clamp off */
++	clk_wr(cc, 0x1094, clk_rd(cc, 0x1094) & ~1u);                   /* SW_COLLAPSE off */
++	if (!tgpu_poll(cc, 0x1094, 1u << 31, 1u << 31, 500, "gx gdsc")) {
++		return;
++	}
++	delay(10);
++	printf("TAIMEN GPU: gx on: misc %#x gdscr %#x\n", clk_rd(cc, 0x130), clk_rd(cc, 0x1094));
++
++	clk_wr(cc, 0x1098, clk_rd(cc, 0x1098) | (1u << 14) | (1u << 13));      /* retain mem, periph */
++	clk_wr(cc, 0x1098, clk_rd(cc, 0x1098) | 1u);
++	if (!tgpu_poll(cc, 0x1098, 1u << 31, 0, 200, "gfx3d cbcr")) {
++		return;
++	}
++	printf("TAIMEN GPU: gfx3d xo: cbcr %#x\n", clk_rd(cc, 0x1098));
++
++	printf("TAIMEN GPU: reading GPU registers\n");
++	vm_offset_t rbbm = ml_io_map(TGPU_PA + 0x1000, 0x1000), vbif = ml_io_map(TGPU_PA + 0xc000, 0x1000);
++	if (rbbm == 0 || vbif == 0) {
++		printf("TAIMEN GPU: GPU map failed\n");
++		return;
++	}
++	uint32_t ver = clk_rd(vbif, 0x000);                             /* VBIF_VERSION 0x3000 */
++	uint32_t sts = clk_rd(rbbm, 0x3d4);                             /* RBBM_STATUS 0x4f5 */
++	uint32_t a0 = clk_rd(rbbm, 0x348);                              /* RBBM_ALWAYSON_COUNTER_LO 0x4d2 */
++	delay(100);
++	uint32_t a1 = clk_rd(rbbm, 0x348);
++	printf("TAIMEN GPU: VBIF_VERSION %#x RBBM_STATUS %#x ALWAYSON %#x -> %#x in 100 us (%s)\n", ver, sts, a0,
++	    a1, a1 != a0 ? "counting: GPU alive" : "not counting");
++}
++
+ /* Every perf tick while gold runs off GPLL0: any TSENS sensor above 90.0 C parks it. */
+ static void
+ taimen_gold_watch(void)
+@@ -947,6 +1046,10 @@ taimen_clocks(void)
+ 	if (PE_parse_boot_argn("taimengpucensus", &gpucensus, sizeof(gpucensus)) && gpucensus > 0) {
+ 		taimen_gpu_census();
+ 	}
++	int gpu = 0;
++	if (PE_parse_boot_argn("taimengpu", &gpu, sizeof(gpu)) && gpu > 0) {
++		taimen_gpu_power();
++	}
+ }
+ #endif
+ 
