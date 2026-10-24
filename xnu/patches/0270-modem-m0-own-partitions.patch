@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 6a8e2f2..d400dad 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -502,8 +502,10 @@ m0(void)
+ 	if (memcmp(pt->magic, "$TOC", 4) == 0 && pt->num_entries <= 64) {
+ 		struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
+ 		for (uint32_t i = 0; i < pt->num_entries; i++) {
+-			struct smem_part_hdr *p = e[i].offset < SMEM_SIZE ? (struct smem_part_hdr *)(smem + e[i].offset) : NULL;
+-			char pm[5] = "????";
++			/* only partitions APPS is a host of: the others are XPU-protected and a read hangs the CPU (boot 109) */
++			bool ours = e[i].host0 == HOST_APPS || e[i].host1 == HOST_APPS;
++			struct smem_part_hdr *p = ours && e[i].offset < SMEM_SIZE ? (struct smem_part_hdr *)(smem + e[i].offset) : NULL;
++			char pm[5] = "----";
+ 			if (p != NULL) {
+ 				memcpy(pm, p->magic, 4);
+ 			}
