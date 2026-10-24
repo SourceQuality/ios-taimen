@@ -895,3 +895,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (WLAN hardware off at FW_READY, on again before WLAN_CFG/mission) and, after a FATAL, dumps the starved task's
   control block (its address through the modem.mdt phdrs, the MPSS carve-out taken back after halting the modem)
   and the full error text.
+- 2026-10-24 boot 120 (r108 = +0263-0288, a plain ROOTFIX + taimenwifi=10, 420 s): the WLAN power cycle at
+  FW_READY (rails off, 10 ms, on again, then WLAN_CFG/mission) went through and changed nothing: scan fine (44
+  networks), FATAL at +14.21 s, DOG_HB starvation. The crash dump could not place the task address (no phdr
+  covers it) and gave nothing actionable; 0289 removes it. Also found: icnss's default quirks are VBATT_DISABLE
+  and FW_REJUVENATE_ENABLE, i.e. Android never sends VBATT but does register for the rejuvenate indication.
+  0289: no VBATT, rejuvenate_enable in IND_REGISTER, REJUVENATE indications logged and ACKed.
