@@ -1563,8 +1563,10 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
  * through one texture (attachImage) and samples it through another
  * (texImageIOSurface); as separate resources Mesa could run the reading
  * batch before the writing one (App Library pods, CC tiles, vibrant glyphs).
- * ponytail: 32 entries, least recently used dropped; a dropped entry keeps
- * nothing alive, a freed surface's pages stay imported until then.
+ * ponytail: 32 entries and SURF_RES_BYTES, least recently used dropped; a
+ * dropped entry keeps nothing alive, a freed surface's pages stay imported
+ * until then. The byte limit: SpringBoard makes a new 13.9 MB snapshot
+ * surface on every swipe (wired grew 130 MB in boot 64, 1 GiB of RAM).
  */
 struct surf_res {
 	uint32_t id, w, h, pitch;
@@ -1574,6 +1576,7 @@ struct surf_res {
 	uint64_t used;
 };
 #define SURF_RES_MAX 32
+#define SURF_RES_BYTES (96u << 20)
 static struct surf_res surf_res[SURF_RES_MAX];
 static uint64_t surf_res_clock;
 
@@ -1615,6 +1618,23 @@ surf_res_put(const struct surf_res *key, struct pipe_resource *res)
 	surf_res[victim] = *key;
 	surf_res[victim].used = ++surf_res_clock;
 	pipe_resource_reference(&surf_res[victim].res, res);
+	for (;;) {
+		uint64_t bytes = 0;
+		int lru = -1;
+		for (int i = 0; i < SURF_RES_MAX; i++) {
+			if (surf_res[i].res == NULL) {
+				continue;
+			}
+			bytes += (uint64_t)surf_res[i].pitch * surf_res[i].h;
+			if (i != victim && (lru < 0 || surf_res[i].used < surf_res[lru].used)) {
+				lru = i;
+			}
+		}
+		if (bytes <= SURF_RES_BYTES || lru < 0) {
+			break;
+		}
+		pipe_resource_reference(&surf_res[lru].res, NULL);
+	}
 }
 
 
