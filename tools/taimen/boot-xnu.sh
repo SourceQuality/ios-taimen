@@ -39,6 +39,12 @@ cmdline="debug=0x10000c serial=3 cpus=1 keepsyms=1 -noprogress taimenepoch=$(dat
 # ROOTFIX=FILE: files the kernel writes into the iOS root before launchd (tools/taimen/mkrootfix.py, xnu 0210)
 blobs=()
 [ -n "${ROOTFIX:-}" ] && blobs+=(--blob "ROOTFIX=$(realpath "$ROOTFIX")")
+# GPUFW=DIR: the Adreno CP microcode for sweetgpu>=2 (docs/taimen-gpu-plan.md 6): the vendor
+# a530_pm4.fw / a530_pfp.fw (pulled by the log reader, never in git) without their 4-byte header.
+if [ -n "${GPUFW:-}" ]; then
+	for f in pm4 pfp; do tail -c +5 "$GPUFW/a530_$f.fw" > "$out/gpu-$f.bin"; done
+	blobs+=(--blob "GPU-PM4=$out/gpu-pm4.bin" --blob "GPU-PFP=$out/gpu-pfp.bin")
+fi
 python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline" "${blobs[@]}"
 ls -l "$out/payload" | awk '{print "payload: " $5 " bytes"}'
 EXTRA_CFLAGS=-DSTAGE2 OUT_NAME=taimen-xnu "$P/shim/build-taimen.sh" "$P/../backup/boot_a.img" "$out/payload" | tail -2
