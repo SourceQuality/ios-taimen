@@ -12,7 +12,9 @@ if [ -z "$DEVELOPER_DIR" ] && [ -d "$R/research/xcode15/Xcode.app" ]; then
 	export DEVELOPER_DIR=$R/research/xcode15/Xcode.app/Contents/Developer
 fi
 export PATH=$R/research/tools/venv/bin:$R/research/tools/bin:$PATH
-# Mesa release that mesa.patch is kept against (archive.mesa3d.org, sha256 from
-# docs.mesa3d.org/relnotes/25.3.6.html)
-MESA_VERSION=25.3.6
-MESA_SHA256=59217efeac3b64e7ced958324b9db7494f1e0741aeb22d780276514cc1b8f206
+# The Mesa the Pixel 1 ran: mesa.patch's blob ids are those of 26.3.0-rc1/rc2
+# (no 25.x or 26.0-26.2 release matches). 25.3.6 builds with two more hunks but
+# calls fscreen->get_param, which sweetgl.c leaves NULL (26.x dropped it).
+# sha256 of the archive.mesa3d.org tarball (rcs have no relnotes; a .sig is there).
+MESA_VERSION=26.3.0-rc2
+MESA_SHA256=6b9154bc46ec73901555dbcb61600eb69607dc1da718a87e7a1c09a755bb1b6d
