@@ -24,9 +24,12 @@ on:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
 
+# One group per commit: the next kernel builds while the phone tests the last one (a group per
+# branch with cancel-in-progress cancelled a running build at every push). tools/windows/
+# ci-kernel.sh waits for the run of a given commit, so parallel runs are fine.
 concurrency:
-  group: xnu-${{ github.ref }}
-  cancel-in-progress: true
+  group: xnu-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
