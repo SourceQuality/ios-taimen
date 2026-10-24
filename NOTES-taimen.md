@@ -682,3 +682,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   after the fastboot boot, empty pstore, no XNU log at all; the shim log ends at "saved (before loader)" as it
   always does. Above 1 GiB XNU now dies before its console (boot 63 at 2 GiB once reached kmem_range_init).
   1 GiB stays.
+- 2026-10-24 hand-off boot (r70, the plain ROOT=1 default, no deadline, booted 06:45; log pulled at 08:15): the user
+  used it for ~85 min (233 touches): "the frame rate is way higher, but [the screen] flickers a lot". No panic, no
+  GPU hang. **The presenter is the limit and CA draws into what it copies**: while the user swiped CA swapped
+  37-46 frames/s, the presenter put 22-27 on the panel, ~30 ms per present (the gesture boots 79-87 too: present
+  avg 25-32 ms, presents ~60 % of swaps). The swap-gap figures of boots 75-87 counted CA's swaps, not panel frames.
+  SwapWait answered at once, so CA reused a surface the presenter was still copying: torn and half-drawn frames.
+  xnu 0249: SwapWait honest (done once copied), a reuse counter, and the GPU copy skips the source clean when the
+  seed has not moved.
