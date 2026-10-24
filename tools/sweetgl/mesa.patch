@@ -46,3 +46,57 @@ index 29134ba..0c3fdbb 100644
     if (rsc->layout.pitch0 < (prsc->width0 * rsc->layout.cpp) ||
         fd_resource_pitch(rsc, 0) != rsc->layout.pitch0)
        return false;
+diff --git a/src/gallium/drivers/freedreno/a5xx/fd5_context.c b/src/gallium/drivers/freedreno/a5xx/fd5_context.c
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_context.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_context.c
+@@ -39,6 +39,39 @@
+    free(fd5_ctx);
+ }
+ 
++#ifdef __APPLE__
++/*
++ * sweetgl: CoreAnimation samples the texture it is rendering into, with a
++ * texture barrier before each such draw. The generic barrier flushes the
++ * whole batch, a submit per draw (~1.4 ms each on taimen, boot 68). In GMEM
++ * bypass (FD_MESA_DEBUG=sysmem, always set by sweetgl) the draws write
++ * memory through the CCU: clean it and invalidate UCHE inside the batch, as
++ * a batch end (sysmem_fini) and the next start (emit_restore) would.
++ */
++static void
++fd5_texture_barrier(struct pipe_context *pctx, unsigned flags) in_dt
++{
++   struct fd_context *ctx = fd_context(pctx);
++
++   if (!FD_DBG(SYSMEM)) {
++      pctx->flush(pctx, NULL, 0);   /* what fd_texture_barrier does */
++      return;
++   }
++
++   struct fd_batch *batch = fd_context_batch(ctx);
++   struct fd_ringbuffer *ring = batch->draw;
++
++   fd5_event_write(batch, ring, PC_CCU_FLUSH_COLOR_TS, true);
++   fd5_event_write(batch, ring, PC_CCU_FLUSH_DEPTH_TS, true);
++   fd_reset_wfi(batch); /* wait for the earlier draws and the CCU flush */
++   fd_wfi(batch, ring);
++   fd5_cache_flush(batch, ring);
++   fd5_event_write(batch, ring, PC_CCU_INVALIDATE_COLOR, false);
++
++   fd_batch_reference(&batch, NULL);
++}
++#endif
++
+ struct pipe_context *
+ fd5_context_create(struct pipe_screen *pscreen, void *priv,
+                    unsigned flags) disable_thread_safety_analysis
+@@ -81,6 +114,10 @@
+    if (!pctx)
+       return NULL;
+ 
++#ifdef __APPLE__
++   pctx->texture_barrier = fd5_texture_barrier;
++#endif
++
+    util_blitter_set_texture_multisample(fd5_ctx->base.blitter, true);
+ 
+    fd5_ctx->vsc_size_mem =
