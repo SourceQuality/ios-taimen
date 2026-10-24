@@ -1,0 +1,55 @@
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..7e4c229 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -868,6 +868,17 @@ vm_compressor_set_size(void)
+ 		compressor_pool_size = max_mem;
+ 	}
+ 	compressor_pool_multiplier = 1;
++#endif
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * The 4 KiB kernel's compact layout leaves ~45 GiB of kernel VA after the physmap for every
++	 * kmem claim. The macOS pool (16 x max_mem) next to the 24 GiB zone map overflows it above
++	 * 1 GiB of RAM: kmem_range_init panicked at 1.5 GiB (boot 92: 24 GiB of compressor) and at
++	 * 2 GiB (boot 63). With no swap file the pool never holds more than RAM: 4 x max_mem.
++	 */
++	if (vm_compression_limit == 0) {
++		compressor_pool_size = 4ULL * max_mem;
++	}
+ #endif
+ 	if (compressor_pool_size > compressor_pool_max_size) {
+ 		compressor_pool_size = compressor_pool_max_size;
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 6394730..b174257 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -1217,6 +1217,16 @@ vm_page_bootstrap(
+ 
+ 	printf("vm_page_bootstrap: %d free pages, %d wired pages, (up to %d of which are delayed free)\n",
+ 	    vm_page_free_count, vm_page_wire_count, vm_delayed_count);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	printf("SWEET VM: max_mem %#llx sane_size %#llx lopage %u secluded %u\n", (uint64_t)max_mem,
++	    (uint64_t)sane_size, vm_lopage_free_count,
++#if CONFIG_SECLUDED_MEMORY
++	    vm_page_secluded_count
++#else
++	    0u
++#endif
++	    );
++#endif
+ 
+ 	kernel_debug_string_early("vm_page_bootstrap complete");
+ }
+@@ -1587,6 +1597,11 @@ pmap_startup(
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 	printf("pmap_startup() init/release time: %lld microsec\n", (now_ns - start_ns) / NSEC_PER_USEC);
+ 	printf("pmap_startup() delayed init/release of %d pages\n", vm_delayed_count);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* boots 63 and 92: above 1 GiB only a quarter of the pages came out free or wired */
++	printf("SWEET VM: pmap_startup span %#llx -> %u vm_pages of %zu bytes, %u initialized, first ppnum %#x\n",
++	    mem_sz, npages, sizeof(*vm_pages), vm_pages_count, vm_first_phys_ppnum);
++#endif
+ 
+ #if defined(__LP64__)
+ 	if ((vm_page_t)(VM_PAGE_UNPACK_PTR(VM_PAGE_PACK_PTR(&vm_pages[0]))) != &vm_pages[0]) {
