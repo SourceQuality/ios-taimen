@@ -1,0 +1,33 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 8d69a11..872f882 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -230,12 +230,14 @@ rootfix_rename(const char *path, const uint8_t *data, uint32_t dlen, vfs_context
+ 		return EINVAL;
+ 	}
+ 	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
+-		return EEXIST;                  /* nothing to move: skipped */
++		printf("TAIMEN ROOTFIX: rename %s: not there, skipped\n", path);
++		return EEXIST;
+ 	}
+ 	vnode_put(vp);
+ 	if (vnode_lookup((const char *)data, 0, &vp, ctx) == 0) {
+ 		vnode_put(vp);
+-		return EEXIST;                  /* already there: skipped */
++		printf("TAIMEN ROOTFIX: rename %s: %s already exists, skipped\n", path, (const char *)data);
++		return EEXIST;
+ 	}
+ 	return taimen_rename(path, (const char *)data, ctx);
+ }
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index aef9399..85365fd 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -33,6 +33,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++#include <sys/errno.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void taimen_modem_init(void);
