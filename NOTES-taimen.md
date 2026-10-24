@@ -521,3 +521,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   1125x2436 pitch 0 plane 0: format failed". On the iPhone X root backboardd's display surfaces are 'b3a8': BGRA8
   plane 0 (bpe 4, rows 4544) plus an A8 plane (13.88 MB); bind_surface refused multi-plane surfaces, and the kernel
   IOSurface reports no per-plane rows. Also texImageIOSurface copy errors 0x506 on LA08 230x186 / 256x1 surfaces.
+- 2026-10-23 **boot 61 (r58 + sweetgl b3a8 fix, /usr/lib/sweetgl-<hash>.dylib): the lock screen drawn by Mesa on the
+  A540** (the user saw it; first GPU-rendered iOS frame on taimen). Swiping up started the unlock animation, which
+  then froze; the power button (now driven, xnu 0225) turned the display off and on. From ~100 s no more swaps.
+  backboardd's SMP sample, symbolicated against sweetgl.dylib (Mach-O symbols read by a scratch script; load base
+  0x1024c4000 from impl_thrd_routine): the CA render thread in glDrawElements -> fd5_draw_vbos -> ir3_cache_lookup ->
+  ir3_get_shader -> util_queue_fence_wait, waiting for two shader-compile threads (util_queue ->
+  create_initial_variants_async -> ir3_shader_get_variant -> compile_variant) that both sat at ir3_block_create+0
+  while backboardd used 1-8 % CPU. Two threads at the first instruction of a function not run before = a page-in
+  of the dylib's text that does not complete: no free page (XNU has 512 MiB; kernel_task was at 193 % around 90 s)
+  or a stuck UFS read. 0238 logs memory every 10 s and adds synthetic swipes; TAIMEN_MEM tries more RAM.
