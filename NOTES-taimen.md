@@ -587,3 +587,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   54 ms; still ~7 ms of kernel time per submit. The rest are batch flushes freedreno makes when a pass samples
   what an earlier pass rendered (CA's blur and backdrop passes). Mesa's App Library at the end is the same as in
   boot 69 (shots/end-surface*.png): the barrier draws correctly. Next: the kernel's ~7 ms per submit (profile).
+- 2026-10-24 boot 71 (r61 = +0239 kmem claims logged on failure, TAIMEN_MEM=0x7e400000): no XNU output at all this
+  time (empty pstore, the UFS ring still boot 70's, bootreason watchdog ~44 s after the fastboot boot), unlike boot
+  63's kmem_range_init panic: ~2 GiB also fails before the console. Left for later; 1 GiB stays.
+- 2026-10-24 boot 72 (sweetgl 565f8e0 = barrier + 96 MB surface cache, PC profiler on backboardd): the kernel part
+  of backboardd is SweetGPUUserClient::submit (928 of the inclusive samples): FlushPoC_DcacheRegion,
+  arm_force_fast_fault_with_flush_range under pmap_clear_modify, hw_lock_bit, pmap_is_modified: the cache clean and
+  write-protect of the pages Mesa wrote into its CPU-cached bos. ~13 frames per swipe at ~70 ms.
+- 2026-10-24 **boot 73 (r62 = +0240 taimengpuheap=256: Mesa's bos from a write-combined heap at 0x16e400000):
+  works**, "SWEET GPU: heap 256 MB at 0x16e400000"; same App Library picture at the end; kernel time per submit
+  ~7 -> ~4 ms; 1.5-1.9 flushes/s, 1000-1700 draws per swipe window, swap gaps mostly 37-54 ms during the
+  animations (~20-25 frames/s, from ~1 at the start of the night). 0241 splits the remaining ~4 ms.
