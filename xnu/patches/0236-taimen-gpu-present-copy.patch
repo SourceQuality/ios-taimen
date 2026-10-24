@@ -1,0 +1,230 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index aeeb795..4d42802 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1854,47 +1854,61 @@ gfx_raise(int mhz)
+ #endif
+ 
+ 
+-/* Full-screen (750x1334, pitch 3072) source-over quads: average us of 5. */
++/*
++ * Full-screen source-over quads, average us of 5: 750x1334 (pitch 3072) on the Pixel 1, taimen's
++ * 1125x2436 canvas (pitch 4608) on taimen. Scattered kernel pages through the GPU VA window, like
++ * an IOSurface: boot 57 got no 4 MB contiguous buffer on the 4K kernel and returned 0 silently,
++ * so every failure is logged now (0236).
++ */
+ static uint64_t
+ quad_bench(void)
+ {
+ 	static vm_offset_t va[2];
+ 	static uint64_t gva[2];
+-	const uint32_t pitch = 3072, h = 1334, bytes = (pitch * h + PAGE_MASK) & ~PAGE_MASK;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	const uint32_t w = 1125, pitch = 4608, h = 2436;
++#else
++	const uint32_t w = 750, pitch = 3072, h = 1334;
++#endif
++	const uint32_t bytes = (pitch * h + PAGE_MASK) & ~PAGE_MASK, np = bytes / PAGE_SIZE;
+ 	for (int b = 0; b < 2 && gva[1] == 0; b++) {
+-		/* the page list on the heap: 1001 entries (8 KB) on 4K, too much kernel stack */
+-		uint32_t np = bytes / PAGE_SIZE;
+-		uint64_t pa = gpu_alloc(&va[b], bytes), *pages = kalloc_data(np * sizeof(uint64_t), Z_WAITOK);
+-		if (pa == 0 || pages == NULL) {
++		uint64_t *pages = kalloc_data(np * sizeof(uint64_t), Z_WAITOK);
++		if (pages == NULL || kmem_alloc(kernel_map, &va[b], bytes, KMA_DATA | KMA_ZERO,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET GPU: quad bench: no %u-byte buffer\n", bytes);
+ 			if (pages != NULL) {
+ 				kfree_data(pages, np * sizeof(uint64_t));
+ 			}
+ 			return 0;
+ 		}
+ 		for (uint32_t i = 0; i < np; i++) {
+-			pages[i] = pa + (uint64_t)i * PAGE_SIZE;
++			pages[i] = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(va[b] + i * PAGE_SIZE)));
+ 		}
+-		gva[b] = sweet_gpu_vm_map(pages, np, false);    /* copies the list */
+-		kfree_data(pages, np * sizeof(uint64_t));
+ 		uint32_t *p = (uint32_t *)va[b];
+ 		for (uint32_t i = 0; i < pitch / 4 * h; i++) {
+-			p[i] = b ? 0xff000000u | (i * 0x10305u) : src_px(i % 768, i / 768);
++			p[i] = b ? 0xff000000u | (i * 0x10305u) : src_px(i % (pitch / 4), i / (pitch / 4));
++		}
++		flush_dcache64((addr64_t)va[b], bytes, FALSE);
++		gva[b] = sweet_gpu_vm_map(pages, np, false);    /* copies the list */
++		kfree_data(pages, np * sizeof(uint64_t));
++		if (gva[b] == 0) {
++			printf("SWEET GPU: quad bench: GPU VA map of %u pages failed\n", np);
++			return 0;
+ 		}
+-	}
+-	if (gva[0] == 0 || gva[1] == 0) {
+-		return 0;
+ 	}
+ 	struct sweet_gpu_quad q = {
+ 		.src_va = gva[0], .dst_va = gva[1],
+-		.src_w = 750, .src_h = h, .src_pitch = pitch,
+-		.dst_w = 750, .dst_h = h, .dst_pitch = pitch,
+-		.w = 750, .h = h,
++		.src_w = w, .src_h = h, .src_pitch = pitch,
++		.dst_w = w, .dst_h = h, .dst_pitch = pitch,
++		.w = w, .h = h,
+ 		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0},
+ 		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}, .src_swiz = SWIZ_XYZW,
+ 	};
+ 	uint64_t t0 = mach_absolute_time();
+ 	for (int i = 0; i < 5; i++) {
+-		if (sweet_gpu_quad(&q) != 0) {
++		int r = sweet_gpu_quad(&q);
++		if (r != 0) {
++			printf("SWEET GPU: quad bench: %ux%u quad %d -> %d\n", w, h, i, r);
+ 			return 0;
+ 		}
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 76f364c..089e24d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -956,6 +956,131 @@ static int taimen_hwscale = -1;
+ static SweetSurface *taimen_scan[2];
+ static unsigned taimen_back;
+ 
++/*
++ * E5 (taimengpucopy=1, docs/taimen-gpu-plan.md 5; 0236): once the GPU service is up (sweetgpu=8)
++ * the A540 copies each frame into the scan buffer instead of the CPU's 11.2 MB memcpy (~11 ms on
++ * a silver core). The surface is mapped read-only into the GPU VA window (four kept, as gpuMap
++ * does), each scan buffer once, and one 1:1 COPY quad does the rest. sweet_gpu_quad cleans the
++ * source out of the CPU caches and waits for the GPU, so the flip follows as before. Any failure
++ * falls back to the CPU copy.
++ */
++static int taimen_gpucopy = -1;
++static uint64_t taimen_scan_gva[2];
++static struct {
++	SweetSurface *s;
++	uint64_t va;
++} taimen_gmap[4];
++static unsigned taimen_gmap_next;
++
++static uint64_t
++taimen_gpu_map_phys(uint64_t pa0, uint64_t bytes)
++{
++	uint32_t np = (uint32_t)(round_page(bytes) / PAGE_SIZE);
++	uint64_t *pa = (uint64_t *)IOMallocData(np * sizeof(uint64_t));
++	if (pa == NULL) {
++		return 0;
++	}
++	for (uint32_t p = 0; p < np; p++) {
++		pa[p] = pa0 + (uint64_t)p * PAGE_SIZE;
++	}
++	uint64_t va = sweet_gpu_vm_map(pa, np, false);
++	IOFreeData(pa, np * sizeof(uint64_t));
++	return va;
++}
++
++static uint64_t
++taimen_gpu_map(SweetSurface *s)
++{
++	for (uint32_t i = 0; i < 4; i++) {
++		if (taimen_gmap[i].s == s) {
++			return taimen_gmap[i].va;
++		}
++	}
++	IOMemoryDescriptor *md = s->memory;
++	uint64_t size = md != NULL ? md->getLength() : 0;
++	if (size == 0 || (size & PAGE_MASK) || md->prepare() != kIOReturnSuccess) {
++		return 0;
++	}
++	uint32_t npages = (uint32_t)(size / PAGE_SIZE);
++	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++	bool ok = pa != NULL;
++	for (uint32_t p = 0; ok && p < npages; p++) {
++		IOByteCount seg = 0;
++		pa[p] = md->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &seg, kIOMemoryMapperNone);
++		ok = pa[p] != 0 && (pa[p] & PAGE_MASK) == 0 && seg >= PAGE_SIZE;
++	}
++	uint64_t va = ok ? sweet_gpu_vm_map(pa, npages, true) : 0;
++	if (pa != NULL) {
++		IOFreeData(pa, npages * sizeof(uint64_t));
++	}
++	if (va == 0) {
++		md->complete();
++		return 0;
++	}
++	uint32_t i = taimen_gmap_next++ % 4;
++	if (taimen_gmap[i].s != NULL) {
++		sweet_gpu_vm_unmap(taimen_gmap[i].va);
++		taimen_gmap[i].s->memory->complete();
++		taimen_gmap[i].s->release();
++	}
++	s->retain();
++	taimen_gmap[i].s = s;
++	taimen_gmap[i].va = va;
++	return va;
++}
++
++static bool
++taimen_gpu_copy(SweetSurface *s, unsigned back)
++{
++	if (taimen_gpucopy < 0) {
++		int on = 0;
++		(void)PE_parse_boot_argn("taimengpucopy", &on, sizeof(on));
++		taimen_gpucopy = on ? 1 : 0;
++	}
++	if (taimen_gpucopy != 1 || !sweet_gpu_ready() || (s->offset & 63) || (s->bytesPerRow & 63)) {
++		return false;
++	}
++	if (taimen_scan_gva[back] == 0) {
++		taimen_scan_gva[back] = taimen_gpu_map_phys(back ? TAIMEN_SCAN1_PA : TAIMEN_SCAN0_PA,
++		    (uint64_t)TAIMEN_CANVAS_BPR * TAIMEN_CANVAS_H);
++		IOLog("TAIMEN GPU COPY: scan buffer %u -> GPU VA 0x%llx\n", back, taimen_scan_gva[back]);
++		if (taimen_scan_gva[back] == 0) {
++			taimen_gpucopy = 0;
++			return false;
++		}
++	}
++	uint64_t va = taimen_gpu_map(s);
++	if (va == 0) {
++		return false;
++	}
++	struct sweet_gpu_quad q = {
++		.src_va = va + s->offset, .dst_va = taimen_scan_gva[back],
++		.src_w = TAIMEN_CANVAS_W, .src_h = TAIMEN_CANVAS_H, .src_pitch = s->bytesPerRow,
++		.dst_w = TAIMEN_CANVAS_W, .dst_h = TAIMEN_CANVAS_H, .dst_pitch = TAIMEN_CANVAS_BPR,
++		.x0 = 0, .y0 = 0, .w = TAIMEN_CANVAS_W, .h = TAIMEN_CANVAS_H,
++		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0},      /* 1:1 */
++		.flags = SWEET_GPU_QUAD_COPY,
++		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
++		.src_fmt = SWEET_GPU_FMT_RGBA8,
++		.src_swiz = 0x688,      /* xyzw: bytes B, G, R, A as they are */
++	};
++	uint64_t t0 = mach_absolute_time();
++	int r = sweet_gpu_quad(&q);
++	static unsigned copies, fails;
++	if (r != 0) {
++		if (fails++ < 10) {
++			IOLog("TAIMEN GPU COPY: quad -> %d, CPU copy instead\n", r);
++		}
++		return false;
++	}
++	if (copies++ % 100 == 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		IOLog("TAIMEN GPU COPY: frame %u by the GPU in %llu us\n", copies, ns / 1000);
++	}
++	return true;
++}
++
+ static bool
+ taimen_present_scaled(const uint8_t *rec, uint32_t mask, uintptr_t panel, uint32_t panel_bpr, uint32_t panel_h)
+ {
+@@ -1011,7 +1136,9 @@ taimen_present_scaled(const uint8_t *rec, uint32_t mask, uintptr_t panel, uint32
+ 	}
+ 	uint8_t *d = (uint8_t *)dst->kernelAddress();
+ 	const uint8_t *src = (const uint8_t *)(s->kernelAddress() + s->offset);
+-	if (s->bytesPerRow == TAIMEN_CANVAS_BPR) {
++	if (taimen_gpu_copy(s, taimen_back)) {
++		/* the A540 wrote the scan buffer (E5) */
++	} else if (s->bytesPerRow == TAIMEN_CANVAS_BPR) {
+ 		memcpy(d, src, (size_t)TAIMEN_CANVAS_BPR * TAIMEN_CANVAS_H);
+ 	} else {
+ 		for (uint32_t y = 0; y < TAIMEN_CANVAS_H; y++) {
