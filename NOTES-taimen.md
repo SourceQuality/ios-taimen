@@ -648,3 +648,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   samples spread thin, the kernel ~2.6 % (sweet_gpu_wait, the GPU user client). The heavier scenes are CPU work in
   CA and Mesa. With one scheduler pset, wakeups go to the lowest idle CPU, a silver one (amp plan; which cores
   these threads ran on is not measured). xnu 0247 taimenslow=0 measures gold-only placement.
+- 2026-10-24 boot 81 (r69 = +0247, taimenslow=0: CPU0 + the four gold cores; the gesture script): "TAIMEN SCHED:
+  cpu1-3 derecommended: 0". Share of swap gaps under 20 ms against boot 79 on eight cores: Control Center windows
+  ~54 % (79: ~41 %), Settings launch/close ~38 % (79: ~33 %), the rest mostly 20-37 ms. Gold placement buys some,
+  not all: the gold clock (1728 of ~2457 MHz without OSM/CPR) is the other half. xnu 0248 taimenamp=1 keeps eight
+  cores and places only above-utility threads gold first.
