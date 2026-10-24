@@ -773,3 +773,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   set brightness 113 of 225 and the DCS 0x51 write completed (CMD_DMA_DONE) through the CMD_DMA_TPG FIFO;
   0 DSI resets, 0 kick timeouts, frames as before; closed loop again (gold 1016, silver 892 mV, 44 C).
   Whether the panel visibly dims is for a person to see. sweetbl=1 is in the ROOT=1 defaults.
+- 2026-10-24 ~12:30, the user on hand-off boot 5 (r81, all defaults): **"The phone feels pretty responsive, a
+  huge improvement from the first boot. The brightness works as well."** Also: "why is this iOS so stripped
+  down? It only has 6 apps": the 32 staged stock apps were never moved into /Applications on taimen (xnu 0262,
+  mkrootfix --stage-apps; boot 107 with the data migration once).
