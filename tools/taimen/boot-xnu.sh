@@ -21,29 +21,33 @@ args=${*:-}
 # 42; boot 91: present 8-15 ms against 27-31 ms with one buffer, every swap shown); sweetperf=1 taimenddr=1804: the perf thread votes DDR to 1804 MHz through
 # the RPM (xnu 0224, boot 44: bimc 648 -> 902 MHz, memcpy ~0.8 -> 1.09 GB/s); taimenamp=1: idle
 # placement gold first above utility priority, silver for utility and background (xnu 0248, boots
-# 82-83: Control Center frames under 20 ms 41 -> 69 %). Later extra args override all of these
+# 82-83: Control Center frames under 20 ms 41 -> 69 %); taimenosm=33: gold through CPRh and the
+# OSM as Linux runs it (xnu 0252, boot 98: 2342 MHz at 1052 mV, ~45 frames/s in the swipes against
+# ~17 at 1728), G1's taimengold=1728 if it refuses. Later extra args override all of these
 # (the last occurrence wins).
 if [ "${ROOT:-0}" = 1 ]; then
-	args="cpus=8 taimengold=1728 taimenamp=1 sweetkeys=1 taimenhwscale=3 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
+	args="cpus=8 taimenosm=33 taimengold=1728 taimenamp=1 sweetkeys=1 taimenhwscale=3 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
 fi
 # GPU (ROOT=1 boots once tools/taimen/sweetgl-install.sh has run; GPU=0: CoreAnimation's CPU
 # renderer): CA draws with Mesa on the A540, sweetgl injected into backboardd (boots 60-75: ~60
-# frames/s in the swipe animations). 1 GiB of RAM; the GPU service at 596 MHz (sweetgpu=8, the CP
+# frames/s in the swipe animations). 2.96 GiB of RAM from 0xb1000000 (xnu 0250-0251, 0254, boot 96:
+# the low bank's top runs on into the upper bank); the GPU service at 596 MHz (sweetgpu=8, the CP
 # microcode and zap shader from GPUFW); the A540 copies each frame to the scan buffer
 # (taimengpucopy, E5); Mesa's buffers write-combined from a 256 MB heap above XNU's RAM (xnu 0240,
-# needs TAIMEN_MEM <= ~1.7 GiB). The dylib comes with the sweetgl ROOTFIX, whatever ROOTFIX says:
+# XNU's RAM ends at 0x16e400000). The dylib comes with the sweetgl ROOTFIX, whatever ROOTFIX says:
 # without the file backboardd cannot start (DYLD_INSERT_LIBRARIES).
 sweetgl_env=$P/../out/sweetgl/current.env
 if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 	. "$sweetgl_env"
-	TAIMEN_MEM=${TAIMEN_MEM:-0x40000000}
+	TAIMEN_BASE=${TAIMEN_BASE:-0xb1000000}
+	TAIMEN_MEM=${TAIMEN_MEM:-0xbd400000}
 	GPUFW=${GPUFW:-$P/../research/taimen/firmware}
 	if [ -n "${ROOTFIX:-}" ] && [ "$(realpath "$ROOTFIX")" != "$(realpath "$SWEETGL_ROOTFIX")" ]; then
 		echo "GPU boot: ROOTFIX $SWEETGL_ROOTFIX (installs $SWEETGL_LIB) instead of $ROOTFIX" >&2
 	fi
 	ROOTFIX=$SWEETGL_ROOTFIX
 	args="sweetgpu=8 sweetgpuclk=600 taimengpucopy=1 taimengpuheap=256 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB sweetnull=backboardd ${args}"
-	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), TAIMEN_MEM $TAIMEN_MEM"
+	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), RAM ${TAIMEN_BASE:-0x100000000} + $TAIMEN_MEM"
 fi
 # SHIM_WATCH=1: CPU 7 stays in the shim as a watcher (shim/taimen.c WATCH): XNU gets 7 cores, and
 # if its early log stops growing before its UFS driver starts, the watcher saves the log to the
@@ -55,8 +59,8 @@ if [ "${SHIM_WATCH:-0}" = 1 ]; then
 fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"
-# TAIMEN_MEM=BYTES: XNU RAM at 0x100000000 (mkadt.py; default 512 MiB)
-TAIMEN_NCPU=$([ "${SHIM_WATCH:-0}" = 1 ] && echo 7) TAIMEN_MEM=${TAIMEN_MEM:-} python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
+# TAIMEN_BASE=0xb1000000 / TAIMEN_MEM=BYTES: XNU's RAM (mkadt.py; default 512 MiB at 0x100000000)
+TAIMEN_NCPU=$([ "${SHIM_WATCH:-0}" = 1 ] && echo 7) TAIMEN_BASE=${TAIMEN_BASE:-} TAIMEN_MEM=${TAIMEN_MEM:-} python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
 # cpus=1 and no root yet: the first milestone is XNU painting its own bands.
 # debug 0x10000c: 0xc plus DB_REBOOT_ALWAYS; DB_NMI alone sets panicDebugging, which parks a
 # panicked kernel instead of resetting (no watchdog bite since boot 13), so a panic now ends in
