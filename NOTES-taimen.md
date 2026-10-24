@@ -653,3 +653,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   ~54 % (79: ~41 %), Settings launch/close ~38 % (79: ~33 %), the rest mostly 20-37 ms. Gold placement buys some,
   not all: the gold clock (1728 of ~2457 MHz without OSM/CPR) is the other half. xnu 0248 taimenamp=1 keeps eight
   cores and places only above-utility threads gold first.
+- 2026-10-24 **boot 82 (r70 = +0248, taimenamp=1 on eight cores, the gesture script)**: "TAIMEN SCHED: gold cpus 4-7
+  at 1728 MHz, preferred with taimenamp". Swap gaps under 20 ms: Control Center windows ~69 % (61-75 %; boot 79
+  stock ~41 %, boot 81 gold-only ~54 %), Settings launch/close ~45 % (33 %, 38 %). Gold first for above-utility
+  threads beats gold-only: silver keeps the background work off the gold cores.
