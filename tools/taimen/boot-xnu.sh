@@ -24,6 +24,25 @@ args=${*:-}
 if [ "${ROOT:-0}" = 1 ]; then
 	args="cpus=8 taimengold=1728 sweetkeys=1 taimenhwscale=2 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
 fi
+# GPU (ROOT=1 boots once tools/taimen/sweetgl-install.sh has run; GPU=0: CoreAnimation's CPU
+# renderer): CA draws with Mesa on the A540, sweetgl injected into backboardd (boots 60-75: ~60
+# frames/s in the swipe animations). 1 GiB of RAM; the GPU service at 596 MHz (sweetgpu=8, the CP
+# microcode and zap shader from GPUFW); the A540 copies each frame to the scan buffer
+# (taimengpucopy, E5); Mesa's buffers write-combined from a 256 MB heap above XNU's RAM (xnu 0240,
+# needs TAIMEN_MEM <= ~1.7 GiB). The dylib comes with the sweetgl ROOTFIX, whatever ROOTFIX says:
+# without the file backboardd cannot start (DYLD_INSERT_LIBRARIES).
+sweetgl_env=$P/../out/sweetgl/current.env
+if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
+	. "$sweetgl_env"
+	TAIMEN_MEM=${TAIMEN_MEM:-0x40000000}
+	GPUFW=${GPUFW:-$P/../research/taimen/firmware}
+	if [ -n "${ROOTFIX:-}" ] && [ "$(realpath "$ROOTFIX")" != "$(realpath "$SWEETGL_ROOTFIX")" ]; then
+		echo "GPU boot: ROOTFIX $SWEETGL_ROOTFIX (installs $SWEETGL_LIB) instead of $ROOTFIX" >&2
+	fi
+	ROOTFIX=$SWEETGL_ROOTFIX
+	args="sweetgpu=8 sweetgpuclk=600 taimengpucopy=1 taimengpuheap=256 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB sweetnull=backboardd ${args}"
+	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), TAIMEN_MEM $TAIMEN_MEM"
+fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"
 # TAIMEN_MEM=BYTES: XNU RAM at 0x100000000 (mkadt.py; default 512 MiB)
