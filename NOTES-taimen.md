@@ -531,3 +531,20 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   while backboardd used 1-8 % CPU. Two threads at the first instruction of a function not run before = a page-in
   of the dylib's text that does not complete: no free page (XNU has 512 MiB; kernel_task was at 193 % around 90 s)
   or a stuck UFS read. 0238 logs memory every 10 s and adds synthetic swipes; TAIMEN_MEM tries more RAM.
+- 2026-10-23 **boot 62 (r60 = +0238, CPU rendering, TAIMEN_MEM=0x40000000, synthetic swipes from 60 s, 180 s): 1 GiB
+  of RAM works** (vm_page_bootstrap 251474 free pages, against 117761 at 512 MiB). The CPU baseline for the synthetic
+  swipes (taimenswipe, xnu 0238: one swipe up from the bottom edge, then page swipes): **10-20 swaps/s** while
+  backboardd ran at 150-540 % CPU (CA's CPU renderer on 5+ cores); TAIMEN MEM free 2-28k pages, compressed 36-65k.
+- 2026-10-23 boot 63 (r60, TAIMEN_MEM=0x7e400000, the whole free upper bank, ~2 GiB): panic at 50 s,
+  "kmem_range_init: vm_map_locate_space failing for claim kmem_ptr_range_meta @vm_kern.c:3645". The 4K-page kernel
+  has a 39-bit kernel VA space and kmem_range_init sizes its claims from the memory size; ~2 GiB does not fit. 1 GiB
+  stays the default for the GPU tests until the claims are made smaller.
+- 2026-10-23 boot 64 (r60, E6 with 1 GiB: sweetgl-489cf405.dylib in backboardd, sweetgpu=8 at 596 MHz, GPU copy,
+  synthetic swipes every 20 s, thread samples every 20 s, 300 s): **no freeze**, but **0.5-2 swaps/s**: sweetgl 0.3-0.6
+  flushes/s, glFinish 7-15 ms per flush, 1.7-2.9 s between flushes; swap gaps all over 54 ms. backboardd used only
+  8-11 % CPU during the animations (SWEET TOP), the system 15-22 %: the frames are gated, not slow to draw. Wired grew
+  58k -> 91k pages (each imported 13.9 MB display surface stays wired while sweetgl caches it). The thread samples
+  (symbolicated with the new tools/sweetgl/dsc-sym.py against research/dsc-x) found backboardd's CA::WindowServer::
+  IOMFBServer threads idle in mach_msg and the Mesa queue threads idle in pthread_cond_wait at every sample. Boot 60
+  (display surfaces failing to bind) flushed 37-60 frames/s, so the gate came with rendering into the imported
+  display surfaces.
