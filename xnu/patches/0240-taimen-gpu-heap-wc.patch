@@ -1,0 +1,224 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index c815a5c..670f767 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -78,6 +78,87 @@ flush_if_written(uint64_t pa)
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * taimengpuheap=MB (default 0: off). Mesa's own buffers (bo new) come from
++ * the top of the upper DDR bank, above XNU's RAM (TAIMEN_MEM), mapped
++ * write-combined into the client: no cache maintenance or modified-bit
++ * tracking at submit or cpu prep. Boots 69-72: ~7 ms of kernel time per
++ * submit, mostly cleaning and write-protecting the pages Mesa wrote
++ * (FlushPoC_DcacheRegion, pmap_clear_modify). The pages are not managed by
++ * the VM, so a write-combined mapping leaves the physmap alone (managed
++ * pages froze boot 0150a). First fit over a byte map; a bo that does not
++ * fit gets wired kernel memory as before.
++ */
++#include <pexpert/pexpert.h>
++extern "C" unsigned long gPhysBase, gPhysSize;
++#define TAIMEN_HEAP_END 0x17e400000ULL  /* the upper bank's RAM ends at 0x17e4c0000 (Linux /proc/iomem) */
++static uint64_t gHeapBase;              /* 0: no heap */
++static uint32_t gHeapPages, gHeapRover;
++static uint8_t *gHeapMap;               /* a byte per page, 1: used */
++static IOLock *gHeapLock;
++
++static void
++heap_init(void)
++{
++	uint32_t mb = 0;
++	(void)PE_parse_boot_argn("taimengpuheap", &mb, sizeof(mb));
++	if (mb == 0) {
++		return;
++	}
++	uint64_t size = (uint64_t)mb << 20;
++	uint64_t base = (TAIMEN_HEAP_END - size) & ~((2ULL << 20) - 1);
++	if (mb > 1024 || base < (uint64_t)gPhysBase + gPhysSize) {
++		printf("SWEET GPU: heap of %u MB at 0x%llx overlaps XNU's RAM (to 0x%llx): off\n", mb, base,
++		    (uint64_t)gPhysBase + gPhysSize);
++		return;
++	}
++	gHeapPages = (uint32_t)((TAIMEN_HEAP_END - base) / PAGE_SIZE);
++	gHeapMap = (uint8_t *)IOMallocZeroData(gHeapPages);
++	gHeapLock = IOLockAlloc();
++	if (gHeapMap == NULL || gHeapLock == NULL) {
++		return;
++	}
++	gHeapBase = base;
++	printf("SWEET GPU: heap %u MB at 0x%llx, write-combined for the clients\n", mb, base);
++}
++
++/* First page of a free run of n heap pages, now used; or -1. */
++static int64_t
++heap_alloc(uint32_t n)
++{
++	if (gHeapBase == 0 || n == 0 || n > gHeapPages) {
++		return -1;
++	}
++	int64_t found = -1;
++	IOLockLock(gHeapLock);
++	for (int pass = 0; pass < 2 && found < 0; pass++) {
++		uint32_t start = pass ? 0 : gHeapRover, end = pass ? gHeapRover : gHeapPages, run = 0;
++		for (uint32_t p = start; p < end; p++) {
++			run = gHeapMap[p] ? 0 : run + 1;
++			if (run == n) {
++				found = p + 1 - n;
++				break;
++			}
++		}
++	}
++	if (found >= 0) {
++		memset(gHeapMap + found, 1, n);
++		gHeapRover = (uint32_t)found + n < gHeapPages ? (uint32_t)found + n : 0;
++	}
++	IOLockUnlock(gHeapLock);
++	return found;
++}
++
++static void
++heap_free(uint32_t first, uint32_t n)
++{
++	IOLockLock(gHeapLock);
++	memset(gHeapMap + first, 0, n);
++	IOLockUnlock(gHeapLock);
++}
++#endif
++
+ struct sweet_gpu_submit {
+ 	uint32_t nr_ibs, nr_bos;
+ };
+@@ -108,6 +189,9 @@ SweetGPU::start(IOService *provider)
+ 		flush_dcache64((addr64_t)pa, (unsigned)page_size, TRUE);
+ 		sweet_gpu_set_fence_page((uintptr_t)gFencePage->getBytesNoCopy(), pa);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	heap_init();
++#endif
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
+ 	registerService();
+ 	IOLog("SWEET GPU: SweetGPU registered\n");
+@@ -130,6 +214,8 @@ struct sweet_gpu_bo {
+ 	uint32_t npages;
+ 	uint32_t last_seq;              /* last submit listing it */
+ 	bool used;                      /* listed in a submit at least once */
++	bool wc;                        /* heap memory, write-combined: no cache maintenance */
++	uint32_t heap_first;            /* wc: its first heap page */
+ };
+ 
+ class SweetGPUUserClient : public IOUserClient {
+@@ -150,6 +236,9 @@ class SweetGPUUserClient : public IOUserClient {
+ 	struct sweet_gpu_bo *bo(uint64_t handle);
+ 	void freeBo(struct sweet_gpu_bo *b);
+ 	IOReturn boNew(uint64_t size, uint64_t *out);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	IOReturn boNewHeap(struct sweet_gpu_bo *b, uint32_t handle, uint64_t size, uint32_t first, uint64_t *out);
++#endif
+ 	IOReturn boImport(uint32_t id, uint64_t *out);
+ 	IOReturn submit(const void *in, size_t len, uint64_t *seq);
+ 
+@@ -348,10 +437,65 @@ SweetGPUUserClient::freeBo(struct sweet_gpu_bo *b)
+ 	} else {
+ 		fBoBytes -= b->size;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	if (b->wc) {
++		heap_free(b->heap_first, b->npages);
++	}
++#endif
+ 	b->md->release();
+ 	bzero(b, sizeof(*b));
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * Lock held. A new bo in heap pages [first, first + npages) (already marked
++ * used; freed here on failure), zeroed, write-combined for the client.
++ */
++IOReturn
++SweetGPUUserClient::boNewHeap(struct sweet_gpu_bo *b, uint32_t handle, uint64_t size, uint32_t first, uint64_t *out)
++{
++	uint32_t npages = (uint32_t)(size / PAGE_SIZE);
++	uint64_t pa0 = gHeapBase + (uint64_t)first * PAGE_SIZE;
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa0, size, kIODirectionInOut);
++	IOMemoryMap *kmap = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++	uint64_t gva = 0;
++	IOMemoryMap *umap = NULL;
++	if (kmap != NULL && pa != NULL) {
++		/* plain stores: no DC ZVA on non-cacheable memory */
++		volatile uint64_t *z = (volatile uint64_t *)kmap->getVirtualAddress();
++		for (uint64_t i = 0; i < size / 8; i++) {
++			z[i] = 0;
++		}
++		__builtin_arm_dsb(0xf);
++		for (uint32_t p = 0; p < npages; p++) {
++			pa[p] = pa0 + (uint64_t)p * PAGE_SIZE;
++		}
++		gva = sweet_gpu_vm_map(pa, npages, false);
++		umap = gva ? md->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
++	}
++	OSSafeReleaseNULL(kmap);
++	if (umap == NULL) {
++		if (gva) {
++			sweet_gpu_vm_unmap(gva);
++		}
++		if (pa != NULL) {
++			IOFreeData(pa, npages * sizeof(uint64_t));
++		}
++		OSSafeReleaseNULL(md);
++		heap_free(first, npages);
++		return kIOReturnNoMemory;
++	}
++	*b = (struct sweet_gpu_bo){ .iova = gva, .size = size, .md = md, .umap = umap, .pa = pa, .npages = npages,
++		                    .wc = true, .heap_first = first };
++	fBoBytes += size;
++	out[0] = handle;
++	out[1] = gva;
++	out[2] = umap->getAddress();
++	return kIOReturnSuccess;
++}
++#endif
++
+ /* out: handle, GPU VA, user address. */
+ IOReturn
+ SweetGPUUserClient::boNew(uint64_t size, uint64_t *out)
+@@ -365,6 +509,12 @@ SweetGPUUserClient::boNew(uint64_t size, uint64_t *out)
+ 	if (b == NULL) {
+ 		return kIOReturnNoResources;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	int64_t first = heap_alloc((uint32_t)(size / PAGE_SIZE));
++	if (first >= 0) {
++		return boNewHeap(b, handle, size, (uint32_t)first, out);
++	}
++#endif
+ 	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
+ 	if (md == NULL) {
+@@ -480,11 +630,13 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 		 * CPU-cached: its CPU writes to memory, no stale lines over GPU
+ 		 * writes. Only pages written since the last submit: flushing every
+ 		 * page of every listed bo was ~1/4 of backboardd's CPU (0182g).
++		 * Heap bos (write-combined) need none.
+ 		 */
+-		for (uint32_t p = 0; p < b->npages; p++) {
++		for (uint32_t p = 0; !b->wc && p < b->npages; p++) {
+ 			flush_if_written(b->pa[p]);
+ 		}
+ 	}
++	__builtin_arm_dsb(0xf);         /* this CPU's write-combined stores reach memory first */
+ 	uint32_t seq = 0;
+ 	int e = sweet_gpu_submit(ib, h.nr_ibs, &seq);
+ 	if (e != 0) {
+@@ -580,7 +732,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			struct sweet_gpu_bo *b = bo(args->scalarInput[0]);
+ 			ret = b == NULL ? kIOReturnNotFound :
+ 			    b->used && sweet_gpu_wait(b->last_seq, 0) != 0 ? kIOReturnBusy : kIOReturnSuccess;
+-			for (uint32_t p = 0; ret == kIOReturnSuccess && p < b->npages; p++) {
++			for (uint32_t p = 0; ret == kIOReturnSuccess && !b->wc && p < b->npages; p++) {
+ 				flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
+ 			}
+ 		}
