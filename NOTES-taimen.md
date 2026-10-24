@@ -615,3 +615,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   renderer), an A5xx texture barrier inside the batch (mesa.patch; CA's destination reads each flushed a batch),
   Mesa's bos write-combined from a heap above XNU's RAM (0240), imported surfaces flushed only when their seed moves
   (0242).
+- 2026-10-24 boot 76 (boot 75's setup, 600 s, 50 swipes every 10 s): **stable at ~60 frames/s throughout** (each
+  swipe window 28-36 swap gaps under 20 ms, 9-20 under 37, at most 2 longer); no panic, no GPU hang; wired levels
+  off at ~87k pages, free 3-9k, compressed ~47k. driverkitd is killed (sig 9) once in this boot as in every boot
+  since at least 58, the CPU-only boot 62 included: not the GPU path.
+- 2026-10-24 boot 77 (r64, the plain ROOT=1 default, only taimenreboot and swipes added): boot-xnu.sh took the GPU
+  setup from ../out/sweetgl/current.env ("GPU boot: sweetgl 565f8e0"), the heap came up, sweetgl waited 5.9 s for
+  the GPU service, Mesa drew at the same ~60 frames/s.
