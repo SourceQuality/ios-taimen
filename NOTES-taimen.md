@@ -823,3 +823,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   rmtfs the modem went FATAL at +35.8 s, as flame predicted (~40 s); item 421 not found (no crash text).
   The reader brought the /vendor WLAN firmware (wlanmdsp.mbn 3723164, bdwlan.bin/.b09 19152, modemuw.jsn:
   wlan_pd instance 180 with kernel/elf_loader, tms/servreg, wlan/fw) into research/taimen/firmware (not git).
+- 2026-10-24 boot 112 (r99 = +0263-0279, the defaults + LastBuildInfo.plist removed + taimenwifi=8 + the WLAN
+  firmware blobs, payload 21.4 MB, 360 s): **M5 and M6 pass.** The modem's FIFO 480 is in the cached list (0279);
+  GLINK VERSION 1 (features 0x7 -> 0x1), the modem opens glink_ssr, IPCRTR, SSM_RTR_MODEM_APPS, later apr_*,
+  LOOPBACK_CTL_MPSS, DS, DATA1-4/11; QRTR HELLO from node 0, 40 services (servreg-notif 0x42, ssctl 0x2b, ipa
+  0x31, nas, uim, wds, dms, wda, ... and WLFW 0x45 at +1.28 s). Our services: rmtfs opens modem_fs1/fs2/fsg/fsc
+  (fsg_oem_1/2 refused, harmless), ALLOC_BUFF 2 MB at 0x8900b000 (to HLOS+MSS_MSA ok), 3 reads; pd-mapper answers
+  tms/pddump_disabled (0), tms/pdr_enabled, avs/audio (0), kernel/elf_loader (wlan_pd); tftp serves
+  /readonly/firmware/image/wlanmdsp.mbn from the payload blob (blk 7680, wsize 10), /readwrite in RAM,
+  /readonly/mbn/mcfg/... not found. **The modem stayed up the whole 200 s watch.** M7: IND_REGISTER ok,
+  MSA_INFO ok (2 regions: 0x8920c000+0x4000 secure, 0x89210000+0xfc000; both assigned), MSA_READY ind, CAP ok:
+  chip_id 0x30214 family 0x4001, board_id 0xff, soc 0x40010002, fw 0x224a00a1 WLAN.HL.2.2.4-00161-QCAHLSW8998MTPL-1
+  (2020-05-20). Then no FW_READY and no pin-connect indication: the WLAN rails were never voted (m7_on was set
+  after M3; 0280). The apps: not on the home screen (end screenshot: the same 6), so removing LastBuildInfo.plist
+  does not make installd register them; 0280's op 9 removes LaunchServices' database instead.
