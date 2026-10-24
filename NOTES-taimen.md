@@ -888,3 +888,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (ipa3 + WDI2 for the WLAN: qcom,ipa-wdi2, an ipa_smmu_wlan stream) long before FW_READY; here IPA is never
   clocked, and a modem task stalled on an unclocked IPA would show as starvation. 0287: the RPM IPA clock
   ("ipa" 0) at 150 MHz before the modem boots.
+- 2026-10-24 boot 119 (r107 = +0263-0287, a plain ROOTFIX + taimenwifi=10, 420 s): the IPA core clock voted at
+  150 MHz (acked) changed nothing: M0-M9 as boot 117 (scan: 34 networks, 49 beacons/probe responses), FATAL at
+  +14.24 s, DOG_HB starvation (task 0xd21c63b0). rmtfs/tftp traffic is the same as in the boots that lived. Two
+  targeted guesses (rx ring, IPA clock) have missed, so 0288 stops guessing: it copies icnss's last difference
+  (WLAN hardware off at FW_READY, on again before WLAN_CFG/mission) and, after a FATAL, dumps the starved task's
+  control block (its address through the modem.mdt phdrs, the MPSS carve-out taken back after halting the modem)
+  and the full error text.
