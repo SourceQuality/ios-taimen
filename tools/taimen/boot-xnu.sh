@@ -101,6 +101,16 @@ if [ -n "${GPUFW:-}" ]; then
 	# the zap shader for sweetgpu>=3: the .mdt (headers + hash) and its one loadable segment
 	[ -f "$GPUFW/a540_zap.mdt" ] && blobs+=(--blob "GPU-ZAP-MDT=$GPUFW/a540_zap.mdt" --blob "GPU-ZAP-SEG=$GPUFW/a540_zap.b02")
 fi
+# WLANFW=DIR: the /vendor/firmware files the modem fetches over TFTP for Wi-Fi (xnu 0277; pulled by
+# the log reader as fw-*, kept in ../research/taimen/firmware, never in git), only for taimenwifi>=7.
+wifi=$(echo "$cmdline" | sed -n 's/.*taimenwifi=\([0-9]*\).*/\1/p')
+WLANFW=${WLANFW:-$P/../research/taimen/firmware}
+if [ "${wifi:-0}" -ge 7 ] && [ -f "$WLANFW/wlanmdsp.mbn" ]; then
+	blobs+=(--blob "WLAN-MDSP=$WLANFW/wlanmdsp.mbn")
+	for f in bdwlan.bin:WLAN-BDF bdwlan.b09:WLAN-BDF09 modemuw.jsn:WLAN-UWJSN; do
+		[ -f "$WLANFW/${f%%:*}" ] && blobs+=(--blob "${f#*:}=$WLANFW/${f%%:*}")
+	done
+fi
 python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline" "${blobs[@]}"
 # ABL does not start a boot image whose ramdisk (the payload) is over ~35 MiB: boot 77's 36698688
 # bytes booted, boot 78's 36715104 went straight back to fastboot (shim never ran). The sweetgl

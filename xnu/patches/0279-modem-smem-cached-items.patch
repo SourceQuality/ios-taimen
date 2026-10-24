@@ -1,0 +1,115 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index ee24626..a4d3fe1 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -261,12 +261,34 @@ smem_partition(uint16_t a, uint16_t b)
+ 	return NULL;
+ }
+ 
++/* the partition's cache line (ptable entry), for its cached list */
++static uint32_t
++smem_part_cacheline(const struct smem_part_hdr *p)
++{
++	struct smem_pt *pt = (struct smem_pt *)(smem + SMEM_SIZE - 0x1000);
++	struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
++	uint32_t off = (uint32_t)((const uint8_t *)p - smem);
++	for (uint32_t i = 0; i < pt->num_entries && i < 64; i++) {
++		if (e[i].offset == off) {
++			return e[i].cacheline != 0 ? e[i].cacheline : 8;
++		}
++	}
++	return 8;
++}
++
++/*
++ * An item of a private partition (qcom_smem_get_private): the uncached list grows up from the
++ * header, the cached list down from the end, each entry's header after its data and cache-line
++ * aligned. 0279: boot 111's modem made the GLINK descriptor (uncached) but its RX FIFO, item 480,
++ * was never found: only the uncached list was searched.
++ */
+ static void *
+ smem_part_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ {
+ 	uint8_t *e, *end;
+ 
+-	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size) {
++	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size ||
++	    p->free_cached > p->size || p->free_uncached > p->free_cached) {
+ 		return NULL;
+ 	}
+ 	e = (uint8_t *)p + sizeof(*p);
+@@ -284,6 +306,23 @@ smem_part_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ 		}
+ 		e += sizeof(*h) + h->pad_hdr + h->size;
+ 	}
++	uint32_t cl = smem_part_cacheline(p);
++	uint32_t hdr = (uint32_t)((sizeof(struct smem_priv_entry) + cl - 1) / cl * cl);
++	e = (uint8_t *)p + p->size - hdr;           /* phdr_to_first_cached_entry */
++	end = (uint8_t *)p + p->free_cached;        /* phdr_to_last_cached_entry */
++	while (e > end && e >= (uint8_t *)p + sizeof(*p)) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5 || h->size > p->size) {
++			return NULL;
++		}
++		if (h->item == item) {
++			if (size != NULL) {
++				*size = h->size - h->pad_data;
++			}
++			return e - h->size;                 /* cached_entry_to_item */
++		}
++		e -= h->size + hdr;                     /* cached_entry_next */
++	}
+ 	return NULL;
+ }
+ 
+@@ -1629,6 +1668,38 @@ rx_one(void)
+ 	return true;
+ }
+ 
++static void
++smem_part_dump(struct smem_part_hdr *p)
++{
++	char line[200];
++	int n = 0;
++	uint8_t *e = (uint8_t *)p + sizeof(*p), *end = (uint8_t *)p + p->free_uncached;
++	while (e + sizeof(struct smem_priv_entry) <= end && n < 150) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %u(%u)", h->item, h->size);
++		e += sizeof(*h) + h->pad_hdr + h->size;
++	}
++	LOG("M5: apps<->mpss partition: uncached%s; free %#x..%#x of %#x, cache line %u", n ? line : " none",
++	    p->free_uncached, p->free_cached, p->size, smem_part_cacheline(p));
++	uint32_t cl = smem_part_cacheline(p), hdr = (uint32_t)((sizeof(struct smem_priv_entry) + cl - 1) / cl * cl);
++	n = 0;
++	e = (uint8_t *)p + p->size - hdr;
++	end = (uint8_t *)p + p->free_cached;
++	while (e > end && n < 150) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5 || h->size > p->size) {
++			n += snprintf(line + n, sizeof(line) - (size_t)n, " (bad canary %#x)", h->canary);
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %u(%u)", h->item, h->size);
++		e -= h->size + hdr;
++	}
++	LOG("M5: apps<->mpss partition: cached%s", n ? line : " none");
++}
++
+ static bool
+ glink_start(struct smem_part_hdr *part)
+ {
+@@ -1663,6 +1734,11 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 			LOG("M5: t=%u ms: modem RX FIFO, %u bytes", ms, sz);
+ 		}
+ 	}
++	static bool dumped;
++	if (g_rx == NULL && ms >= 5000 && !dumped) {
++		dumped = true;
++		smem_part_dump(part);
++	}
+ 	for (int i = 0; i < 64 && g_rx != NULL && rx_one(); i++) {
+ 	}
+ 	txq_pump();

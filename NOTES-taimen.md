@@ -811,3 +811,15 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   mem 0x1fffffff, reset 0x4, gfmux 0x102), but **PBL status stayed 0 for 1 s**. Cause found: the mss node's
   bus_clk is clk_gcc_bimc_mss_q6_axi_clk = GCC 0x4401C; M3 had enabled GCC_MSS_Q6_BIMC_AXI_CBCR 0x8A040 instead,
   so the Q6 had no path to DDR for the MBA (0276).
+- 2026-10-24 boot 111 (r96 = +0263-0276, the defaults + the apps archive on system_b (op 8) + taimenwifi=7, 360 s):
+  **the 32 stock apps are back in /Applications**: 9415 records (5575 mkdir, 3840 zlib files) written in 21 s,
+  280 MB read from system_b; /Applications 143 -> 175 entries. Not yet registered with LaunchServices (boot 112).
+  **The modem runs.** 0276's clock was it: PBL status 1, MBA status 1 (XPU unlocked); AXI halt ports idle, not
+  halted. M4: modem.mdt is relocatable (0x8cc00000..0x94400000, 27 loadable phdrs counting zero-filled ones),
+  metadata 980 + 7368 bytes -> META_DATA_AUTH_SUCCESS, 27 segments (121736 KiB with BSS) loaded and announced in
+  296 ms, AUTH_COMPLETE; the modem's SMP2P item 435 at +60 ms, slave-kernel READY|HANDOVER at +130 ms. M5: the
+  modem had made the GLINK descriptor (478), but its FIFO 480 was never found (rx 0 messages): smem_part_get
+  only searched a partition's uncached list (0279 adds the cached list, and a dump of both at +5 s). With no
+  rmtfs the modem went FATAL at +35.8 s, as flame predicted (~40 s); item 421 not found (no crash text).
+  The reader brought the /vendor WLAN firmware (wlanmdsp.mbn 3723164, bdwlan.bin/.b09 19152, modemuw.jsn:
+  wlan_pd instance 180 with kernel/elf_loader, tms/servreg, wlan/fw) into research/taimen/firmware (not git).
