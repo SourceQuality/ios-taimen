@@ -1347,6 +1347,51 @@ sgl_gap(void *ra)
 	gap_calls = 1;
 }
 
+/* two more: the EAGLContext methods that bind IOSurfaces (imports, copies) */
+#define SLOT_TEXIOS SGL_SLOTS
+#define SLOT_ATTACH (SGL_SLOTS + 1)
+#define SLOT_N (SGL_SLOTS + 2)
+static uint64_t slot_ticks[SLOT_N];
+static uint32_t slot_calls[SLOT_N];
+
+void
+sgl_t1(int slot, uint64_t t0)
+{
+	slot_ticks[slot] += mach_absolute_time() - t0;
+	slot_calls[slot]++;
+}
+
+/* the 8 slots with the most time since the last call, then cleared */
+static void
+slot_report(uint64_t span_us)
+{
+	char line[700];
+	uint64_t all = 0;
+	for (int i = 0; i < SLOT_N; i++) {
+		all += slot_ticks[i];
+	}
+	int o = snprintf(line, sizeof(line), "sweetgl: in GL %llu of %llu ms:", ticks_us(all) / 1000, span_us / 1000);
+	for (int k = 0; k < 8 && o < (int)sizeof(line) - 60; k++) {
+		int best = -1;
+		for (int i = 0; i < SLOT_N; i++) {
+			if (slot_ticks[i] != 0 && (best < 0 || slot_ticks[i] > slot_ticks[best])) {
+				best = i;
+			}
+		}
+		if (best < 0) {
+			break;
+		}
+		const char *n = best == SLOT_TEXIOS ? "texImageIOSurface" : best == SLOT_ATTACH ? "attachImage" :
+		    sgl_slot_names[best];
+		o += snprintf(line + o, sizeof(line) - o, " %s %llu ms/%u", n[0] == 'g' && n[1] == 'l' ? n + 2 : n,
+		    ticks_us(slot_ticks[best]) / 1000, slot_calls[best]);
+		slot_ticks[best] = 0;
+	}
+	sweet_drm_log("%s", line);
+	memset(slot_ticks, 0, sizeof(slot_ticks));
+	memset(slot_calls, 0, sizeof(slot_calls));
+}
+
 /*
  * Frame timing, logged every 10 s: flushes, time blocked in glFinish (GPU
  * still busy), the CPU time between one flush's return and the next, and
@@ -1373,6 +1418,7 @@ flush_stats(uint64_t t0, uint64_t t1)
 	if (span >= 10000000ull) {
 		sweet_drm_log("sweetgl: %.1f flushes/s, finish avg %llu us max %llu us, between %llu us (build %llu us)",
 		    n * 1e6 / span, ticks_us(wait) / n, ticks_us(wait_max), ticks_us(cpu) / n, ticks_us(build) / n);
+		slot_report(span);
 		window = t1;
 		n = wait = wait_max = cpu = build = 0;
 	}
@@ -1903,8 +1949,11 @@ m_tex_iosurface(id self, SEL cmd, IOSurfaceRef s, NSUInteger target, NSUInteger 
 		    NSUInteger, uint32_t, BOOL))orig_tex_iosurface)(self, cmd, s, target, internalformat, width,
 		    height, format, type, plane, invert);
 	}
+	uint64_t t = sgl_t0();
 	SGL_CUR(c);
-	return bind_surface(s, SGL_TGT((GLenum)target), (GLenum)format, (GLenum)type, plane, "texImageIOSurface");
+	BOOL ok = bind_surface(s, SGL_TGT((GLenum)target), (GLenum)format, (GLenum)type, plane, "texImageIOSurface");
+	sgl_t1(SLOT_TEXIOS, t);
+	return ok;
 }
 
 static BOOL
@@ -1914,8 +1963,11 @@ m_attach(id self, SEL cmd, NSUInteger target, IOSurfaceRef s, BOOL inverted)
 	if (c == NULL) {
 		return ((BOOL(*)(id, SEL, NSUInteger, IOSurfaceRef, BOOL))orig_attach)(self, cmd, target, s, inverted);
 	}
+	uint64_t t = sgl_t0();
 	SGL_CUR(c);
-	return bind_surface(s, SGL_TGT((GLenum)target), 0, 0, 0, "attachImage");
+	BOOL ok = bind_surface(s, SGL_TGT((GLenum)target), 0, 0, 0, "attachImage");
+	sgl_t1(SLOT_ATTACH, t);
+	return ok;
 }
 
 static __thread id current_eagl;

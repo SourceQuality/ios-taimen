@@ -25,6 +25,10 @@ void sgl_bind(void *rctx);
  */
 extern uint64_t sgl_gap_ticks;
 void sgl_gap(void *ra);
+/* time inside each GLI slot (every dispatch wrapper), logged every 10 s with the flush line */
+uint64_t mach_absolute_time(void);
+#define sgl_t0() mach_absolute_time()
+void sgl_t1(int slot, uint64_t t0);
 #define SGL_CUR(r) do { if (__builtin_expect(sgl_gap_ticks != 0, 1)) sgl_gap(__builtin_return_address(0)); \
 	if (__builtin_expect(sgl_current != (r), 0)) sgl_bind(r); } while (0)
 

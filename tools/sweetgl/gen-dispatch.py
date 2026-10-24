@@ -60,7 +60,19 @@ body, table, unsupported = [], [], []
 for i in range(n):
     name = slots.get(i)
     if name in special:
-        table.append('(void *)%s' % special[name])
+        if name not in protos:
+            table.append('(void *)%s' % special[name])
+            continue
+        # timed (sgl_t1) around the hand-written function, which makes rctx current itself
+        ret, params = protos[name]
+        decl = ', '.join(['void *rctx'] + params)
+        call = '%s(%s)' % (special[name], ', '.join(['rctx'] + [split(p)[1] for p in params]))
+        if ret == 'void':
+            stmt = '%s; sgl_t1(%d, t);' % (call, i)
+        else:
+            stmt = '%s r = %s; sgl_t1(%d, t); return r;' % (ret, call, i)
+        body.append('static %s w_%d(%s) { uint64_t t = sgl_t0(); %s }' % (ret, i, decl, stmt))
+        table.append('(void *)w_%d' % i)
         continue
     target = None
     if name and name in protos:
@@ -86,10 +98,10 @@ for i in range(n):
     call = '%s(%s)' % (target, args)
     decl = ', '.join(['void *rctx'] + params)
     if ret == 'void':
-        stmt = '%s; SGL_POST(%d);' % (call, i)
+        stmt = '%s; SGL_POST(%d); sgl_t1(%d, t);' % (call, i, i)
     else:
-        stmt = '%s r = %s; SGL_POST(%d); return r;' % (ret, conv(call, tret, ret), i)
-    body.append('static %s w_%d(%s) { SGL_CUR(rctx); %s }' % (ret, i, decl, stmt))
+        stmt = '%s r = %s; SGL_POST(%d); sgl_t1(%d, t); return r;' % (ret, conv(call, tret, ret), i, i)
+    body.append('static %s w_%d(%s) { uint64_t t = sgl_t0(); SGL_CUR(rctx); %s }' % (ret, i, decl, stmt))
     table.append('(void *)w_%d' % i)
 
 with open(out, 'w') as f:
