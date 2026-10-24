@@ -44,6 +44,8 @@ blobs=()
 if [ -n "${GPUFW:-}" ]; then
 	for f in pm4 pfp; do tail -c +5 "$GPUFW/a530_$f.fw" > "$out/gpu-$f.bin"; done
 	blobs+=(--blob "GPU-PM4=$out/gpu-pm4.bin" --blob "GPU-PFP=$out/gpu-pfp.bin")
+	# the zap shader for sweetgpu>=3: the .mdt (headers + hash) and its one loadable segment
+	[ -f "$GPUFW/a540_zap.mdt" ] && blobs+=(--blob "GPU-ZAP-MDT=$GPUFW/a540_zap.mdt" --blob "GPU-ZAP-SEG=$GPUFW/a540_zap.b02")
 fi
 python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline" "${blobs[@]}"
 ls -l "$out/payload" | awk '{print "payload: " $5 " bytes"}'

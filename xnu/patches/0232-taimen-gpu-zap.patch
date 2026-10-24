@@ -1,0 +1,156 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 48c4f26..d57fe28 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -112,19 +112,25 @@ void sweet_gpu_init(void);
+ #define GCC_PA          0x00300000u
+ #define MEMACC_PA       0x007af000u     /* gfx_mem_acc corner at +0x004 */
+ #define GFX_S2          0x317u
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#define ZAP_PA          0x95a00000u     /* live.dts pil_ipa_gpu_region: 1 MB, outside XNU's RAM */
++#define ZAP_META_PA     0x9ef00000u     /* splash region past SCAN0's end: below 4 GB, unused */
++#else
+ #define ZAP_PA          0x90f00000u     /* msm8996.dtsi gpu_mem, 1 MB */
++#endif
+ #define ZAP_SIZE        0x00100000u
+ #define GPU_PAS_ID      13
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ /*
+  * Taimen (Adreno 540, docs/taimen-gpu-plan.md; 0230): the GPU, its SMMU (SMMUv2, CB0 at +0x8000
+- * as on the Pixel 1) and the GPU clock controller. Power-up is taimen_power_up() below; levels
+- * above 2 still use the MSM8996 zap address and clock code, so sweetgpu is capped at 2 here.
++ * as on the Pixel 1) and the GPU clock controller. Power-up is taimen_power_up() below. Level 3
++ * (zap shader, secure-mode exit, 2D blits) has its taimen addresses since 0232; levels above it
++ * still use the MSM8996 GPU clock code, so sweetgpu is capped at 3 here.
+  */
+ #define GPU_PA          0x05000000u
+ #define SMMU_PA         0x05040000u
+ #define GPUCC_PA        0x05065000u
+-#define TAIMEN_GPU_MAX_LEVEL 2
++#define TAIMEN_GPU_MAX_LEVEL 3
+ #else
+ #define GPU_PA          0x00b00000u
+ #define SMMU_PA         0x00b40000u
+@@ -611,6 +617,23 @@ zap_load(void)
+ 		return false;
+ 	}
+ 	vm_offset_t meta_va;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * a540_zap.mdt is 6684 bytes: more than one 4K page. Like mainline (32-bit DMA mask) it goes
++	 * contiguous below 4 GB, in the free tail of the splash region; that mapping is device
++	 * memory, so it is written word by word (0232).
++	 */
++	uint64_t meta = ZAP_META_PA;
++	meta_va = mdt_len >= 0x34 && mdt_len <= 0x10000 && !(mdt_len & 3) ? ml_io_map(meta, round_page(mdt_len)) : 0;
++	if (meta_va == 0) {
++		printf("SWEET GPU: zap metadata %u bytes: unexpected size or map failed\n", mdt_len);
++		return false;
++	}
++	for (uint32_t off = 0; off < mdt_len; off += 4) {
++		wr(meta_va, off, *(const uint32_t *)(phystokv(mdt) + off));
++	}
++	const uint8_t *m = (const uint8_t *)phystokv(mdt);
++#else
+ 	uint64_t meta = gpu_page(&meta_va);
+ 	if (meta == 0 || mdt_len > PAGE_SIZE || mdt_len < 0x34) {
+ 		printf("SWEET GPU: zap metadata %u bytes, no page\n", mdt_len);
+@@ -618,9 +641,10 @@ zap_load(void)
+ 	}
+ 	memcpy((void *)meta_va, (const void *)phystokv(mdt), mdt_len);
+ 	const uint8_t *m = (const uint8_t *)meta_va;
++#endif
+ 	uint32_t phoff = *(const uint32_t *)(m + 0x1c);
+ 	uint16_t phnum = *(const uint16_t *)(m + 0x2c);
+-	uint32_t lo = ~0u, hi = 0, filesz = 0, memsz = 0, nload = 0;
++	uint32_t lo = ~0u, hi = 0, filesz = 0, memsz = 0, nload = 0, reloc = 0;
+ 	for (uint32_t i = 0; i < phnum && phoff + (i + 1) * 32 <= mdt_len; i++) {
+ 		const struct zap_phdr *ph = (const struct zap_phdr *)(m + phoff + i * 32);
+ 		/* PT_LOAD, not the hash segment (type field 2 in flags 26:24), not empty */
+@@ -632,13 +656,37 @@ zap_load(void)
+ 		hi = (ph->paddr + ph->memsz + 0xfff) & ~0xfffu;
+ 		filesz = ph->filesz;
+ 		memsz = ph->memsz;
++		reloc = (ph->flags >> 27) & 1;  /* QCOM_MDT_RELOCATABLE */
+ 	}
+ 	if (nload != 1 || filesz != seg_len || memsz > ZAP_SIZE) {
+ 		printf("SWEET GPU: zap layout unexpected: %u loadable, filesz %u seg %u memsz %u\n",
+ 		    nload, filesz, seg_len, memsz);
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* a540_zap: paddr 0x5000, memsz 0x1334, relocatable, 1 MB alignment (boot 52 notes) */
++	if (!reloc) {
++		printf("SWEET GPU: zap segment at %x is not relocatable: not supported\n", lo);
++		return false;
++	}
++	/*
++	 * XNU has made no SCM call on taimen before; PSCI over smc works, hvc resets the board. Ask
++	 * TZ first, harmlessly (docs/taimen-gpu-plan.md 3.3): INFO IS_CALL_AVAIL for PAS_INIT_IMAGE,
++	 * then PAS_IS_SUPPORTED(13). Raw x0/x1 are logged; anything but 0/1 stops here.
++	 */
++	uint64_t avail = 0, supported = 0;
++	int64_t ra = scm_call(6, 1, 1, 0x02000201ull, 0, 0, &avail);
++	int64_t rs = scm_call(2, 7, 1, GPU_PAS_ID, 0, 0, &supported);
++	printf("SWEET GPU: scm is_call_avail(pas_init_image) -> %lld/%llx, pas_is_supported(13) -> %lld/%llx\n",
++	    ra, avail, rs, supported);
++	if (ra != 0 || avail != 1 || rs != 0 || supported != 1) {
++		printf("SWEET GPU: TZ does not offer PAS for the GPU from here, stop\n");
++		return false;
++	}
++#else
++	(void)reloc;
+ 	flush_dcache64((addr64_t)meta, PAGE_SIZE, TRUE);
++#endif
+ 	uint64_t r1 = 0;
+ 	/* PAS_INIT_IMAGE (svc 2 cmd 1): args (pas id VAL, metadata RW) */
+ 	int64_t r = scm_call(2, 1, 2u | (2u << 6), GPU_PAS_ID, meta, 0, &r1);
+@@ -678,7 +726,10 @@ static void
+ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
+ {
+ 	vm_offset_t sva, d1va, d2va, d3va;
+-	uint64_t src = gpu_page(&sva), d1 = gpu_page(&d1va), d2 = gpu_page(&d2va), d3 = gpu_page(&d3va);
++	/* 64 x 64 x 4 = 16 KB each: one page on 16K, four on 4K (taimen-gpu-plan.md 2.7) */
++	const vm_size_t bytes = 64 * 256;
++	uint64_t src = gpu_alloc(&sva, bytes), d1 = gpu_alloc(&d1va, bytes), d2 = gpu_alloc(&d2va, bytes),
++	    d3 = gpu_alloc(&d3va, bytes);
+ 	if (src == 0 || d1 == 0 || d2 == 0 || d3 == 0) {
+ 		printf("SWEET GPU: no blit pages\n");
+ 		return;
+@@ -691,10 +742,10 @@ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t sc
+ 			}
+ 		}
+ 	}
+-	flush_dcache64((addr64_t)src, PAGE_SIZE, TRUE);
+-	flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
+-	flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
+-	flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)src, bytes, TRUE);
++	flush_dcache64((addr64_t)d1, bytes, TRUE);
++	flush_dcache64((addr64_t)d2, bytes, TRUE);
++	flush_dcache64((addr64_t)d3, bytes, TRUE);
+ 	uint64_t fence = scratch + 16;
+ 	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 16);
+ 	printf("SWEET GPU: blit pages src %llx dst %llx %llx %llx\n", src, d1, d2, d3);
+@@ -716,9 +767,9 @@ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t sc
+ 		bool read = kick(gpu);
+ 		delay(5000);
+ 		flush_dcache64((addr64_t)scratch, 64, TRUE);
+-		flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
+-		flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
+-		flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)d1, bytes, TRUE);
++		flush_dcache64((addr64_t)d2, bytes, TRUE);
++		flush_dcache64((addr64_t)d3, bytes, TRUE);
+ 		uint32_t bad = 0, nonzero = 0, first = ~0u;
+ 		for (uint32_t y = 0; y < 64; y++) {
+ 			for (uint32_t x = 0; x < 64; x++) {
+@@ -2417,7 +2468,7 @@ sweet_gpu_init(void)
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 	if (on > TAIMEN_GPU_MAX_LEVEL) {
+-		printf("SWEET GPU: sweetgpu=%d capped at %d on taimen (zap and clocks not ported yet)\n", on,
++		printf("SWEET GPU: sweetgpu=%d capped at %d on taimen (GPU clocks not ported yet)\n", on,
+ 		    TAIMEN_GPU_MAX_LEVEL);
+ 		on = TAIMEN_GPU_MAX_LEVEL;
+ 	}
