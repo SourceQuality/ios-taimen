@@ -26,13 +26,19 @@ migration registers them (the Pixel 1 port did the same move on the Mac before f
 Records: "RFX1", count, then {op, mode, uid, gid, path length, data length, path, data}
 (op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present, 5 as 2 with the data a
 u32 size and a zlib stream, 6 rename path to the NUL-terminated path in data, 7 list the directory
-into the log, mode its depth; 4-byte padding).
+into the log, mode its depth, 8 apply the RFX1 blob on the raw partition named by the path; 4-byte
+padding).
+
+--apps-archive OUT writes the 32 staged apps as their own blob (mkdir + create_z records into
+/Applications, ~490 MB of files): too big for the payload (ABL starts none over ~35 MiB), it goes on
+a spare partition (fastboot flash system_b OUT) and --apps-part system_b adds the op 8 record that
+has the kernel apply it (xnu 0275). Boot 109: iOS's first boot had removed the staged copies.
 """
 import argparse, os, plistlib, struct, subprocess, sys, tempfile, zlib
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
-WRITE, CREATE, MKDIR, REMOVE, CREATE_Z, RENAME, LIST = 1, 2, 3, 4, 5, 6, 7
+WRITE, CREATE, MKDIR, REMOVE, CREATE_Z, RENAME, LIST, PART = 1, 2, 3, 4, 5, 6, 7, 8
 STAGED = 'private/var/staged_system_apps'
 SEVENZIP = os.environ.get('SEVENZIP', '/mnt/c/Program Files/7-Zip/7z.exe')
 
@@ -53,6 +59,40 @@ def extract(img, paths, dest):
             sys.exit(f'{p}: not in the image')
         out[p] = open(f, 'rb').read()
     return out
+
+
+def apps_archive(img, out):
+    """The staged apps as mkdir + create_z records under /Applications (dirs 0755, Mach-O 0755, else 0644)."""
+    b = Blob()
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(out))) as tmp:
+        # 7-Zip exits 2 on one "Data Error" (MobileCal's FacetimeExtension Localizable.loctable, a
+        # 4 KB bplist in 64 KB of extents): the file comes out whole and parses, so warn and go on
+        r = subprocess.run([SEVENZIP, 'x', '-y', '-o' + winpath(tmp), winpath(img),
+                            'iOSRoot\\' + STAGED.replace('/', '\\') + '\\*', '-r'], capture_output=True)
+        if r.returncode not in (0, 2):
+            sys.exit(f'7-Zip failed ({r.returncode}): ' + r.stdout.decode('utf-8', 'replace')[-500:])
+        for line in r.stdout.decode('utf-8', 'replace').splitlines():
+            if line.startswith('ERROR:'):
+                print('7-Zip: ' + line.strip())
+        top = os.path.join(tmp, 'iOSRoot', STAGED)
+        apps = sorted(d for d in os.listdir(top) if d.endswith('.app'))
+        files = raw = 0
+        for app in apps:
+            for d, dirs, fs in os.walk(os.path.join(top, app)):
+                dirs.sort()
+                rel = os.path.relpath(d, top).replace(os.sep, '/')
+                b.add(MKDIR, f'/Applications/{rel}', b'', 0o755, 0, 0)
+                for n in sorted(fs):
+                    data = open(os.path.join(d, n), 'rb').read()
+                    exe = data[:4] in (b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe') or data[:2] == b'#!'
+                    b.add(CREATE_Z, f'/Applications/{rel}/{n}', struct.pack('<I', len(data)) + zlib.compress(data, 6),
+                          0o755 if exe else 0o644, 0, 0)
+                    files += 1
+                    raw += len(data)
+    blob = b.pack()
+    blob += b'\0' * (-len(blob) % 4096)
+    open(out, 'wb').write(blob)
+    print(f'{out}: {len(apps)} apps, {files} files ({raw >> 20} MiB), {len(b.recs)} records, {len(blob) >> 20} MiB')
 
 
 def staged_apps(img):
@@ -122,9 +162,14 @@ def main():
     ap.add_argument('--stage-apps', action='store_true')
     ap.add_argument('--list', action='append', default=[], metavar='/DIR[:DEPTH]',
                     help='log the directory (and with depth 2 its subdirectories) at boot (xnu 0271)')
+    ap.add_argument('--apps-archive', metavar='OUT', help='write the staged apps blob to OUT and stop')
+    ap.add_argument('--apps-part', metavar='PARTITION', help='apply the blob on PARTITION at boot (op 8)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     a = ap.parse_args()
+    if a.apps_archive:
+        apps_archive(a.image, a.apps_archive)
+        return
     b = Blob()
     srv = ['System/Library/Frameworks/MediaToolbox.framework/%s/SubServerConfiguration.plist' % d
            for d in ('D22', 'D221', 'Default')]
@@ -180,6 +225,8 @@ def main():
         for app in apps:
             b.add(RENAME, f'/{STAGED}/{app}', f'/Applications/{app}'.encode() + b'\0', 0o755, 0, 0)
         print(f'--stage-apps: {len(apps)} apps to /Applications: ' + ', '.join(x[:-4] for x in apps))
+    if a.apps_part:
+        b.add(PART, '/' + a.apps_part, b'', 0o644, 0, 0)
     for spec in a.list:
         d, _, depth = spec.partition(':')
         b.add(LIST, d, b'', int(depth or 1), 0, 0)

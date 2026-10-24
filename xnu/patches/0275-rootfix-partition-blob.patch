@@ -1,0 +1,195 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 2a01de2..c2ce6f8 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -7,7 +7,9 @@
+  *            length, the NUL-terminated path, the data (both padded to 4 bytes)
+  *   ops      1 write (create or replace), 2 write only if absent (prefs iOS may own later),
+  *            3 mkdir if absent, 4 remove if present, 5 as 2 from u32 size + zlib data,
+- *            6 rename, 7 list a directory into the log (mode: depth, 1 or 2);
++ *            6 rename, 7 list a directory into the log (mode: depth, 1 or 2), 8 apply the
++ *            records stored on the raw partition named by the path ("/system_b": an RFX1 blob
++ *            from offset 0, too big for the payload: mkrootfix.py --apps-archive);
+  *            owner and mode set on what was written or created; "@HOSTUUID@" in a path
+  *            is replaced by IOPlatformUUID
+  * Without the blob nothing happens. Boot-arg taimenrootfix=0 skips it.
+@@ -31,6 +33,7 @@
+ #include <uuid/uuid.h>
+ #include <libkern/zlib.h>
+ #include <kern/kalloc.h>
++#include <kern/clock.h>
+ 
+ extern vm_map_address_t phystokv(uint64_t pa);
+ extern kern_return_t IOBSDGetPlatformUUID(__darwin_uuid_t uuid, mach_timespec_t timeoutp);
+@@ -47,6 +50,7 @@ void taimen_rootfix(void);
+ #define RFX_CREATE_Z    5u      /* as RFX_CREATE; data: u32 size, then a zlib stream */
+ #define RFX_RENAME      6u      /* path -> data (a NUL-terminated path), if path exists and data does not */
+ #define RFX_LIST        7u      /* log a directory's names; mode 2 also each subdirectory's */
++#define RFX_PART        8u      /* the RFX1 blob on the partition named by the path (no nesting) */
+ 
+ /*
+  * "@HOSTUUID@" in a path becomes IOPlatformUUID (gethostuuid; from the ADT's unique-chip-id
+@@ -345,12 +349,118 @@ static const uint8_t *rootfix_blob;
+ static uint64_t rootfix_len;
+ static int rootfix_chan;
+ 
++struct rootfix_count { uint32_t done, skipped, failed; };
++
++static void
++rootfix_one(uint32_t op, uint32_t mode, uint32_t uid, uint32_t gid, const char *rawpath, const uint8_t *data,
++    uint32_t dlen, bool quiet, struct rootfix_count *c, vfs_context_t ctx)
++{
++	char pbuf[256];
++	const char *path = rootfix_path(rawpath, pbuf, sizeof(pbuf));
++	if (path == NULL) {
++		printf("TAIMEN ROOTFIX: %s: no IOPlatformUUID\n", rawpath);
++		c->failed++;
++		return;
++	}
++	int err = op == RFX_MKDIR ? rootfix_mkdir(path, mode, uid, gid, ctx) :
++	    op == RFX_RENAME ? rootfix_rename(path, data, dlen, ctx) :
++	    op == RFX_LIST ? rootfix_list(path, mode, ctx) :
++	    op == RFX_REMOVE ? rootfix_remove(path, ctx) :
++	    op == RFX_CREATE_Z ? rootfix_create_z(path, data, dlen, mode, uid, gid, ctx) :
++	    (op == RFX_WRITE || op == RFX_CREATE) ?
++	    rootfix_write(path, data, dlen, mode, uid, gid, op == RFX_CREATE, ctx) : EINVAL;
++	if (err == 0) {
++		c->done++;
++	} else if (err == EEXIST) {
++		c->skipped++;
++	} else {
++		c->failed++;
++	}
++	if (err != EEXIST && op != RFX_LIST && (!quiet || err != 0)) {
++		printf("TAIMEN ROOTFIX: %s %s (%u bytes, %o %u:%u): %s%d\n",
++		    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" :
++		    op == RFX_CREATE_Z ? "create (zlib)" : op == RFX_RENAME ? "rename" : "write",
++		    path, dlen, mode,
++		    uid, gid, err ? "error " : "ok ", err);
++	}
++}
++
++extern int sweet_ufs_part_find(const char *name, uint8_t *lun, uint64_t *first, uint64_t *nblocks);
++extern int sweet_ufs_part_read(uint8_t lun, uint64_t first, uint64_t nblocks, uint64_t off, void *dst, uint32_t len);
++
++/*
++ * RFX_PART (0275): the records of an RFX1 blob on a raw partition, read in order through
++ * sweet_ufs.c (the stock apps, ~490 MB: mkrootfix.py --apps-archive, fastboot flash system_b).
++ * Each record's data is read into its own buffer; the per-record log is only for failures.
++ */
++static int
++rootfix_part(const char *path, vfs_context_t ctx)
++{
++	uint8_t lun = 0;
++	uint64_t first = 0, nblocks = 0, off = 8;
++	uint32_t hdr[6];
++	if (sweet_ufs_part_find(path + 1, &lun, &first, &nblocks) != 0) {
++		printf("TAIMEN ROOTFIX: part %s: no such partition\n", path);
++		return ENOENT;
++	}
++	if (sweet_ufs_part_read(lun, first, nblocks, 0, hdr, 8) != 0 || hdr[0] != RFX_MAGIC) {
++		printf("TAIMEN ROOTFIX: part %s: no RFX1 blob (%#x)\n", path, hdr[0]);
++		return EINVAL;
++	}
++	uint32_t count = hdr[1];
++	struct rootfix_count c = {};
++	uint64_t t0 = mach_absolute_time(), bytes = 0;
++	printf("TAIMEN ROOTFIX: part %s: %u records on LUN %u at block %#llx\n", path, count, lun, first);
++	for (uint32_t i = 0; i < count; i++) {
++		if (sweet_ufs_part_read(lun, first, nblocks, off, hdr, sizeof(hdr)) != 0) {
++			printf("TAIMEN ROOTFIX: part %s: read error at record %u\n", path, i);
++			c.failed++;
++			break;
++		}
++		uint32_t op = hdr[0], plen = hdr[4], dlen = hdr[5];
++		uint32_t pl = (plen + 3u) & ~3u, dl = (dlen + 3u) & ~3u;
++		char rpath[1024];
++		uint8_t *data = NULL;
++		if (op == RFX_PART || plen == 0 || pl > sizeof(rpath) || dlen > (256u << 20) ||
++		    sweet_ufs_part_read(lun, first, nblocks, off + 24, rpath, pl) != 0 || rpath[plen - 1] != 0 ||
++		    rpath[0] != '/') {
++			printf("TAIMEN ROOTFIX: part %s: bad record %u at %#llx\n", path, i, off);
++			c.failed++;
++			break;
++		}
++		if (dlen != 0 && ((data = kalloc_data(dlen, Z_WAITOK)) == NULL ||
++		    sweet_ufs_part_read(lun, first, nblocks, off + 24 + pl, data, dlen) != 0)) {
++			printf("TAIMEN ROOTFIX: part %s: record %u data (%u bytes) unreadable\n", path, i, dlen);
++			if (data != NULL) {
++				kfree_data(data, dlen);
++			}
++			c.failed++;
++			break;
++		}
++		rootfix_one(op, hdr[1], hdr[2], hdr[3], rpath, data, dlen, true, &c, ctx);
++		if (data != NULL) {
++			kfree_data(data, dlen);
++		}
++		bytes += dlen;
++		off += 24 + pl + dl;
++		if ((i + 1) % 1000 == 0) {
++			printf("TAIMEN ROOTFIX: part %s: %u of %u records, %llu MB read\n", path, i + 1, count, bytes >> 20);
++		}
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("TAIMEN ROOTFIX: part %s: %u records: %u written, %u already present, %u failed; %llu MB in %llu s\n",
++	    path, count, c.done, c.skipped, c.failed, bytes >> 20, ns / 1000000000ull);
++	return c.failed != 0 ? EIO : 0;
++}
++
+ static void
+ rootfix_apply(void)
+ {
+ 	const uint8_t *b = rootfix_blob, *end = b + rootfix_len;
+ 	const uint32_t *h = (const uint32_t *)b;
+-	uint32_t count = h[1], done = 0, skipped = 0, failed = 0;
++	uint32_t count = h[1];
++	struct rootfix_count c = {};
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	const uint8_t *p = b + 8;
+ 	for (uint32_t i = 0; i < count; i++) {
+@@ -367,36 +477,16 @@ rootfix_apply(void)
+ 			printf("TAIMEN ROOTFIX: bad record %u\n", i);
+ 			break;
+ 		}
+-		char pbuf[256];
+-		const char *rawpath = path;
+-		if ((path = rootfix_path(rawpath, pbuf, sizeof(pbuf))) == NULL) {
+-			printf("TAIMEN ROOTFIX: %s: no IOPlatformUUID\n", rawpath);
+-			failed++;
++		if (op == RFX_PART) {
++			int err = rootfix_part(path, ctx);
++			c.done += err == 0;
++			c.failed += err != 0;
+ 			continue;
+ 		}
+-		int err = op == RFX_MKDIR ? rootfix_mkdir(path, mode, uid, gid, ctx) :
+-		    op == RFX_RENAME ? rootfix_rename(path, data, dlen, ctx) :
+-		    op == RFX_LIST ? rootfix_list(path, mode, ctx) :
+-		    op == RFX_REMOVE ? rootfix_remove(path, ctx) :
+-		    op == RFX_CREATE_Z ? rootfix_create_z(path, data, dlen, mode, uid, gid, ctx) :
+-		    (op == RFX_WRITE || op == RFX_CREATE) ?
+-		    rootfix_write(path, data, dlen, mode, uid, gid, op == RFX_CREATE, ctx) : EINVAL;
+-		if (err == 0) {
+-			done++;
+-		} else if (err == EEXIST) {
+-			skipped++;
+-		} else {
+-			failed++;
+-		}
+-		if (err != EEXIST && op != RFX_LIST) {
+-			printf("TAIMEN ROOTFIX: %s %s (%u bytes, %o %u:%u): %s%d\n",
+-			    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" :
+-			    op == RFX_CREATE_Z ? "create (zlib)" : op == RFX_RENAME ? "rename" : "write",
+-			    path, dlen, mode,
+-			    uid, gid, err ? "error " : "ok ", err);
+-		}
++		rootfix_one(op, mode, uid, gid, path, data, dlen, false, &c, ctx);
+ 	}
+-	printf("TAIMEN ROOTFIX: %u records: %u written, %u already present, %u failed\n", count, done, skipped, failed);
++	printf("TAIMEN ROOTFIX: %u records: %u written, %u already present, %u failed\n", count, c.done, c.skipped,
++	    c.failed);
+ }
+ 
+ /*
