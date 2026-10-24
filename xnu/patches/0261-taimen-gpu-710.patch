@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 9f71e83..999d171 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1832,6 +1832,9 @@ extern bool sweet_rpm_mx_corner(uint32_t corner);
+ static bool
+ gfx_raise(int mhz)
+ {
++	if (mhz == 710) {
++		return g_tgpu != 0 && taimen_gfx_set(g_tgpu, 710);      /* corner 8 (0261) */
++	}
+ 	return gfx_clock(mhz == 600 ? 1 : 2);      /* 596 or 414 MHz, rail and MX first */
+ }
+ #else
+@@ -2054,7 +2057,8 @@ compute_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t
+  * first when it is below it, LSB then MSB (the FTS426 may latch on the high byte; gfx3d is on XO
+  * meanwhile, so the brief in-between value is harmless), MX through the RPM above 414 MHz;
+  * mem-acc stays 0 (its setting from 414 MHz up), and the rail stays where it is when the clock
+- * goes down. No CPR, no GPMU: 596 MHz at most.
++ * goes down. No CPR, no GPMU. 670 and 710 MHz (corners 7-8, 0261): the fused open-loop voltage of
++ * the top fuse corner, 1024 mV (this phone's Linux ran 710 MHz at 988 mV closed loop), MX turbo.
+  */
+ extern bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
+ 
+@@ -2079,13 +2083,14 @@ taimen_gfx_set(vm_offset_t gpu, unsigned mhz)
+ 	} row[] = {
+ 		{257, 0x1a, 0xc555, 725, 128}, {342, 0x23, 0xa000, 775, 128}, {414, 0x2b, 0x2000, 880, 128},
+ 		{515, 0x35, 0xa555, 920, 256}, {596, 0x3e, 0x1555, 970, 256},
++		{670, 0x45, 0xcaaa, 1024, 384}, {710, 0x49, 0xf555, 1024, 384},
+ 	};
+ 	unsigned r = 0;
+ 	while (r < sizeof(row) / sizeof(row[0]) && row[r].mhz != mhz) {
+ 		r++;
+ 	}
+ 	if (r == sizeof(row) / sizeof(row[0])) {
+-		printf("SWEET GPU: no %u MHz row (257, 342, 414, 515, 596)\n", mhz);
++		printf("SWEET GPU: no %u MHz row (257, 342, 414, 515, 596, 670, 710)\n", mhz);
+ 		return false;
+ 	}
+ 	vm_offset_t cc = g_gpucc != 0 ? g_gpucc : (g_gpucc = ml_io_map(GPUCC_PA, 0x2000));
+@@ -2361,7 +2366,7 @@ cp_test(vm_offset_t gpu, int level)
+ 			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
+ 			g_max_mhz = 300;
+ 			uint64_t us300 = quad_bench();
+-			if (mhz == 400 || mhz == 600) {
++			if (mhz == 400 || mhz == 600 || mhz == 710) {
+ 				lck_mtx_lock(&sweet_gpu_vm_lock);
+ 				bool ok = gfx_raise(mhz);
+ 				lck_mtx_unlock(&sweet_gpu_vm_lock);
