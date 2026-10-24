@@ -3,7 +3,7 @@
 boot, before launchd (xnu 0210, bsd/kern/taimen_rootfix.c). The Pixel 1 port's root tweaks
 (tools/sweet-root-tweaks.py) without reflashing userdata or writing HFS+ on the PC.
 
-  mkrootfix.py ROOT.img OUT.bin [--migrate] [--file /DEST=SRC ...] [--zfile /DEST=SRC ...]
+  mkrootfix.py ROOT.img OUT.bin [--migrate] [--stage-apps] [--file /DEST=SRC ...] [--zfile /DEST=SRC ...]
 
 ROOT.img is the raw root image (tools/simg2img.py of what was flashed); the original files the
 tweaks edit are read from it with 7-Zip (7z.exe on Windows reads HFS+). Without --migrate the
@@ -17,17 +17,22 @@ no boot rewrites a library a process may be loading (the records apply after lau
 the root read-write, when backboardd starts). Such a blob is for the boot that installs the
 file; later boots keep the small one: ABL starts no payload over ~35 MiB (boot 78), and a
 development kernel takes ~17 MB of it. --zfile is --file zlib-compressed (op 5, xnu 0245; the
-19 MB sweetgl dylib goes in at about a third).
+19 MB sweetgl dylib goes in at about a third). --stage-apps moves every stock app iOS stages in
+/private/var/staged_system_apps (32 in 20H392: Calculator, Calendar, Clock, Maps, Notes, Weather,
+...) to /Applications (op 6, xnu 0262): iOS's own first-boot install of them fails on code signing
+here, so only the apps already in /Applications showed. Pair it with --migrate once, so the data
+migration registers them (the Pixel 1 port did the same move on the Mac before flashing).
 
 Records: "RFX1", count, then {op, mode, uid, gid, path length, data length, path, data}
 (op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present, 5 as 2 with the data a
-u32 size and a zlib stream; 4-byte padding).
+u32 size and a zlib stream, 6 rename path to the NUL-terminated path in data; 4-byte padding).
 """
 import argparse, os, plistlib, struct, subprocess, sys, tempfile, zlib
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
-WRITE, CREATE, MKDIR, REMOVE, CREATE_Z = 1, 2, 3, 4, 5
+WRITE, CREATE, MKDIR, REMOVE, CREATE_Z, RENAME = 1, 2, 3, 4, 5, 6
+STAGED = 'private/var/staged_system_apps'
 SEVENZIP = os.environ.get('SEVENZIP', '/mnt/c/Program Files/7-Zip/7z.exe')
 
 
@@ -47,6 +52,18 @@ def extract(img, paths, dest):
             sys.exit(f'{p}: not in the image')
         out[p] = open(f, 'rb').read()
     return out
+
+
+def staged_apps(img):
+    """The .app bundles directly under /private/var/staged_system_apps in the image."""
+    out = subprocess.run([SEVENZIP, 'l', winpath(img)], check=True, capture_output=True).stdout
+    prefix = 'iOSRoot\\' + STAGED.replace('/', '\\') + '\\'
+    apps = set()
+    for line in out.decode('utf-8', 'replace').splitlines():
+        name = line.rstrip('\r').split(' ')[-1]
+        if name.startswith(prefix) and name.endswith('.app') and '\\' not in name[len(prefix):]:
+            apps.add(name[len(prefix):])
+    return sorted(apps)
 
 
 class Blob:
@@ -101,6 +118,7 @@ def main():
     ap.add_argument('image')
     ap.add_argument('out')
     ap.add_argument('--migrate', action='store_true')
+    ap.add_argument('--stage-apps', action='store_true')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     a = ap.parse_args()
@@ -152,6 +170,13 @@ def main():
              {'LockdownActivationIndicatesCloudConfigurationAvailable': False})):
         b.plist(WRITE, f'{prefs}/{name}.plist', values, 0o600, MOBILE, MOBILE)
 
+    if a.stage_apps:
+        apps = staged_apps(a.image)
+        if not apps:
+            sys.exit('--stage-apps: no .app under /' + STAGED + ' in the image')
+        for app in apps:
+            b.add(RENAME, f'/{STAGED}/{app}', f'/Applications/{app}'.encode() + b'\0', 0o755, 0, 0)
+        print(f'--stage-apps: {len(apps)} apps to /Applications: ' + ', '.join(x[:-4] for x in apps))
     for f in a.file:
         dest, src = f.split('=', 1)
         assert dest.startswith('/'), dest

@@ -1,0 +1,85 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index b2b854e..8d69a11 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -33,6 +33,7 @@
+ extern vm_map_address_t phystokv(uint64_t pa);
+ extern kern_return_t IOBSDGetPlatformUUID(__darwin_uuid_t uuid, mach_timespec_t timeoutp);
+ extern int taimen_mkdir(const char *path, int mode, vfs_context_t ctx);   /* vfs_syscalls.c */
++extern int taimen_rename(const char *from, const char *to, vfs_context_t ctx);
+ extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
+ void taimen_rootfix(void);
+ 
+@@ -42,6 +43,7 @@ void taimen_rootfix(void);
+ #define RFX_MKDIR       3u
+ #define RFX_REMOVE      4u
+ #define RFX_CREATE_Z    5u      /* as RFX_CREATE; data: u32 size, then a zlib stream */
++#define RFX_RENAME      6u      /* path -> data (a NUL-terminated path), if path exists and data does not */
+ 
+ /*
+  * "@HOSTUUID@" in a path becomes IOPlatformUUID (gethostuuid; from the ADT's unique-chip-id
+@@ -215,6 +217,29 @@ rootfix_remove(const char *path, vfs_context_t ctx)
+ 	return unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+ }
+ 
++/*
++ * RFX_RENAME (0262): move path to the path in data, if path exists and the target does not. The
++ * stock apps iOS stages in /private/var/staged_system_apps (its first-boot install of them fails
++ * on code signing here) go to /Applications this way (mkrootfix.py --stage-apps).
++ */
++static int
++rootfix_rename(const char *path, const uint8_t *data, uint32_t dlen, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	if (dlen < 2 || data[dlen - 1] != 0) {
++		return EINVAL;
++	}
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return EEXIST;                  /* nothing to move: skipped */
++	}
++	vnode_put(vp);
++	if (vnode_lookup((const char *)data, 0, &vp, ctx) == 0) {
++		vnode_put(vp);
++		return EEXIST;                  /* already there: skipped */
++	}
++	return taimen_rename(path, (const char *)data, ctx);
++}
++
+ static const uint8_t *rootfix_blob;
+ static uint64_t rootfix_len;
+ static int rootfix_chan;
+@@ -249,6 +274,7 @@ rootfix_apply(void)
+ 			continue;
+ 		}
+ 		int err = op == RFX_MKDIR ? rootfix_mkdir(path, mode, uid, gid, ctx) :
++		    op == RFX_RENAME ? rootfix_rename(path, data, dlen, ctx) :
+ 		    op == RFX_REMOVE ? rootfix_remove(path, ctx) :
+ 		    op == RFX_CREATE_Z ? rootfix_create_z(path, data, dlen, mode, uid, gid, ctx) :
+ 		    (op == RFX_WRITE || op == RFX_CREATE) ?
+@@ -263,7 +289,7 @@ rootfix_apply(void)
+ 		if (err != EEXIST) {
+ 			printf("TAIMEN ROOTFIX: %s %s (%u bytes, %o %u:%u): %s%d\n",
+ 			    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" :
+-			    op == RFX_CREATE_Z ? "create (zlib)" : "write",
++			    op == RFX_CREATE_Z ? "create (zlib)" : op == RFX_RENAME ? "rename" : "write",
+ 			    path, dlen, mode,
+ 			    uid, gid, err ? "error " : "ok ", err);
+ 		}
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 5756246..9ebf08e 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14592,4 +14592,13 @@ taimen_mkdir(const char *path, int mode, vfs_context_t ctx)
+ 	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
+ 	return mkdir1at(ctx, CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
+ }
++
++/* bsd/kern/taimen_rootfix.c: rename with kernel-space paths (renameat_internal is static). */
++int taimen_rename(const char *from, const char *to, vfs_context_t ctx);
++int
++taimen_rename(const char *from, const char *to, vfs_context_t ctx)
++{
++	return renameat_internal(ctx, AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD, CAST_USER_ADDR_T(to),
++	           UIO_SYSSPACE, 0);
++}
+ #endif

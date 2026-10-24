@@ -47,10 +47,15 @@ if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 	TAIMEN_BASE=${TAIMEN_BASE:-0xb1000000}
 	TAIMEN_MEM=${TAIMEN_MEM:-0xbd400000}
 	GPUFW=${GPUFW:-$P/../research/taimen/firmware}
-	if [ -n "${ROOTFIX:-}" ] && [ "$(realpath "$ROOTFIX")" != "$(realpath "$SWEETGL_ROOTFIX")" ]; then
-		echo "GPU boot: ROOTFIX $SWEETGL_ROOTFIX (installs $SWEETGL_LIB) instead of $ROOTFIX" >&2
+	# ROOTFIX_KEEP=1: this ROOTFIX as given (the dylib already on the phone; e.g. --stage-apps --migrate)
+	if [ "${ROOTFIX_KEEP:-0}" = 1 ] && [ -n "${ROOTFIX:-}" ]; then
+		echo "GPU boot: ROOTFIX $ROOTFIX as given (ROOTFIX_KEEP=1; $SWEETGL_LIB must be on the phone)" >&2
+	else
+		if [ -n "${ROOTFIX:-}" ] && [ "$(realpath "$ROOTFIX")" != "$(realpath "$SWEETGL_ROOTFIX")" ]; then
+			echo "GPU boot: ROOTFIX $SWEETGL_ROOTFIX (installs $SWEETGL_LIB) instead of $ROOTFIX" >&2
+		fi
+		ROOTFIX=$SWEETGL_ROOTFIX
 	fi
-	ROOTFIX=$SWEETGL_ROOTFIX
 	args="sweetgpu=8 sweetgpuclk=600 taimengpucopy=1 taimengpuheap=256 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB sweetnull=backboardd ${args}"
 	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), RAM ${TAIMEN_BASE:-0x100000000} + $TAIMEN_MEM"
 fi
