@@ -1,0 +1,12 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 85365fd..d41a6f9 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -34,6 +34,7 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/errno.h>
++#include <sys/param.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void taimen_modem_init(void);
