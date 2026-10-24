@@ -548,3 +548,24 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   IOMFBServer threads idle in mach_msg and the Mesa queue threads idle in pthread_cond_wait at every sample. Boot 60
   (display surfaces failing to bind) flushed 37-60 frames/s, so the gate came with rendering into the imported
   display surfaces.
+- 2026-10-23 boot 65 (r60, boot 64 plus the PC profiler on backboardd, swipes every 10 s): first try refused (boot-args
+  640 bytes; boot-xnu.sh now drops overridden keys, XNU takes the last occurrence) and autoboot then waited 14 min for
+  a reader that never came (fixed: it stops when boot-xnu.sh did not boot). The real boot: **sweetgl refused 17
+  EAGLContexts before the GPU service was up** (service ready at log line 2668, backboardd loaded sweetgl at 925) and
+  CA kept its **software renderer** for the display: the profile (tools/sweetgl/prof-sym.py, shared cache through
+  dsc-sym.py) is CA::OGL::SW (scanline, image_sampler, SWContext::draw_elements, GaussianBlurFilter) plus kernel
+  workqueue park/unpark and ticket-lock contention; backboardd 54-84 % CPU for ~0.7 swaps/s on the home screen.
+  (Boot 62's 10-20 swaps/s were in Settings, which the unlock swipe brought back: not the same scene.) Fixed in
+  sweetgl 5c9d70c/57ebaea: the first context waits for the service (SWEETGL_WAIT, default 60 s).
+- 2026-10-23 boot 66 (sweetgl b15f7dc: GL-call gaps over 50 ms logged with frame-pointer backtraces): Mesa drew
+  (API 3); 0.6-1.2 flushes/s, glFinish 5-17 ms, **frame build 100-340 ms** from the first GL call to the flush, with
+  no gap over 50 ms inside the display frames and backboardd at 7-12 % CPU: the time is spread over GL calls that
+  block. Every frame after a pause starts in CA::WindowServer::IOMFBDisplay::can_update_ <- Server::render_for_time
+  <- IOMFBServer::vsync_callback <- display_timer_callback: CA paces itself with its own display timer (it never
+  enables our IOMFB vsync notifications, selector 72) and can_update_ polls IOMobileFramebufferSwapWait on the
+  earlier swaps (our selector 6 returns at once). A second thread (CA::Render::Server::server_thread ->
+  _XRenderDisplayLayerSurface -> EAGLServer::render_surface, SpringBoard's snapshots into the 13.9 MB b3a8 surface
+  it creates on every swipe) stalls 600-730 ms before the glGenTextures of GLESContext::make_buffer_current.
+  tools/sweetgl/dsc-dis.py disassembles shared-cache functions (binutils objdump) with call targets named.
+- 2026-10-24 boot 67 (sweetgl 57ebaea, the GPU wait): "GPU service up after 7125 ms of waiting", no context
+  refused, Mesa from the first frame; otherwise as boot 66 (0.6-1.2 flushes/s).
