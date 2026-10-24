@@ -1,0 +1,946 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 99f9d34..a625a3d 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -25,6 +25,7 @@
+  *   the carve-out: nothing in XNU touches it again before a reset.
+  * M4 (0269): MPSS authenticated and running, the modem's SMP2P err-ready (see m4()).
+  * M5 (0272): GLINK over SMEM and QRTR on the IPCRTR channel, inside M4's watch (see glink_start()).
++ * M6 (0274): the host services the modem asks APPS for: rmtfs, pd-mapper, tftp (see svc_rx()).
+  * SMEM structures and lookups from ios-topaz TopazModem.cpp (0113), plus the v11 global heap.
+  * SMEM is mapped write-combined (Normal NC): no cache upkeep, unaligned reads are fine.
+  */
+@@ -460,20 +461,118 @@ fat_entry_file(const struct fat *f, const uint8_t *e, struct fat_file *out)
+ 	out->dir = (e[11] & 0x10) != 0;
+ }
+ 
++/* name as a short name: at most 8 + 3 characters and one dot */
++static bool
++fat_is_83(const char *name)
++{
++	const char *dot = strchr(name, '.');
++	size_t n = strlen(name);
++	return dot == NULL ? n <= 8 : (size_t)(dot - name) <= 8 && n - (size_t)(dot - name) - 1 <= 3 &&
++	       strchr(dot + 1, '.') == NULL;
++}
++
++static bool
++fat_name_eq(const char *a, const char *b)
++{
++	for (; *a != 0 && *b != 0; a++, b++) {
++		char x = *a >= 'a' && *a <= 'z' ? (char)(*a - 32) : *a, y = *b >= 'a' && *b <= 'z' ? (char)(*b - 32) : *b;
++		if (x != y) {
++			return false;
++		}
++	}
++	return *a == *b;
++}
++
++/*
++ * name in dir (NULL: the root), case-insensitive: the VFAT long name collected from the entries
++ * before each short entry (13 UCS-2 characters each, ASCII kept), else the 8.3 name.
++ */
+ static bool
+ fat_lookup(struct fat *f, const struct fat_file *dir, const char *name, struct fat_file *out)
+ {
+-	char want[11];
++	static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
++	struct fat_file root = { f->bits == 16 ? 0 : f->root_clus, f->bits == 16 ? f->root_ents * 32u : 0, true };
++	const struct fat_file *d = dir != NULL ? dir : &root;
++	char want[11], lfn[256];
+ 	uint8_t e[32];
+-	int r;
++	bool short_ok = fat_is_83(name), lfn_ok = false;
+ 	fat_83(name, want);
+-	for (uint32_t i = 0; (r = fat_dir_entry(f, dir, i, e)) >= 0; i++) {
+-		if (r == 1 && memcmp(e, want, 11) == 0) {
++	for (uint32_t i = 0;; i++) {
++		uint64_t off = (uint64_t)i * 32;
++		if (off >= (d->size != 0 ? d->size : 0x100000u) || fat_read(f, d, off, e, 32) != 0 || e[0] == 0) {
++			return false;
++		}
++		if (e[0] == 0xE5) {
++			lfn_ok = false;
++			continue;
++		}
++		if ((e[11] & 0x3F) == 0x0F) {
++			unsigned seq = e[0] & 0x1F;
++			if (e[0] & 0x40) {
++				bzero(lfn, sizeof(lfn));
++				lfn_ok = true;
++			}
++			if (seq == 0 || seq > 19) {
++				lfn_ok = false;
++				continue;
++			}
++			for (unsigned k = 0; k < 13; k++) {
++				uint16_t c = (uint16_t)(e[pos[k]] | e[pos[k] + 1] << 8);
++				if (c == 0 || c == 0xFFFF) {
++					break;
++				}
++				lfn[(seq - 1) * 13 + k] = c < 0x80 ? (char)c : '?';
++			}
++			continue;
++		}
++		if (e[11] & 0x08) {                     /* volume label */
++			lfn_ok = false;
++			continue;
++		}
++		bool match = (short_ok && memcmp(e, want, 11) == 0) || (lfn_ok && fat_name_eq(lfn, name));
++		lfn_ok = false;
++		if (match) {
+ 			fat_entry_file(f, e, out);
+ 			return true;
+ 		}
+ 	}
+-	return false;
++}
++
++/* a/b/c from the root */
++static bool
++fat_open_path(struct fat *f, const char *path, struct fat_file *out)
++{
++	struct fat_file cur = {}, next = {};
++	bool at_root = true;
++	char comp[128];
++	while (*path == '/') {
++		path++;
++	}
++	while (*path != 0) {
++		size_t n = 0;
++		while (path[n] != 0 && path[n] != '/') {
++			n++;
++		}
++		if (n == 0 || n >= sizeof(comp) || (!at_root && !cur.dir)) {
++			return false;
++		}
++		memcpy(comp, path, n);
++		comp[n] = 0;
++		if (!fat_lookup(f, at_root ? NULL : &cur, comp, &next)) {
++			return false;
++		}
++		cur = next;
++		at_root = false;
++		path += n;
++		while (*path == '/') {
++			path++;
++		}
++	}
++	if (at_root) {
++		return false;
++	}
++	*out = cur;
++	return true;
+ }
+ 
+ /* ---------------------------------------------------------------- milestones */
+@@ -1040,6 +1139,10 @@ static bool q_hello_sent, q_hello_rx;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
++static bool m6_on, q_announced;
++static bool svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len);
++static void svc_announce(void);
++static void svc_summary(void);
+ 
+ static void
+ glink_kick(void)
+@@ -1183,9 +1286,18 @@ glink_try_send(const void *data, uint32_t len)
+ 		}
+ 		return false;
+ 	}
+-	struct glink_data_hdr h = { { CMD_TX_DATA, CHAN_LCID, g_ri[i].id }, len, 0 };
+ 	g_ri[i].used = true;
+-	return tx_write(&h, sizeof(h), data, len);
++	for (uint32_t off = 0; off < len;) {
++		uint32_t chunk = MIN(len - off, 0x2000u);
++		struct glink_data_hdr h = { { (uint16_t)(off == 0 ? CMD_TX_DATA : CMD_TX_DATA_CONT), CHAN_LCID, g_ri[i].id },
++			                    chunk, len - off - chunk };
++		if (!tx_write(&h, sizeof(h), (const uint8_t *)data + off, chunk)) {
++			LOG("M5: t=%u ms: glink TX of %u bytes cut at %u", g_ms, len, off);
++			break;                          /* never resent: the modem drops the partial message */
++		}
++		off += chunk;
++	}
++	return true;
+ }
+ 
+ /* packets wait here until the modem has a free RX intent for them */
+@@ -1221,11 +1333,13 @@ glink_send(const void *data, uint32_t len)
+ static void
+ qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
+ {
+-	uint8_t buf[sizeof(struct qrtr_hdr_v1) + 512] = {};
++	uint32_t cap = (uint32_t)sizeof(struct qrtr_hdr_v1) + len + 4;
++	uint8_t *buf = (uint8_t *)IOMalloc(cap);
+ 	uint32_t n;
+-	if (len > 512) {
++	if (buf == NULL) {
+ 		return;
+ 	}
++	bzero(buf, cap);
+ 	if (q_ver == 2) {
+ 		struct qrtr_hdr_v2 *h = (struct qrtr_hdr_v2 *)buf;
+ 		h->version = 2;
+@@ -1251,6 +1365,7 @@ qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port
+ 	}
+ 	memcpy(buf + n, payload, len);
+ 	glink_send(buf, (n + len + 3) & ~3u);
++	IOFree(buf, cap);
+ }
+ 
+ static const char *
+@@ -1276,16 +1391,16 @@ svc_name(uint32_t svc)
+ static void
+ qrtr_rx(const uint8_t *p, uint32_t len)
+ {
+-	uint32_t type, src_node, src_port, dst_port, hlen, confirm;
++	uint32_t type, src_node, src_port, dst_port, hlen, confirm, size;
+ 	if (len >= sizeof(struct qrtr_hdr_v1) && *(const uint32_t *)p == 1) {
+ 		const struct qrtr_hdr_v1 *h = (const struct qrtr_hdr_v1 *)p;
+ 		type = h->type; src_node = h->src_node; src_port = h->src_port;
+-		dst_port = h->dst_port; hlen = sizeof(*h); confirm = h->confirm_rx;
++		dst_port = h->dst_port; hlen = sizeof(*h); confirm = h->confirm_rx; size = h->size;
+ 		q_ver = 1;
+ 	} else if (len >= sizeof(struct qrtr_hdr_v2) && p[0] == 2) {
+ 		const struct qrtr_hdr_v2 *h = (const struct qrtr_hdr_v2 *)p;
+ 		type = h->type; src_node = h->src_node; src_port = h->src_port;
+-		dst_port = h->dst_port; hlen = sizeof(*h) + h->optlen * 4;
++		dst_port = h->dst_port; hlen = sizeof(*h) + h->optlen * 4; size = h->size;
+ 		src_port = src_port == 0xFFFE ? QRTR_PORT_CTRL : src_port;
+ 		dst_port = dst_port == 0xFFFE ? QRTR_PORT_CTRL : dst_port;
+ 		confirm = h->flags & 1;
+@@ -1319,8 +1434,10 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
+ 			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
+ 		}
+-		LOG("M5: t=%u ms: qrtr DATA %u bytes from %u:%#x to port %#x (no service of ours yet)", g_ms,
+-		    len - hlen, src_node, src_port, dst_port);
++		if (!m6_on || hlen + size > len || !svc_rx(src_node, src_port, dst_port, p + hlen, size)) {
++			LOG("M5: t=%u ms: qrtr DATA %u bytes from %u:%#x to port %#x (no service of ours there)", g_ms,
++			    len - hlen, src_node, src_port, dst_port);
++		}
+ 		break;
+ 	case QRTR_TYPE_RESUME_TX:
+ 		q_resumes++;
+@@ -1530,6 +1647,10 @@ glink_poll(struct smem_part_hdr *part, unsigned ms)
+ 		qrtr_send(QRTR_TYPE_HELLO, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
+ 		q_hello_sent = true;
+ 		LOG("M5: t=%u ms: sent qrtr HELLO to node %#x", ms, q_modem_node);
++		if (m6_on && q_hello_rx && !q_announced) {
++			svc_announce();
++			q_announced = true;
++		}
+ 	}
+ 	/* nobody opened IPCRTR after 2 s: open it from our side */
+ 	if (ms >= 2000 && !g_open_sent && g_rx != NULL) {
+@@ -1544,9 +1665,674 @@ glink_summary(void)
+ 	LOG("M5: glink rx %u msgs, tx %u, IPCRTR %s, modem intents %u, txq %u drops %u; qrtr node %#x hello %u, "
+ 	    "%u services, %u RESUME_TX", g_rx_msgs, g_tx_msgs, chan_up() ? "UP" : "down", g_ri_count,
+ 	    g_txq_tail - g_txq_head, g_txq_drops, q_modem_node, q_hello_rx, q_srv_count, q_resumes);
++	if (m6_on) {
++		svc_summary();
++	}
+ 	return chan_up() && q_hello_rx && q_srv_count > 0;
+ }
+ 
++/* ---------------------------------------------------------------- M6: host services */
++
++/*
++ * M6 (0274): what the modem expects from APPS (the linux-msm daemons; plan stage 7), port of
++ * ios-topaz 0121 on top of the FAT walker instead of a generated file table:
++ *  - pd-mapper: QMI servreg-locator 0x40 v0x101, "wlan/fw" etc. to msm/modem/{root,wlan}_pd 180;
++ *  - tftp (QRTR service 4096): /readonly/firmware/image/... from modem_a, read only; /readwrite/...
++ *    kept in RAM for the session (topaz: dropped writes starve modem_cfg);
++ *  - rmtfs (QMI 14): the EFS from modemst1/modemst2/fsc/fsg through a 2 MB pool buffer (DTS
++ *    rmtfs_sharedmem: dynamic, 2 MB) given to {HLOS, MSS_MSA}. Writes are not persisted.
++ * Without rmtfs the modem err-fatals ~40 s after boot (plan, flame lesson 3).
++ */
++#define PORT_PDM                0x4001
++#define PORT_TFTP               0x4002
++#define PORT_RMTFS              0x4003
++#define PORT_SESS               0x4100
++#define QMI_REQ                 0
++#define QMI_RESP                2
++
++/* QMI */
++struct qmsg { uint8_t b[512]; uint32_t n; };
++
++static void
++qm_init(struct qmsg *m, uint16_t txn, uint16_t msg)
++{
++	m->b[0] = QMI_RESP;
++	memcpy(m->b + 1, &txn, 2);
++	memcpy(m->b + 3, &msg, 2);
++	m->n = 7;
++}
++
++static void
++qm_tlv(struct qmsg *m, uint8_t type, const void *v, uint16_t len)
++{
++	if (m->n + 3 + len > sizeof(m->b)) {
++		return;
++	}
++	m->b[m->n] = type;
++	memcpy(m->b + m->n + 1, &len, 2);
++	memcpy(m->b + m->n + 3, v, len);
++	m->n += 3 + len;
++}
++
++static void
++qm_result(struct qmsg *m, bool ok)
++{
++	uint16_t r[2] = { (uint16_t)(ok ? 0 : 1), (uint16_t)(ok ? 0 : 1) };
++	qm_tlv(m, 2, r, 4);
++}
++
++static void
++qm_send(struct qmsg *m, uint32_t src_port, uint32_t node, uint32_t port)
++{
++	uint16_t l = (uint16_t)(m->n - 7);
++	memcpy(m->b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, m->b, m->n);
++}
++
++static const uint8_t *
++qm_find(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
++{
++	uint32_t o = 7;
++	while (o + 3 <= len) {
++		uint16_t l;
++		memcpy(&l, d + o + 1, 2);
++		if (o + 3 + l > len) {
++			break;
++		}
++		if (d[o] == type) {
++			*tlen = l;
++			return d + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++static void
++qm_string(const uint8_t *d, uint32_t len, uint8_t type, char *out, size_t max)
++{
++	uint16_t l = 0;
++	const uint8_t *v = qm_find(d, len, type, &l);
++	out[0] = 0;
++	if (v != NULL) {
++		l = (uint16_t)MIN((size_t)l, max - 1);
++		memcpy(out, v, l);
++		out[l] = 0;
++	}
++}
++
++/* pd-mapper */
++static const struct { const char *svc, *domain; } pd_map[] = {
++	{ "tms/servreg",       "msm/modem/root_pd" },
++	{ "tms/pdr_enabled",   "msm/modem/root_pd" },
++	{ "gps/gps_service",   "msm/modem/root_pd" },
++	{ "kernel/elf_loader", "msm/modem/wlan_pd" },
++	{ "tms/servreg",       "msm/modem/wlan_pd" },
++	{ "wlan/fw",           "msm/modem/wlan_pd" },
++};
++static unsigned pd_reqs;
++
++static void
++pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	struct qmsg m;
++	char name[80];
++	uint8_t list[256];
++	uint32_t n = 1, cnt = 0;
++	uint16_t v;
++	qm_init(&m, txn, msg);
++	if (msg != 0x21) {                      /* PFR etc.: just say OK */
++		LOG("M6: t=%u ms: pd-mapper: msg %#x", g_ms, msg);
++		qm_result(&m, true);
++		qm_send(&m, PORT_PDM, node, port);
++		return;
++	}
++	qm_string(d, len, 1, name, sizeof(name));
++	for (unsigned i = 0; i < sizeof(pd_map) / sizeof(pd_map[0]); i++) {
++		if (strcmp(pd_map[i].svc, name) == 0) {
++			uint32_t dl = (uint32_t)strlen(pd_map[i].domain), inst = 180, zero = 0;
++			list[n++] = (uint8_t)dl;
++			memcpy(list + n, pd_map[i].domain, dl);
++			n += dl;
++			memcpy(list + n, &inst, 4);
++			n += 4;
++			list[n++] = 0;                  /* service_data_valid */
++			memcpy(list + n, &zero, 4);
++			n += 4;
++			cnt++;
++		}
++	}
++	list[0] = (uint8_t)cnt;
++	qm_result(&m, true);
++	v = (uint16_t)cnt;
++	qm_tlv(&m, 0x10, &v, 2);
++	v = 1;
++	qm_tlv(&m, 0x11, &v, 2);
++	if (cnt != 0) {
++		qm_tlv(&m, 0x12, list, (uint16_t)n);
++	}
++	qm_send(&m, PORT_PDM, node, port);
++	pd_reqs++;
++	LOG("M6: t=%u ms: pd-mapper: \"%s\" -> %u domain(s)", g_ms, name, cnt);
++}
++
++/* tftp (tqftpserv) */
++#define OP_RRQ   1
++#define OP_WRQ   2
++#define OP_DATA  3
++#define OP_ACK   4
++#define OP_ERROR 5
++#define OP_OACK  6
++
++struct tftp_sess {
++	bool used, write;
++	uint32_t port, node, rport;
++	struct fat_file ff;                     /* the modem_a file (rw < 0) */
++	int rw;                                 /* /readwrite file in RAM, -1 = none */
++	uint64_t size, sent;
++	uint32_t blk, rsize, wsize, seek;
++};
++static struct tftp_sess sess[16];
++static uint32_t next_sess_port = PORT_SESS;
++static unsigned tftp_reqs, tftp_missing, tftp_writes;
++
++struct rw_file { char path[96]; uint8_t *data; uint32_t size, cap; };
++static struct rw_file rw_files[12];
++
++static int
++rw_find(const char *path, bool create)
++{
++	for (int i = 0; i < 12; i++) {
++		if (rw_files[i].path[0] != 0 && strcmp(rw_files[i].path, path) == 0) {
++			return i;
++		}
++	}
++	for (int i = 0; create && i < 12; i++) {
++		if (rw_files[i].path[0] == 0) {
++			strlcpy(rw_files[i].path, path, sizeof(rw_files[i].path));
++			return i;
++		}
++	}
++	return -1;
++}
++
++static bool
++rw_write(int r, uint64_t off, const uint8_t *src, uint32_t n)
++{
++	struct rw_file *f = &rw_files[r];
++	uint64_t end = off + n;
++	if (off > 0x100000 || n > 0x100000) {
++		return false;
++	}
++	if (end > f->cap) {
++		uint32_t cap = (uint32_t)MAX(end, (uint64_t)f->cap * 2);
++		uint8_t *d = (uint8_t *)IOMalloc(cap);
++		if (d == NULL) {
++			return false;
++		}
++		bzero(d, cap);
++		if (f->data != NULL) {
++			memcpy(d, f->data, f->size);
++			IOFree(f->data, f->cap);
++		}
++		f->data = d;
++		f->cap = cap;
++	}
++	memcpy(f->data + off, src, n);
++	f->size = (uint32_t)MAX((uint64_t)f->size, end);
++	return true;
++}
++
++static void
++tftp_send(struct tftp_sess *s, const void *p, uint32_t len)
++{
++	qrtr_send(QRTR_TYPE_DATA, s->port, s->node, s->rport, p, len);
++}
++
++static void
++tftp_error(struct tftp_sess *s, uint16_t code, const char *msg)
++{
++	uint8_t b[64] = { 0, OP_ERROR, (uint8_t)(code >> 8), (uint8_t)code };
++	uint32_t l = (uint32_t)strlcpy((char *)b + 4, msg, sizeof(b) - 4) + 1;
++	tftp_send(s, b, 4 + l);
++}
++
++static void
++tftp_close(struct tftp_sess *s)
++{
++	bzero(s, sizeof(*s));
++}
++
++static bool
++tftp_data(struct tftp_sess *s, uint32_t block, uint64_t offset, uint32_t resp_size)
++{
++	uint8_t *b = (uint8_t *)IOMalloc(s->blk + 4);
++	uint32_t n = s->blk, send;
++	if (b == NULL) {
++		return false;
++	}
++	b[0] = 0; b[1] = OP_DATA; b[2] = (uint8_t)(block >> 8); b[3] = (uint8_t)block;
++	if (offset >= s->size) {
++		n = 0;
++	} else {
++		n = (uint32_t)MIN((uint64_t)n, s->size - offset);
++		if (s->rw >= 0) {
++			memcpy(b + 4, rw_files[s->rw].data + offset, n);
++		} else if (fat_read(&modem_fs, &s->ff, offset, b + 4, n) != 0) {
++			LOG("M6: tftp sess %#x: read FAILED at %llu", s->port, offset);
++			IOFree(b, s->blk + 4);
++			tftp_error(s, 0, "Read error");
++			return false;
++		}
++	}
++	send = 4 + n;
++	if (resp_size != 0) {
++		if (4 + resp_size > send) {
++			IOFree(b, s->blk + 4);
++			return false;
++		}
++		send = 4 + resp_size;
++	}
++	tftp_send(s, b, send);
++	s->sent += send - 4;
++	IOFree(b, s->blk + 4);
++	return true;
++}
++
++static char *
++tftp_opt(char *p, char *end, const char *name, uint64_t val)
++{
++	char num[24];
++	snprintf(num, sizeof(num), "%llu", val);
++	size_t a = strlen(name) + 1, b = strlen(num) + 1;
++	if (p + a + b > end) {
++		return p;
++	}
++	memcpy(p, name, a);
++	memcpy(p + a, num, b);
++	return p + a + b;
++}
++
++/* the modem's path -> a modem_a path: /readonly/firmware/image/x -> image/x */
++static const char *
++tftp_map(const char *path)
++{
++	static const char *pre[] = {
++		"/readonly/firmware/", "/readonly/vendor/firmware_mnt/", "/readonly/vendor/firmware/",
++	};
++	for (unsigned i = 0; i < sizeof(pre) / sizeof(pre[0]); i++) {
++		size_t l = strlen(pre[i]);
++		if (strncmp(path, pre[i], l) == 0) {
++			return path + l;
++		}
++	}
++	return NULL;
++}
++
++static uint32_t
++dec(const char *p)
++{
++	uint32_t v = 0;
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (uint32_t)(*p++ - '0');
++	}
++	return v;
++}
++
++static void
++tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	char buf[512], *p, *end, *file, *mode, oack[256], *o;
++	uint16_t op = (uint16_t)(d[0] << 8 | d[1]);
++	struct tftp_sess *s = NULL;
++	bool opts, want_tsize = false;
++	uint32_t timeoutms = 1000;
++	if (len < 4 || len >= sizeof(buf)) {
++		return;
++	}
++	memcpy(buf, d, len);
++	buf[len] = 0;
++	end = buf + len;
++	file = buf + 2;
++	mode = file + strlen(file) + 1;
++	if (mode >= end) {
++		return;
++	}
++	p = mode + strlen(mode) + 1;
++	opts = p < end;
++	for (unsigned i = 0; i < 16; i++) {
++		if (!sess[i].used) {
++			s = &sess[i];
++			break;
++		}
++	}
++	if (s == NULL) {
++		LOG("M6: tftp: out of sessions");
++		return;
++	}
++	bzero(s, sizeof(*s));
++	s->used = true;
++	s->write = op == OP_WRQ;
++	s->port = next_sess_port++;
++	s->node = node;
++	s->rport = port;
++	s->blk = 512;
++	s->wsize = 1;
++	s->rw = -1;
++	while (p < end) {
++		char *name = p, *val = p + strlen(p) + 1;
++		if (val >= end) {
++			break;
++		}
++		uint32_t v = dec(val);
++		if (strcmp(name, "blksize") == 0) {
++			s->blk = MAX(8u, MIN(v, 16384u));
++		} else if (strcmp(name, "timeoutms") == 0) {
++			timeoutms = v;
++		} else if (strcmp(name, "tsize") == 0) {
++			want_tsize = true;
++		} else if (strcmp(name, "rsize") == 0) {
++			s->rsize = v;
++		} else if (strcmp(name, "wsize") == 0) {
++			s->wsize = MAX(1u, v);
++		} else if (strcmp(name, "seek") == 0) {
++			s->seek = v;
++		}
++		p = val + strlen(val) + 1;
++	}
++	tftp_reqs++;
++	if (strncmp(file, "/readwrite/", 11) == 0) {
++		s->rw = rw_find(file, s->write);
++	}
++	if (s->write) {
++		tftp_writes++;
++		LOG("M6: t=%u ms: tftp WRQ %s seek %u%s", g_ms, file, s->seek, s->rw < 0 ? " (no RAM slot, dropped)" : "");
++		if (s->rw >= 0 && s->seek == 0) {
++			rw_files[s->rw].size = 0;       /* a write from the start replaces the file */
++		}
++	} else if (s->rw >= 0) {
++		s->size = rw_files[s->rw].size;
++		LOG("M6: t=%u ms: tftp RRQ %s (RAM, %llu B)", g_ms, file, s->size);
++	} else {
++		const char *rel = tftp_map(file);
++		if (rel == NULL || !fat_open_path(&modem_fs, rel, &s->ff) || s->ff.dir) {
++			tftp_missing++;
++			LOG("M6: t=%u ms: tftp RRQ %s: not found", g_ms, file);
++			tftp_error(s, 1, "file not found");
++			tftp_close(s);
++			return;
++		}
++		s->size = s->ff.size;
++		LOG("M6: t=%u ms: tftp RRQ %s seek %u rsize %u blk %u w %u (%llu B)", g_ms, rel, s->seek, s->rsize, s->blk,
++		    s->wsize, s->size);
++	}
++	if (!opts) {
++		if (s->write) {
++			uint8_t ack[4] = { 0, OP_ACK, 0, 0 };
++			tftp_send(s, ack, 4);
++		} else {
++			tftp_data(s, 1, 0, 0);
++		}
++		return;
++	}
++	o = oack;
++	*o++ = 0;
++	*o++ = OP_OACK;
++	o = tftp_opt(o, oack + sizeof(oack), "blksize", s->blk);
++	o = tftp_opt(o, oack + sizeof(oack), "timeoutms", timeoutms);
++	if (want_tsize && !s->write) {
++		o = tftp_opt(o, oack + sizeof(oack), "tsize", s->size);
++	}
++	o = tftp_opt(o, oack + sizeof(oack), "wsize", s->wsize);
++	if (s->rsize != 0) {
++		o = tftp_opt(o, oack + sizeof(oack), "rsize", s->rsize);
++	}
++	if (s->seek != 0) {
++		o = tftp_opt(o, oack + sizeof(oack), "seek", s->seek);
++	}
++	tftp_send(s, oack, (uint32_t)(o - oack));
++}
++
++/* traffic on a session port: ACKs for reads, DATA for writes (tqftpserv handle_reader) */
++static bool
++tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	struct tftp_sess *s = NULL;
++	for (unsigned i = 0; i < 16; i++) {
++		if (sess[i].used && sess[i].port == dst_port) {
++			s = &sess[i];
++			break;
++		}
++	}
++	if (s == NULL || len < 4) {
++		return s != NULL;
++	}
++	uint16_t op = (uint16_t)(d[0] << 8 | d[1]), blk = (uint16_t)(d[2] << 8 | d[3]);
++	if (op == OP_ERROR) {
++		/* rsize 0 + tsize is a stat: the modem ends it with ERROR 9 "End of Transfer" */
++		if (blk != 9) {
++			LOG("M6: t=%u ms: tftp sess %#x: modem ERROR %u after %llu B", g_ms, s->port, blk, s->sent);
++		}
++		tftp_close(s);
++		return true;
++	}
++	if (s->write) {
++		if (op == OP_DATA) {
++			uint32_t payload = len - 4;
++			if (s->rw >= 0 && blk >= 1) {
++				(void)rw_write(s->rw, s->seek + (uint64_t)(blk - 1) * s->blk, d + 4, payload);
++			}
++			if ((blk % s->wsize) == 0 || payload < s->blk) {
++				uint8_t ack[4] = { 0, OP_ACK, (uint8_t)(blk >> 8), (uint8_t)blk };
++				tftp_send(s, ack, 4);
++			}
++			if (payload < s->blk) {
++				tftp_close(s);
++			}
++		}
++		return true;
++	}
++	if (op != OP_ACK) {
++		tftp_error(s, 4, "Expected ACK opcode");
++		tftp_close(s);
++		return true;
++	}
++	if (s->rsize == 0) {
++		/* the whole file: blocks until a short one */
++		uint64_t total = s->size > s->seek ? s->size - s->seek : 0;
++		uint32_t last = (uint32_t)(total / s->blk) + 1;
++		if ((uint32_t)blk >= last) {
++			tftp_close(s);
++			return true;
++		}
++		for (uint32_t i = blk + 1u; i <= blk + s->wsize && i <= last; i++) {
++			if (!tftp_data(s, i, s->seek + (uint64_t)(i - 1) * s->blk, 0)) {
++				break;
++			}
++		}
++		return true;
++	}
++	if ((uint64_t)blk * s->blk > s->rsize) {
++		tftp_close(s);
++		return true;
++	}
++	for (uint32_t i = blk; i < blk + s->wsize; i++) {
++		uint64_t off = s->seek + (uint64_t)i * s->blk;
++		uint32_t rs = (i + 1) * s->blk > s->rsize ? s->rsize % s->blk : 0;
++		if (!tftp_data(s, i + 1, off, rs) || (i + 1) * s->blk > s->rsize) {
++			break;
++		}
++	}
++	return true;
++}
++
++/* rmtfs */
++#define RMTFS_BUF_SIZE          0x200000u       /* DTS qcom,rmtfs_sharedmem: dynamic, 2 MB */
++
++static const struct { const char *path, *part; } rmtfs_parts[] = {
++	{ "/boot/modem_fs1", "modemst1" },
++	{ "/boot/modem_fs2", "modemst2" },
++	{ "/boot/modem_fsc", "fsc" },
++	{ "/boot/modem_fsg", "fsg" },
++};
++static struct part rmtfs_part[4];
++static bool rmtfs_part_ok[4];
++static uint64_t rmtfs_pa;
++static uint8_t *rmtfs_va;
++static unsigned rmtfs_reads, rmtfs_writes, rmtfs_err;
++
++static void
++rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	struct qmsg m;
++	char path[64];
++	uint16_t l = 0;
++	const uint8_t *v;
++	uint32_t caller = 0, i;
++	bool ok = true;
++	qm_init(&m, txn, msg);
++	v = qm_find(d, len, 1, &l);
++	if (msg != 1 && v != NULL && l >= 4) {
++		memcpy(&caller, v, 4);
++	}
++	switch (msg) {
++	case 1:                                     /* OPEN */
++		qm_string(d, len, 1, path, sizeof(path));
++		for (i = 0; i < 4; i++) {
++			if (strcmp(path, rmtfs_parts[i].path) == 0) {
++				break;
++			}
++		}
++		if (i < 4 && !rmtfs_part_ok[i]) {
++			rmtfs_part_ok[i] = part_open(rmtfs_parts[i].part, &rmtfs_part[i]);
++		}
++		ok = i < 4 && rmtfs_part_ok[i];
++		LOG("M6: t=%u ms: rmtfs: open %s -> %s", g_ms, path, ok ? rmtfs_parts[i].part : "FAILED");
++		qm_result(&m, ok);
++		if (ok) {
++			caller = i + 1;
++			qm_tlv(&m, 0x10, &caller, 4);
++		}
++		break;
++	case 2:                                     /* CLOSE */
++		qm_result(&m, true);
++		break;
++	case 3: {                                   /* RW_IOVEC: {sector, phys, count} x n */
++		uint16_t l2 = 0;
++		const uint8_t *dir = qm_find(d, len, 2, &l2);
++		const uint8_t *iov = qm_find(d, len, 3, &l2);
++		bool write = dir != NULL && *dir != 0;
++		ok = caller >= 1 && caller <= 4 && rmtfs_part_ok[caller - 1] && iov != NULL && l2 >= 1 &&
++		    1u + 12u * iov[0] <= l2 && rmtfs_pa != 0;
++		for (i = 0; ok && i < iov[0]; i++) {
++			uint32_t e[3];
++			memcpy(e, iov + 1 + 12 * i, 12);
++			uint64_t bytes = (uint64_t)e[2] * 512;
++			if (e[1] < rmtfs_pa || e[1] + bytes > rmtfs_pa + RMTFS_BUF_SIZE) {
++				ok = false;
++				break;
++			}
++			if (write) {
++				rmtfs_writes++;                 /* never written to the phone's EFS */
++			} else {
++				ok = part_read(&rmtfs_part[caller - 1], (uint64_t)e[0] * 512, rmtfs_va + (e[1] - rmtfs_pa),
++				    (uint32_t)bytes) == 0;
++				rmtfs_reads++;
++			}
++		}
++		if (!ok && ++rmtfs_err <= 3) {
++			LOG("M6: t=%u ms: rmtfs: iovec caller %u %s FAILED", g_ms, caller, write ? "write" : "read");
++		}
++		qm_result(&m, ok);
++		break;
++	}
++	case 4: {                                   /* ALLOC_BUFF */
++		if (rmtfs_pa == 0) {
++			uint64_t pa = 0;
++			uint8_t *va = (uint8_t *)pool_alloc(RMTFS_BUF_SIZE, &pa);
++			static const uint32_t hlos[] = {VMID_HLOS}, both[] = {VMID_HLOS, VMID_MSS_MSA};
++			static const uint32_t both_perm[] = {PERM_RW, PERM_RW};
++			uint64_t ar = va != NULL ? scm_assign(pa, RMTFS_BUF_SIZE, hlos, 1, both, both_perm, 2) : ~0ull;
++			LOG("M6: t=%u ms: rmtfs buffer %#llx+%#x to HLOS+MSS_MSA -> %#llx", g_ms, pa, RMTFS_BUF_SIZE, ar);
++			if (ar == 0) {
++				rmtfs_pa = pa;
++				rmtfs_va = va;
++			}
++		}
++		LOG("M6: t=%u ms: rmtfs: alloc for caller %u -> %#llx", g_ms, caller, rmtfs_pa);
++		ok = rmtfs_pa != 0;
++		qm_result(&m, ok);
++		if (ok) {
++			uint64_t a = rmtfs_pa;
++			qm_tlv(&m, 0x10, &a, 8);
++		}
++		break;
++	}
++	case 5: {                                   /* GET_DEV_ERROR */
++		uint8_t st = 0;
++		qm_result(&m, true);
++		qm_tlv(&m, 0x10, &st, 1);
++		break;
++	}
++	default:
++		LOG("M6: t=%u ms: rmtfs: msg %#x", g_ms, msg);
++		qm_result(&m, false);
++		break;
++	}
++	qm_send(&m, PORT_RMTFS, node, port);
++}
++
++static void
++svc_announce(void)
++{
++	static const uint32_t svc[][3] = {
++		{ 0x40, 0x101, PORT_PDM },              /* servreg-locator, version 0x101 instance 0 */
++		{ 4096, 1,     PORT_TFTP },             /* tftp */
++		{ 14,   1,     PORT_RMTFS },            /* rmtfs */
++	};
++	for (unsigned i = 0; i < 3; i++) {
++		struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, svc[i][0], svc[i][1], QRTR_NODE_APPS, svc[i][2] };
++		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++	}
++	LOG("M6: t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
++}
++
++static bool
++svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
++{
++	if (dst_port == PORT_TFTP) {
++		if (len >= 2 && (data[1] == OP_RRQ || data[1] == OP_WRQ)) {
++			tftp_request(src_node, src_port, data, len);
++		}
++		return true;
++	}
++	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
++		return tftp_session(dst_port, data, len);
++	}
++	if (len < 7 || data[0] != QMI_REQ) {
++		return false;
++	}
++	uint16_t txn, msg;
++	memcpy(&txn, data + 1, 2);
++	memcpy(&msg, data + 3, 2);
++	if (dst_port == PORT_PDM) {
++		pdm_rx(src_node, src_port, txn, msg, data, len);
++		return true;
++	}
++	if (dst_port == PORT_RMTFS) {
++		rmtfs_rx(src_node, src_port, txn, msg, data, len);
++		return true;
++	}
++	return false;
++}
++
++static void
++svc_summary(void)
++{
++	LOG("M6: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) "
++	    "errors %u", pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
++}
++
+ #define MPSS_PA                 0x8CC00000ull   /* modem_mem, 120 MB */
+ #define MPSS_SIZE               0x07800000ull
+ #define MDT_RELOCATABLE         (1u << 27)
+@@ -1608,7 +2394,7 @@ rmb_wait(uint32_t want, unsigned ms)
+  * SMP2P "slave-kernel" is watched for READY (bit 1) or FATAL (bit 0: the crash reason). SMP2P out
+  * (item 428) is made first and the IPA power query answered, as ios-topaz 0113 does.
+  */
+-static bool m5_on, m5_ok;
++static bool m5_on, m5_ok, m4_alive;
+ 
+ static bool
+ m4(unsigned watch_s)
+@@ -1873,6 +2659,7 @@ m4(unsigned watch_s)
+ 			LOG("M4: no modem SMP2P item after %u s", watch_s);
+ 			mss_crash_reason(part);
+ 		}
++		m4_alive = ok && sk_last != ~0u && (sk_last & 3) == 2;
+ 		LOG("M4: watch done: slave-kernel %08x, %s", sk_last, ok ? "READY" : "NOT ready");
+ 	}
+ out:
+@@ -1902,6 +2689,7 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 		return;
+ 	}
+ 	m5_on = level >= 6;
++	m6_on = level >= 7;
+ 	if (level >= 5 && !m4(120)) {
+ 		LOG("M4 failed: stop (the carve-outs stay assigned until a reset)");
+ 		return;
+@@ -1909,6 +2697,9 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 	if (level >= 6) {
+ 		LOG("M5 %s", m5_ok ? "passed: IPCRTR up, HELLO both ways, services listed" : "FAILED");
+ 	}
++	if (level >= 7) {
++		LOG("M6: the modem %s the whole watch with our services", m5_ok && m4_alive ? "stayed up" : "did NOT stay up");
++	}
+ }
+ 
+ void
