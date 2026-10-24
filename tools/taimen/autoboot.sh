@@ -37,6 +37,10 @@ if [ "${FLASH_READER:-0}" = 1 ] || [ "$(cat "$rstamp" 2>/dev/null)" != "$rh" ]; 
 else
 	say "reader unchanged, not reflashed"
 fi
+# ABL gives a slot 3 boots that never mark it successful, and the reader never does. Reflashing
+# used to reset that; without it both slots ran out after six reader boots and the phone stayed
+# in fastboot (boot 55). set-active resets the slot's retry count and unbootable flag.
+timeout 20 fastboot --set-active=a > /dev/null 2>&1 || say "fastboot --set-active=a failed"
 reboot_s=$(echo "$*" | sed -n 's/.*taimenreboot=\([0-9]*\).*/\1/p')
 NO_ALERT=1 BOOT_WAIT=25 "$P/tools/taimen/boot-xnu.sh" "$kernel" "$out" "$@" > "$out/boot.log" 2>&1
 grep -E "warning|fastboot boot at|Booting" "$out/boot.log"
