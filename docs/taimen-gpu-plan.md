@@ -1,5 +1,20 @@
 # Plan: GPU acceleration on taimen (Adreno 540) from XNU (2026-10-23)
 
+**Status 2026-10-24: E1-E6 done.** CoreAnimation draws with Mesa on the A540 in backboardd at ~60
+frames/s during home screen animations (boot 75), and ROOT=1 boots use it by default
+(`tools/taimen/boot-xnu.sh`, `tools/taimen/sweetgl-install.sh`). E1-E5: xnu 0227-0237, boots 47-59.
+E6: boots 60-75 in NOTES-taimen.md; the steps that took it from ~1 to ~60 frames/s:
+
+| What | Where | Effect |
+| --- | --- | --- |
+| The first EAGL context waits for the GPU service | sweetgl `eagl.c` (`gpu_ready`) | CA no longer stays on its software renderer when backboardd starts before the GPU (boot 65) |
+| A5xx texture barrier inside the batch in GMEM bypass | `tools/sweetgl/mesa.patch` (`fd5_texture_barrier`) | a destination-read draw no longer flushes the batch (one GPU submit per such draw, boot 69) |
+| Mesa's buffers write-combined from a 256 MB heap above XNU's RAM | xnu 0240 (`taimengpuheap`) | no cache clean and write-protect of Mesa's pages per submit (boot 72 profile) |
+| Imported surfaces flushed only when their seed moved | xnu 0242 | the display surfaces (~3400 pages) no longer cleaned at every submit (boot 74: ~4 ms each) |
+| Imported-surface cache bounded to 96 MB | sweetgl `eagl.c` (`SURF_RES_BYTES`) | SpringBoard's per-swipe snapshot surfaces no longer stay wired |
+
+The rest of this file is the plan as written before any of it ran.
+
 Plan only: nothing was built, booted or committed. Sources read: `scratch/xnu` at `fb73534` (patches
 0001-0223; line numbers below refer to that tree), `port/` (NOTES-taimen.md, docs, tools/sweetgl,
 tools/taimen), `research/taimen/live.dts`, the phone's own LineageOS boot log and memory map
