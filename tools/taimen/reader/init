@@ -102,8 +102,16 @@ udc=$(ls /sys/class/udc | head -1)
 echo "$udc" > $G/UDC
 log "gadget on $udc: $(cat $G/UDC 2>&1)"
 
-# The PC copies the drive within a few seconds of seeing it (tools/taimen/reader-pull.ps1).
-sleep 45
+# The PC copies the drive within a few seconds of seeing it and then ejects it
+# (tools/taimen/reader-pull.ps1): f_mass_storage closes the LUN and its file attribute goes
+# empty. Reboot then, or after 45 s if no eject comes.
+for i in $(seq 1 45); do
+	sleep 1
+	if [ -z "$(cat $G/functions/mass_storage.0/lun.0/file 2>/dev/null)" ]; then
+		log "the host ejected the drive after $i s"
+		break
+	fi
+done
 log "done, rebooting into fastboot"
 echo "" > $G/UDC
 sync

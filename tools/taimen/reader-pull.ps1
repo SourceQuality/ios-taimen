@@ -12,6 +12,9 @@ while (((Get-Date) - $t0).TotalSeconds -lt $Timeout) {
 		New-Item -ItemType Directory -Force $Dest | Out-Null
 		Copy-Item "$($disk.DeviceID)\*" $Dest -Force
 		$files = Get-ChildItem $Dest | ForEach-Object { "$($_.Name) $($_.Length)" }
+		# Eject (SCSI START STOP UNIT): the gadget closes its LUN, and the reader reboots into
+		# fastboot at once instead of after its 45 s wait (tools/taimen/reader/init).
+		try { (New-Object -ComObject Shell.Application).Namespace(17).ParseName($disk.DeviceID).InvokeVerb('Eject') } catch {}
 		"reader drive $($disk.DeviceID) after $([int]((Get-Date) - $t0).TotalSeconds) s: $($files -join ', ')"
 		exit 0
 	}

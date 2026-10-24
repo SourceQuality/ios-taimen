@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8df16e8..48c4f26 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -255,6 +255,10 @@ gpu_wait(unsigned secs)
+ 	if (g_level >= 8 && secs > 2) {
+ 		return;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* 2 s: pstore keeps the last lines before a hang, and 11 s pauses cost about a minute per test (0231) */
++	secs = secs > 2 ? 2 : secs;
++#endif
+ 	gpu_sleep(secs);
+ }
+ 
+@@ -2263,17 +2267,20 @@ taimen_power_up(void)
+ 	return aon1 != aon0 ? gpu : 0;
+ }
+ 
++extern void taimen_end_early(const char *why);  /* SweetPlatformExpert.cpp: with taimenend=1 */
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+ 	(void)result;
+ 	g_level = (int)(uintptr_t)arg;
+-	gpu_sleep(40);
++	gpu_sleep(10);
+ 	vm_offset_t gpu = taimen_power_up();
+ 	if (gpu != 0 && g_level >= 2) {
+ 		gpu_wait(11);
+ 		cp_test(gpu, g_level);
+ 	}
++	taimen_end_early("GPU test done");
+ }
+ #else
+ static void
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index e021978..1264767 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -256,6 +256,22 @@ taimen_fb_report(int t)
+ #define TAIMEN_WDT_BITE  0x14
+ #define TAIMEN_WDT_PET_S 5
+ 
++/*
++ * taimenend=1 (0231): an experiment that has finished calls taimen_end_early(), and the pet
++ * thread ends the boot at its next tick (the usual report, screenshot, log flush and reset into
++ * the log reader) instead of waiting for taimenreboot. Boots meant to be used leave it off.
++ */
++static const char *volatile taimen_end_why;
++
++extern "C" void
++taimen_end_early(const char *why)
++{
++	int on = 0;
++	if (PE_parse_boot_argn("taimenend", &on, sizeof(on)) && on) {
++		taimen_end_why = why;
++	}
++}
++
+ static void
+ taimen_wdt_thread(void *arg)
+ {
+@@ -290,6 +306,10 @@ taimen_wdt_thread(void *arg)
+ 			sweet_fb_screenshot("60s");
+ 		}
+ 		IOSleep(TAIMEN_WDT_PET_S * 1000);
++		if (taimen_end_why != NULL) {
++			IOLog("TAIMEN WDT: ending early at %d s: %s\n", t + TAIMEN_WDT_PET_S, taimen_end_why);
++			break;
++		}
+ 	}
+ 	IOLog("TAIMEN WDT: taimenreboot=%d reached: WDT EN 0x%x STS 0x%x BARK 0x%x BITE 0x%x; reset ladder follows\n",
+ 	    reboot_s, wdt[TAIMEN_WDT_EN / 4], wdt[0x0c / 4], wdt[TAIMEN_WDT_BARK / 4], wdt[TAIMEN_WDT_BITE / 4]);
