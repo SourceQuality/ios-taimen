@@ -1,0 +1,129 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4d42802..0894a96 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1702,6 +1702,8 @@ smmu_report(void)
+ 	wr(cb, 0x58, fsr);      /* write-1-to-clear */
+ }
+ 
++uint64_t sweet_gpu_ring_wait;
++
+ int
+ sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
+ {
+@@ -1724,12 +1726,14 @@ sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
+ 	uint32_t need = 4 * n + 6 + 5;
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
++	uint64_t w0 = mach_absolute_time();
+ 	while (ret == 0 && g_ready && rb_free() < need) {
+ 		if (mach_absolute_time() > deadline) {
+ 			gpu_hung("submit: ring full");
+ 			ret = ETIMEDOUT;
+ 		}
+ 	}
++	sweet_gpu_ring_wait += mach_absolute_time() - w0;
+ 	if (ret == 0 && !g_ready) {
+ 		ret = ENXIO;
+ 	}
+diff --git a/bsd/dev/sweet_gpu.h b/bsd/dev/sweet_gpu.h
+index 74eeae6..5e15a29 100644
+--- a/bsd/dev/sweet_gpu.h
++++ b/bsd/dev/sweet_gpu.h
+@@ -83,6 +83,8 @@ struct sweet_gpu_ib {
+ #define SWEET_GPU_MAX_IBS       256u
+ 
+ int sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno);
++/* mach time sweet_gpu_submit spent waiting for ring room (SweetGPU logs it) */
++extern uint64_t sweet_gpu_ring_wait;
+ 
+ /*
+  * Wait until submit seqno has completed: 0, ETIMEDOUT after timeout_ms, or
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 670f767..fa25784 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -66,16 +66,19 @@ extern "C" boolean_t pmap_valid_page(ppnum_t pn);
+  * not set it: bos are flushed whole when created or imported.
+  * ponytail: also tells the VM the page is clean; fine while bos are wired.
+  */
+-static void
++static bool
+ flush_if_written(uint64_t pa)
+ {
+ 	ppnum_t pn = (ppnum_t)(pa >> PAGE_SHIFT);
+ 	if (!pmap_valid_page(pn)) {             /* not managed: no modified bit, always */
+ 		flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++		return true;
+ 	} else if (pmap_is_modified(pn)) {
+ 		pmap_clear_modify(pn);
+ 		flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++		return true;
+ 	}
++	return false;
+ }
+ 
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+@@ -606,6 +609,37 @@ SweetGPUUserClient::boImport(uint32_t id, uint64_t *out)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * Where submit time goes, logged every 10 s of submits ("SWEET GPU: ...
++ * submits"): the cache loop (pages checked, pages flushed) against the ring
++ * (and the part of it spent waiting for room behind the GPU).
++ */
++static void
++submitStats(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t ring_wait, uint64_t checked, uint64_t flushed)
++{
++	static uint64_t start, n, cache, ring, wait, pages, dirty;
++	if (start == 0) {
++		start = t0;
++	}
++	n++;
++	cache += t1 - t0;
++	ring += t2 - t1;
++	wait += ring_wait;
++	pages += checked;
++	dirty += flushed;
++	uint64_t span, a, b, c;
++	absolutetime_to_nanoseconds(t2 - start, &span);
++	if (span < 10 * NSEC_PER_SEC) {
++		return;
++	}
++	absolutetime_to_nanoseconds(cache, &a);
++	absolutetime_to_nanoseconds(ring, &b);
++	absolutetime_to_nanoseconds(wait, &c);
++	printf("SWEET GPU: %llu submits in %llu ms: cache %llu ms (%llu pages checked, %llu flushed), ring %llu ms "
++	    "(%llu ms waiting for room)\n", n, span / 1000000, a / 1000000, pages, dirty, b / 1000000, c / 1000000);
++	start = n = cache = ring = wait = pages = dirty = 0;
++}
++
+ /* Lock held. in: struct sweet_gpu_submit, ibs, handles. */
+ IOReturn
+ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+@@ -621,6 +655,7 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 	}
+ 	const struct sweet_gpu_ib *ib = (const struct sweet_gpu_ib *)((const char *)in + sizeof(h));
+ 	const uint32_t *handles = (const uint32_t *)(ib + h.nr_ibs);
++	uint64_t t0 = mach_absolute_time(), checked = 0, flushed = 0;
+ 	for (uint32_t i = 0; i < h.nr_bos; i++) {
+ 		struct sweet_gpu_bo *b = bo(handles[i]);
+ 		if (b == NULL) {
+@@ -633,12 +668,15 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 		 * Heap bos (write-combined) need none.
+ 		 */
+ 		for (uint32_t p = 0; !b->wc && p < b->npages; p++) {
+-			flush_if_written(b->pa[p]);
++			flushed += flush_if_written(b->pa[p]);
+ 		}
++		checked += b->wc ? 0 : b->npages;
+ 	}
+ 	__builtin_arm_dsb(0xf);         /* this CPU's write-combined stores reach memory first */
++	uint64_t t1 = mach_absolute_time(), wait0 = sweet_gpu_ring_wait;
+ 	uint32_t seq = 0;
+ 	int e = sweet_gpu_submit(ib, h.nr_ibs, &seq);
++	submitStats(t0, t1, mach_absolute_time(), sweet_gpu_ring_wait - wait0, checked, flushed);
+ 	if (e != 0) {
+ 		return e == EFAULT ? kIOReturnNotPermitted : e == EINVAL ? kIOReturnBadArgument :
+ 		       e == ETIMEDOUT ? kIOReturnTimeout : kIOReturnNotReady;
