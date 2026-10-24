@@ -675,3 +675,6 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   no crash, but **worse pacing** than glFinish: Control Center windows 13-32 swap gaps over 54 ms each (boot 82:
   0-1). The CPU running ahead only moves the wait elsewhere (buffer reuse, the kernel's synchronous GPU copy of
   the frame). glFinish at CA's flush stays; SWEETGL_FINISH stays off.
+- 2026-10-24 **boot 87 (r70, the plain ROOT=1 default, 3700 s, taimengestn=175)**: ran to the deadline (WDT pet
+  at 3695 s); 155 gesture cycles in what the 4 MB ring kept (it wrapped), no panic, no crash, no GPU hang;
+  wired flat at 65-68k pages for the hour, free 7-17k, compressed 29-46k.
