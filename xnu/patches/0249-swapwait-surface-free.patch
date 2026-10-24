@@ -62,7 +62,7 @@ index 85c59cf..e2e33b2 100644
  		printf("SWEET PERF: panel kicks %llu (after done %llu, after 50 ms timeout %llu)\n",
  		    sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout);
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 2de6efe..0f213ea 100644
+index 2de6efe..b858590 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -142,6 +142,8 @@ public:
@@ -82,15 +82,6 @@ index 2de6efe..0f213ea 100644
  	bool startScaled(void);
  	bool gpuStart(void);
  	uint64_t gpuMap(SweetSurface *s);
-@@ -763,7 +766,7 @@ AppleCLCD::gpuLayer(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t
- 		.x0 = x0, .y0 = y0, .w = x1 - x0, .h = y1 - y0,
- 		/* u = (X + .5) lw / pw + sx - dx, v likewise */
- 		.m = {fbits(lw, fPanelW), 0, 0, fbits(lh, fPanelH), fbits(sx - dx, 1), fbits(sy - dy, 1)},
--		.flags = SWEET_GPU_QUAD_COPY,
-+		.flags = SWEET_GPU_QUAD_COPY | (clean ? SWEET_GPU_QUAD_SRC_CLEAN : 0u),
- 		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
- 		.src_fmt = SWEET_GPU_FMT_RGBA8,
- 		.src_swiz = 0x688,      /* xyzw: bytes B, G, R, A as they are */
 @@ -835,6 +838,9 @@ static uint32_t sweet_fb_swaps_logged;
  /* gaps between swaps: < 20, < 37, < 54, longer ms (1, 2, 3, 4+ vsyncs; SWEET PERF) */
  extern "C" uint64_t sweet_fb_stat_gap[4];
@@ -211,7 +202,7 @@ index 2de6efe..0f213ea 100644
  	return va;
  }
  
-@@ -1083,6 +1154,16 @@ taimen_gpu_copy(SweetSurface *s, unsigned back)
+@@ -1083,19 +1154,33 @@ taimen_gpu_copy(SweetSurface *s, unsigned back)
  	if (va == 0) {
  		return false;
  	}
@@ -228,7 +219,14 @@ index 2de6efe..0f213ea 100644
  	struct sweet_gpu_quad q = {
  		.src_va = va + s->offset, .dst_va = taimen_scan_gva[back],
  		.src_w = TAIMEN_CANVAS_W, .src_h = TAIMEN_CANVAS_H, .src_pitch = s->bytesPerRow,
-@@ -1096,6 +1177,10 @@ taimen_gpu_copy(SweetSurface *s, unsigned back)
+ 		.dst_w = TAIMEN_CANVAS_W, .dst_h = TAIMEN_CANVAS_H, .dst_pitch = TAIMEN_CANVAS_BPR,
+ 		.x0 = 0, .y0 = 0, .w = TAIMEN_CANVAS_W, .h = TAIMEN_CANVAS_H,
+ 		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0},      /* 1:1 */
+-		.flags = SWEET_GPU_QUAD_COPY,
++		.flags = SWEET_GPU_QUAD_COPY | (clean ? SWEET_GPU_QUAD_SRC_CLEAN : 0u),
+ 		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
+ 		.src_fmt = SWEET_GPU_FMT_RGBA8,
+ 		.src_swiz = 0x688,      /* xyzw: bytes B, G, R, A as they are */
  	};
  	uint64_t t0 = mach_absolute_time();
  	int r = sweet_gpu_quad(&q);
