@@ -1,0 +1,419 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 8050237..ee24626 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -26,6 +26,7 @@
+  * M4 (0269): MPSS authenticated and running, the modem's SMP2P err-ready (see m4()).
+  * M5 (0272): GLINK over SMEM and QRTR on the IPCRTR channel, inside M4's watch (see glink_start()).
+  * M6 (0274): the host services the modem asks APPS for: rmtfs, pd-mapper, tftp (see svc_rx()).
++ * M7 (0278): WLFW to mission mode, the WLAN rails first (see wlfw_rx()).
+  * SMEM structures and lookups from ios-topaz TopazModem.cpp (0113), plus the v11 global heap.
+  * SMEM is mapped write-combined (Normal NC): no cache upkeep, unaligned reads are fine.
+  */
+@@ -1161,7 +1162,10 @@ static bool q_hello_sent, q_hello_rx;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
+-static bool m6_on, q_announced;
++static bool m6_on, q_announced, m7_on;
++static void wlfw_arrive(uint32_t node, uint32_t port);
++static void wlfw_rx(const uint8_t *d, uint32_t len);
++static void wlfw_summary(void);
+ static bool svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len);
+ static void svc_announce(void);
+ static void svc_summary(void);
+@@ -1449,6 +1453,9 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			q_srv_count++;
+ 		}
+ 		LOG("M5: t=%u ms: NEW_SERVER %#x:%#x node %u port %#x %s", g_ms, c.a, c.b, c.c, c.d, svc_name(c.a));
++		if (m7_on && c.a == QMI_SVC_WLFW) {
++			wlfw_arrive(c.c, c.d);
++		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+ 		if (confirm) {
+@@ -1708,6 +1715,7 @@ glink_summary(void)
+ #define PORT_PDM                0x4001
+ #define PORT_TFTP               0x4002
+ #define PORT_RMTFS              0x4003
++#define PORT_WLFWC              0x4004          /* our QMI client port towards WLFW (M7) */
+ #define PORT_SESS               0x4100
+ #define QMI_REQ                 0
+ #define QMI_RESP                2
+@@ -2364,6 +2372,12 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		}
+ 		return true;
+ 	}
++	if (dst_port == PORT_WLFWC) {
++		if (m7_on) {
++			wlfw_rx(data, len);
++		}
++		return m7_on;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
+@@ -2389,6 +2403,334 @@ svc_summary(void)
+ {
+ 	LOG("M6: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) "
+ 	    "errors %u", pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
++	if (m7_on) {
++		wlfw_summary();
++	}
++}
++
++extern "C" bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
++
++/* ---------------------------------------------------------------- M7: WLFW (QMI 0x45) */
++
++/*
++ * M7 (0278): the WLAN firmware service to mission mode, in the order this phone's downstream
++ * icnss.c uses (plan stage 8; topaz 0122 follows ath10k's): IND_REGISTER (fw_ready, msa_ready,
++ * pin_connect_result, client id) -> MSA_INFO (1 MB from the pool) -> each region the answer lists
++ * to {MSS_MSA, WLAN, WLAN_CE unless secure} -> MSA_READY -> CAP (logged) -> FW_READY_IND ->
++ * WLAN_CFG (ath10k snoc's CE layout, service map, 12 shadow registers) -> WLAN_MODE mission. The
++ * WLAN rails go on in M4, before the modem boots (flame lesson 6). Nothing touches the WLAN
++ * registers here: before mission mode a register read hangs the bus.
++ */
++#define QMI_IND                 4
++#define WLFW_IND_REGISTER       0x20
++#define WLFW_FW_READY_IND       0x21
++#define WLFW_WLAN_MODE          0x22
++#define WLFW_WLAN_CFG           0x23
++#define WLFW_CAP                0x24
++#define WLFW_MSA_READY_IND      0x2B
++#define WLFW_PIN_RESULT_IND     0x2C
++#define WLFW_MSA_INFO           0x2D
++#define WLFW_MSA_READY          0x2E
++#define WLFW_MSA_SIZE           0x00100000u     /* icnss msa_mem_size */
++#define WLFW_CLIENT_ID          0x4b4e454c      /* icnss WLFW_CLIENT_ID */
++#define VMID_WLAN               0x18
++#define VMID_WLAN_CE            0x19
++
++static uint32_t w_node, w_port, w_board = 0xFF;
++static uint16_t w_txn = 1;
++static uint64_t w_msa_pa;
++static bool w_fw_ready, w_mission;
++static const char *w_step = "not started";
++
++struct wmsg { uint8_t b[1024]; uint32_t n; };
++
++static void
++wm_new(struct wmsg *m, uint16_t msg)
++{
++	bzero(m->b, sizeof(m->b));
++	m->b[0] = QMI_REQ;
++	uint16_t t = w_txn++;
++	memcpy(m->b + 1, &t, 2);
++	memcpy(m->b + 3, &msg, 2);
++	m->n = 7;
++}
++
++static void
++wm_tlv(struct wmsg *m, uint8_t type, const void *v, uint16_t len)
++{
++	if (m->n + 3 + len > sizeof(m->b)) {
++		return;
++	}
++	m->b[m->n] = type;
++	memcpy(m->b + m->n + 1, &len, 2);
++	if (len != 0) {
++		memcpy(m->b + m->n + 3, v, len);
++	}
++	m->n += 3 + len;
++}
++
++static void wm_u8(struct wmsg *m, uint8_t t, uint8_t v) { wm_tlv(m, t, &v, 1); }
++static void wm_u32(struct wmsg *m, uint8_t t, uint32_t v) { wm_tlv(m, t, &v, 4); }
++
++/* a TLV with a u8 element count in front of an array */
++static void
++wm_array(struct wmsg *m, uint8_t type, uint8_t count, const void *v, uint16_t bytes)
++{
++	uint16_t l = (uint16_t)(1 + bytes);
++	if (m->n + 4 + bytes > sizeof(m->b)) {
++		return;
++	}
++	m->b[m->n] = type;
++	memcpy(m->b + m->n + 1, &l, 2);
++	m->b[m->n + 3] = count;
++	memcpy(m->b + m->n + 4, v, bytes);
++	m->n += 4 + bytes;
++}
++
++static void
++wm_send(struct wmsg *m, const char *step)
++{
++	uint16_t l = (uint16_t)(m->n - 7);
++	memcpy(m->b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, PORT_WLFWC, w_node, w_port, m->b, m->n);
++	w_step = step;
++}
++
++static bool
++w_result(const uint8_t *d, uint32_t len, uint16_t *err)
++{
++	uint16_t l = 0, res = 0xFFFF;
++	const uint8_t *r = qm_find(d, len, 2, &l);
++	*err = 0xFFFF;
++	if (r != NULL && l >= 4) {
++		memcpy(&res, r, 2);
++		memcpy(err, r + 2, 2);
++	}
++	return res == 0;
++}
++
++/*
++ * ath10k snoc's copy-engine layout (target_ce_config_wlan, target_service_to_ce_map_wlan,
++ * target_shadow_reg_cfg_map): {pipe, dir (1 in, 2 out, 3 inout), nentries, nbytes_max, flags}.
++ */
++static const uint32_t w_tgt_ce[12][5] = {
++	{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
++	{ 4, 2, 256, 256, 8 }, { 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 },
++	{ 8, 1, 32, 2048, 0 }, { 9, 1, 32, 2048, 0 }, { 10, 1, 32, 2048, 0 }, { 11, 1, 32, 2048, 0 },
++};
++static const uint32_t w_svc_ce[][3] = {
++	{ 0x104, 2, 3 }, { 0x104, 1, 2 }, { 0x102, 2, 3 }, { 0x102, 1, 2 }, { 0x101, 2, 3 }, { 0x101, 1, 2 },
++	{ 0x103, 2, 3 }, { 0x103, 1, 2 }, { 0x100, 2, 3 }, { 0x100, 1, 2 }, { 0x001, 2, 0 }, { 0x001, 1, 2 },
++	{ 0xFE00, 2, 0 }, { 0xFE00, 1, 2 }, { 0x300, 2, 4 }, { 0x300, 1, 1 }, { 0xFE00, 2, 5 }, { 0x301, 1, 9 },
++	{ 0x302, 1, 10 }, { 0x600, 1, 11 }, { 0, 0, 0 },
++};
++static const uint16_t w_shadow[12][2] = {
++	{ 0, 0x3C }, { 3, 0x3C }, { 4, 0x3C }, { 5, 0x3C }, { 7, 0x3C }, { 1, 0x40 },
++	{ 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 }, { 9, 0x40 }, { 10, 0x40 }, { 11, 0x40 },
++};
++
++static void
++w_on_cap(const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v;
++	char s[80];
++	uint32_t a = 0, b = 0;
++	if ((v = qm_find(d, len, 0x10, &l)) != NULL && l >= 8) {
++		memcpy(&a, v, 4);
++		memcpy(&b, v + 4, 4);
++		LOG("M7: chip_id %#x chip_family %#x", a, b);
++	}
++	if ((v = qm_find(d, len, 0x11, &l)) != NULL && l >= 4) {
++		memcpy(&w_board, v, 4);
++	}
++	if ((v = qm_find(d, len, 0x12, &l)) != NULL && l >= 4) {
++		memcpy(&a, v, 4);
++		LOG("M7: board_id %#x soc_id %#x", w_board, a);
++	}
++	if ((v = qm_find(d, len, 0x13, &l)) != NULL && l >= 5) {
++		size_t n = MIN((size_t)v[4], MIN((size_t)(l - 5), sizeof(s) - 1));
++		memcpy(s, v + 5, n);
++		s[n] = 0;
++		memcpy(&a, v, 4);
++		LOG("M7: fw_version %#x built %s", a, s);
++	}
++	if ((v = qm_find(d, len, 0x14, &l)) != NULL) {
++		size_t n = MIN((size_t)l, sizeof(s) - 1);
++		memcpy(s, v, n);
++		s[n] = 0;
++		LOG("M7: fw_build_id %s", s);
++	}
++}
++
++/* icnss_setup_msa_permissions: HLOS -> {MSS_MSA, WLAN, WLAN_CE (not for a secure region)} RW */
++static void
++w_on_msa_info(const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v = qm_find(d, len, 0x03, &l);
++	uint32_t n = (v != NULL && l >= 1) ? v[0] : 0;
++	LOG("M7: %u MSA region(s)", n);
++	IOSleep(20);                                /* ath10k: give the modem time before the XPU update */
++	for (uint32_t i = 0; i < n && 1 + 13 * (i + 1) <= l; i++) {
++		const uint8_t *e = v + 1 + 13 * i;      /* u64 addr, u32 size, u8 secure */
++		uint64_t addr;
++		uint32_t size;
++		memcpy(&addr, e, 8);
++		memcpy(&size, e + 8, 4);
++		uint8_t sec = e[12];
++		static const uint32_t hlos[] = {VMID_HLOS}, vm[3] = {VMID_MSS_MSA, VMID_WLAN, VMID_WLAN_CE};
++		static const uint32_t rw3[3] = {PERM_RW, PERM_RW, PERM_RW};
++		if (addr < w_msa_pa || addr + size > w_msa_pa + WLFW_MSA_SIZE) {
++			LOG("M7:   region %u: %#llx + %#x secure %u: outside our MSA block, skipped", i, addr, size, sec);
++			continue;
++		}
++		uint64_t ar = scm_assign(addr, size, hlos, 1, vm, rw3, sec ? 2 : 3);
++		LOG("M7:   region %u: %#llx + %#x secure %u -> MSS_MSA+WLAN%s: %#llx", i, addr, size, sec,
++		    sec ? "" : "+WLAN_CE", ar);
++	}
++}
++
++static void
++wlfw_arrive(uint32_t node, uint32_t port)
++{
++	if (w_node != 0 || w_port != 0) {
++		return;
++	}
++	w_node = node;
++	w_port = port;
++	struct wmsg m;
++	wm_new(&m, WLFW_IND_REGISTER);
++	wm_u8(&m, 0x10, 1);                         /* fw_ready_enable */
++	wm_u8(&m, 0x13, 1);                         /* msa_ready_enable */
++	wm_u8(&m, 0x14, 1);                         /* pin_connect_result_enable */
++	wm_u32(&m, 0x15, WLFW_CLIENT_ID);
++	wm_send(&m, "ind_register sent");
++	LOG("M7: t=%u ms: WLFW at %u:%#x, ind_register sent", g_ms, node, port);
++}
++
++static void
++wlfw_rx(const uint8_t *d, uint32_t len)
++{
++	uint16_t msg, err = 0, l = 0;
++	struct wmsg m;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&msg, d + 3, 2);
++	if (d[0] == QMI_IND) {
++		if (msg == WLFW_MSA_READY_IND) {
++			LOG("M7: t=%u ms: MSA_READY indication", g_ms);
++		} else if (msg == WLFW_PIN_RESULT_IND) {
++			const uint8_t *v;
++			uint32_t pwr = 0, phy = 0, rf = 0;
++			if ((v = qm_find(d, len, 0x10, &l)) != NULL && l >= 4) {
++				memcpy(&pwr, v, 4);
++			}
++			if ((v = qm_find(d, len, 0x11, &l)) != NULL && l >= 4) {
++				memcpy(&phy, v, 4);
++			}
++			if ((v = qm_find(d, len, 0x12, &l)) != NULL && l >= 4) {
++				memcpy(&rf, v, 4);
++			}
++			LOG("M7: t=%u ms: pin connect result: power %#x phy io %#x rf %#x", g_ms, pwr, phy, rf);
++		} else if (msg == WLFW_FW_READY_IND) {
++			w_fw_ready = true;
++			LOG("M7: t=%u ms: FW_READY", g_ms);
++			wm_new(&m, WLFW_WLAN_CFG);
++			wm_array(&m, 0x11, 12, w_tgt_ce, sizeof(w_tgt_ce));
++			wm_array(&m, 0x12, (uint8_t)(sizeof(w_svc_ce) / sizeof(w_svc_ce[0])), w_svc_ce, sizeof(w_svc_ce));
++			wm_array(&m, 0x13, 12, w_shadow, sizeof(w_shadow));
++			wm_send(&m, "wlan_cfg sent");
++		} else {
++			LOG("M7: t=%u ms: indication %#x", g_ms, msg);
++		}
++		return;
++	}
++	if (d[0] != QMI_RESP) {
++		return;
++	}
++	bool ok = w_result(d, len, &err);
++	switch (msg) {
++	case WLFW_IND_REGISTER: {
++		const uint8_t *v = qm_find(d, len, 0x10, &l);
++		uint64_t st = 0;
++		if (v != NULL && l >= 8) {
++			memcpy(&st, v, 8);
++		}
++		LOG("M7: t=%u ms: ind_register %s err %u, fw_status %#llx", g_ms, ok ? "ok" : "FAILED", err, st);
++		if (!ok) {
++			break;
++		}
++		if (w_msa_pa == 0 && pool_alloc(WLFW_MSA_SIZE, &w_msa_pa) == NULL) {
++			LOG("M7: no pool space for the MSA");
++			break;
++		}
++		wm_new(&m, WLFW_MSA_INFO);
++		wm_tlv(&m, 0x01, &w_msa_pa, 8);
++		wm_u32(&m, 0x02, WLFW_MSA_SIZE);
++		wm_send(&m, "msa_info sent");
++		break;
++	}
++	case WLFW_MSA_INFO:
++		LOG("M7: t=%u ms: msa_info (%#llx + %#x) %s err %u", g_ms, w_msa_pa, WLFW_MSA_SIZE, ok ? "ok" : "FAILED",
++		    err);
++		if (ok) {
++			w_on_msa_info(d, len);
++			wm_new(&m, WLFW_MSA_READY);
++			wm_send(&m, "msa_ready sent");
++		}
++		break;
++	case WLFW_MSA_READY:
++		LOG("M7: t=%u ms: msa_ready %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (ok) {
++			wm_new(&m, WLFW_CAP);
++			wm_send(&m, "cap sent");
++		}
++		break;
++	case WLFW_CAP:
++		LOG("M7: t=%u ms: cap %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (ok) {
++			w_on_cap(d, len);
++		}
++		w_step = "waiting for FW_READY";
++		break;
++	case WLFW_WLAN_CFG:
++		LOG("M7: t=%u ms: wlan_cfg %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (ok) {
++			wm_new(&m, WLFW_WLAN_MODE);
++			wm_u32(&m, 0x01, 0);                /* mission */
++			wm_u8(&m, 0x10, 0);                 /* hw_debug */
++			wm_send(&m, "wlan_mode sent");
++		}
++		break;
++	case WLFW_WLAN_MODE:
++		LOG("M7: t=%u ms: wlan_mode mission %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (ok) {
++			w_mission = true;
++			w_step = "WLAN on (mission mode)";
++		}
++		break;
++	default:
++		LOG("M7: t=%u ms: response %#x %s err %u", g_ms, msg, ok ? "ok" : "FAILED", err);
++		break;
++	}
++}
++
++/* the WLAN rails (icnss_hw_power_on; plan stage 1): before the modem boots */
++static void
++wlfw_summary(void)
++{
++	LOG("M7: WLFW %s%s", w_step, w_fw_ready ? " (firmware ready)" : "");
++}
++
++static void
++w_rails(void)
++{
++	bool l5 = sweet_rpm_ldoa(5, 800000), l7 = sweet_rpm_ldoa(7, 1800000);
++	bool l17 = sweet_rpm_ldoa(17, 1304000), l25 = sweet_rpm_ldoa(25, 3312000);
++	LOG("M7: WLAN rails L5 0.8 V %s, L7 1.8 V %s, L17 1.304 V %s, L25 3.312 V %s", l5 ? "ok" : "FAILED",
++	    l7 ? "ok" : "FAILED", l17 ? "ok" : "FAILED", l25 ? "ok" : "FAILED");
+ }
+ 
+ #define MPSS_PA                 0x8CC00000ull   /* modem_mem, 120 MB */
+@@ -2742,13 +3084,17 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 		LOG("M2 failed: stop");
+ 		return;
+ 	}
++	if (m7_on) {
++		w_rails();                              /* before the modem boots (flame lesson 6) */
++	}
+ 	if (level >= 4 && !m3()) {
+ 		LOG("M3 failed: stop (the modem may hold the MBA carve-out until a reset)");
+ 		return;
+ 	}
+ 	m5_on = level >= 6;
+ 	m6_on = level >= 7;
+-	if (level >= 5 && !m4(120)) {
++	m7_on = level >= 8;
++	if (level >= 5 && !m4(m7_on ? 200 : 120)) {
+ 		LOG("M4 failed: stop (the carve-outs stay assigned until a reset)");
+ 		return;
+ 	}
+@@ -2758,6 +3104,9 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 	if (level >= 7) {
+ 		LOG("M6: the modem %s the whole watch with our services", m5_ok && m4_alive ? "stayed up" : "did NOT stay up");
+ 	}
++	if (level >= 8) {
++		LOG("M7 %s: %s", w_mission ? "passed" : "FAILED", w_step);
++	}
+ }
+ 
+ void
