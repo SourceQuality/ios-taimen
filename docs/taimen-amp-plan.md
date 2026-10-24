@@ -1,5 +1,13 @@
 # Plan: running taimen's UI-critical threads on the gold cores (2026-10-23)
 
+**Status 2026-10-24:** B and C level 1 are built and measured, with Mesa drawing CoreAnimation on the GPU
+(the gesture script, xnu 0243). B is xnu 0247 (`taimenslow=0`, boot 81), an experiment only. C level 1 is xnu
+0248 (`taimenamp=1`: the idle search and the idle last-processor hint narrowed to gold above
+`BASEPRI_UTILITY` and to silver at or below it; no realtime change). It is a ROOT=1 default since boot 83. Share
+of Control Center frames under 20 ms: stock 41 %, B 54 %, C1 69 %; app launches 33 %, 38 %, 45 % (boots 79, 81,
+82). A 30 and a 60 min soak with it ran clean (boots 85, 87). Levels 2-3 (migration, preemption) and D are
+not done.
+
 Plan only: nothing was built, booted or changed in the kernel. Sources read: `scratch/xnu` at `da8a26b`
 (patches 0001-0233; the files cited here are unchanged since `0e2d165` = 0230, and line numbers refer to that
 tree), `port/` at `8bf1a08` (NOTES-taimen.md, tools, the CI workflow), `scratch/dxb/build.sh`, the r51
