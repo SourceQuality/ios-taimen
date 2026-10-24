@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index e8fcd65..60c508f 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -3077,7 +3077,8 @@ w_rails(void)
+  *    buffers from our pool (Normal NC).
+  *  - HTC: READY on ep0, connect HTT_DATA and WMI_CONTROL, SETUP_COMPLETE_EX.
+  *  - WMI (TLV): SERVICE_READY -> INIT -> READY, then a passive scan (nothing is transmitted);
+- *    each BSS seen is logged once, its BSSID masked.
++ *    each BSS seen is counted and logged once by channel and signal only (0286: no SSID or BSSID in
++ *    the log; they stay in memory for joining later).
+  */
+ #define SMMU_PA             0x016C0000ull       /* anoc2 SMMU (DTS:5314-5325) */
+ #define SMMU_SIZE           0x00040000u
+@@ -4149,8 +4150,7 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 	b->chan = (uint8_t)chan;
+ 	b->rssi = (int8_t)rssi;
+ 	b->seen = 1;
+-	LOG("M9: t=%u ms: net %2u: %02x:%02x:%02x:**:**:** ch %3u %4d dBm '%s'", g_ms, nbss, b->bssid[0], b->bssid[1],
+-	    b->bssid[2], b->chan, b->rssi, b->ssid);
++	LOG("M9: t=%u ms: net %2u: ch %3u %4d dBm", g_ms, nbss, b->chan, b->rssi);   /* no names or addresses logged */
+ }
+ 
+ static void
+@@ -4553,6 +4553,17 @@ m4(unsigned watch_s)
+ 			LOG("M4: no modem SMP2P item after %u s", watch_s);
+ 			mss_crash_reason(part);
+ 		}
++		if (in != NULL) {
++			struct smp2p_entry *e = (struct smp2p_entry *)(in + 1);
++			char line[200];
++			int n = 0;
++			for (uint32_t i = 0; i < in->valid && i < SMP2P_MAX_ENTRY && n < 170; i++) {
++				char nm[17] = {};
++				memcpy(nm, e[i].name, 16);
++				n += snprintf(line + n, sizeof(line) - (size_t)n, " %s=%08x", nm, e[i].value);
++			}
++			LOG("M4: modem SMP2P item %u, %u entries:%s", ITEM_SMP2P_IN, in->valid, n ? line : " none");
++		}
+ 		m4_alive = ok && sk_last != ~0u && (sk_last & 3) == 2;
+ 		LOG("M4: watch done: slave-kernel %08x, %s", sk_last, ok ? "READY" : "NOT ready");
+ 	}
