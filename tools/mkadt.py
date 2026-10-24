@@ -108,6 +108,12 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
     if pixel1 or taimen:
         P = PIXEL1 if pixel1 else TAIMEN
         phys_base, mem_size, gicd, gicr, vtimer = P['phys_base'], P['mem_size'], P['gicd'], P['gicr'], P['vtimer']
+        # TAIMEN_MEM (boot-xnu.sh): more of the free upper bank (Linux: System RAM up to 0x17e4bffff, ~2 GB
+        # above 4 GB); 512 MiB is the S8 port's limit, untried above that on taimen (boot 61: iOS with
+        # Mesa stalled, compressor busy)
+        if taimen and os.environ.get('TAIMEN_MEM'):
+            mem_size = int(os.environ['TAIMEN_MEM'], 0)
+            assert 0x20000000 <= mem_size <= 0x7e4c0000 and mem_size % 0x200000 == 0, hex(mem_size)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))

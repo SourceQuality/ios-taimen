@@ -26,7 +26,8 @@ if [ "${ROOT:-0}" = 1 ]; then
 fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"
-python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
+# TAIMEN_MEM=BYTES: XNU RAM at 0x100000000 (mkadt.py; default 512 MiB)
+TAIMEN_MEM=${TAIMEN_MEM:-} python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
 # cpus=1 and no root yet: the first milestone is XNU painting its own bands.
 # debug 0x10000c: 0xc plus DB_REBOOT_ALWAYS; DB_NMI alone sets panicDebugging, which parks a
 # panicked kernel instead of resetting (no watchdog bite since boot 13), so a panic now ends in

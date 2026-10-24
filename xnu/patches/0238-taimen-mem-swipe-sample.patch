@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 4a8e3ed..4ac763a 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -872,6 +872,63 @@ taimen_gpu_census(void)
+ 	printf("TAIMEN GPU: census done\n");
+ }
+ 
++/*
++ * Memory every perf tick (0238): boot 61 (iOS + Mesa in 512 MiB) stalled with backboardd's
++ * shader-compile threads parked at a function entry and kernel_task near 200 %. Pages are 4 KB.
++ */
++extern unsigned int vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_wire_count;
++extern uint32_t c_segment_pages_compressed;
++
++static void
++taimen_mem_line(void)
++{
++	printf("TAIMEN MEM: free %u active %u inactive %u wired %u compressed %u pages (%u KB each)
++",
++	    vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_wire_count,
++	    c_segment_pages_compressed, (unsigned)(PAGE_SIZE / 1024));
++}
++
++/*
++ * Synthetic swipes (0238; nobody at the phone overnight): taimenswipe=T injects, T s after the
++ * perf thread starts, a swipe up from the bottom edge (unlock, or home), then every
++ * taimenswipeint=P s (default 20) a horizontal page swipe across the middle, alternating
++ * direction, up to taimenswipen=N (default 12). Panel pixels through sweet_hid_touch, finger 9
++ * (fingers 0-9; a real touch takes the low ones), 16 moves 15 ms apart.
++ */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++static void
++taimen_swipe(int x0, int y0, int x1, int y1)
++{
++	for (int i = 0; i <= 16; i++) {
++		sweet_hid_touch(9, 1, x0 + (x1 - x0) * i / 16, y0 + (y1 - y0) * i / 16);
++		delay(15000);
++	}
++	sweet_hid_touch(9, 0, x1, y1);
++}
++
++static void
++taimen_swipe_thread(void *arg, wait_result_t wr)
++{
++	(void)wr;
++	int t = (int)(uintptr_t)arg, p = 20, n = 12;
++	(void)PE_parse_boot_argn("taimenswipeint", &p, sizeof(p));
++	(void)PE_parse_boot_argn("taimenswipen", &n, sizeof(n));
++	perf_wait((unsigned)t);
++	for (int i = 0; i < n; i++) {
++		if (i == 0) {
++			printf("TAIMEN SWIPE %d: up from the bottom edge
++", i);
++			taimen_swipe(720, 2870, 720, 1300);
++		} else {
++			printf("TAIMEN SWIPE %d: %s
++", i, i & 1 ? "right to left" : "left to right");
++			taimen_swipe(i & 1 ? 1200 : 240, 1500, i & 1 ? 240 : 1200, 1500);
++		}
++		perf_wait((unsigned)(p > 1 ? p : 1));
++	}
++}
++
+ /* Every perf tick while gold runs off GPLL0: any TSENS sensor above 90.0 C parks it. */
+ static void
+ taimen_gold_watch(void)
+@@ -943,6 +1000,12 @@ taimen_clocks(void)
+ 	if (gold > 0) {
+ 		taimen_gold((unsigned)gold);
+ 	}
++	int swipe = 0;
++	thread_t st;
++	if (PE_parse_boot_argn("taimenswipe", &swipe, sizeof(swipe)) && swipe > 0 &&
++	    kernel_thread_start(taimen_swipe_thread, (void *)(uintptr_t)swipe, &st) == KERN_SUCCESS) {
++		thread_deallocate(st);
++	}
+ 	int gpucensus = 0;
+ 	if (PE_parse_boot_argn("taimengpucensus", &gpucensus, sizeof(gpucensus)) && gpucensus > 0) {
+ 		taimen_gpu_census();
+@@ -1018,6 +1081,7 @@ perf_thread(void *arg, wait_result_t result)
+ 		perf_top(perf_ns(now - t));
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 		taimen_gold_watch();
++		taimen_mem_line();
+ #endif
+ 		swaps = sweet_fb_stat_swaps;
+ 		presents = sweet_fb_stat_presents;
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index d680819..92c053c 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -71,11 +71,15 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
++	/* sweetsampleint=S (0238): every S s instead of 120, the first after min(90, S) */
++	int every = 120;
++	(void)PE_parse_boot_argn("sweetsampleint", &every, sizeof(every));
++	every = every < 5 ? 5 : every;
++	(void)tsleep(&chan, PZERO, "sweetsmp", (every < 90 ? every : 90) * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", every * hz);
+ 	}
+ }
+ 
