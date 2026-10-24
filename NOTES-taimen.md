@@ -488,3 +488,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   WORKS")**. RGBA8 -> RGB888 and the 32x32 -> 46x46 scale into RGB888 came out partly written (the dst holds 4-byte
   pixels with alpha 0x80: the A540 2D path does not take RB5_R8G8B8_UNORM as the A530 did). Not needed on taimen: the
   scan buffers are 32-bit and QSEED3 scales. CB0 FSR 0x400 with FAR 0 throughout. 70 s fastboot to fastboot.
+- 2026-10-23 boot 55 (r55 = +0234 GPU clock, taimengpuclk=257): the phone came back to **fastboot** 22 s after the
+  fastboot boot and `fastboot reboot` stayed there: slot-unbootable a and b, retry-count 0. ABL gives a slot 3 boots
+  that never mark it successful (the reader never does); reflashing the reader every run used to reset that, and
+  0231 stopped reflashing an unchanged reader, so both slots ran out after six reader boots. `fastboot
+  --set-active=a` reset it (retry-count 3); autoboot.sh now runs it before every boot. The UFS ring then still held
+  boot 54's log (boot 55 never flushed one).
+- 2026-10-23 **boot 55b (r55 again): gfx3d at 257 MHz.** XO measured 19 MHz; GPUPLL0 relocked at L 0x1a / FRAC 0xc555
+  (MODE 0xd0000005, USER 0x7), gfx3d RCG 0x103 (out_even / 2), **measured 256 MHz** (CP_PERFCTR_CP_0 always-count
+  against the always-on counter); S1 left at 752 mV, MX not voted; the RGBA8 blit again 0 mismatches. 78 s fastboot to
+  fastboot.
