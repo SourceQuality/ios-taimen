@@ -510,3 +510,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   ("frame 1/101 by the GPU in ~8 ms"), no fallbacks, 0 timeouts; not faster than the CPU copy while the CPU renders
   (present avg 8-23 ms, against 5-8 ms: sweet_gpu_quad cleans the 11 MB source out of the CPU caches first). Off by
   default until Mesa renders on the GPU. 0237 binds the presenter thread to CPU 7 (gold) instead.
+- 2026-10-23 boot 59 (r58 = +0237 presenter on CPU 7, 300 s): "presenter bound to cpu 7"; with the user swiping, **7-13
+  frames/s** (1165 kicks in 300 s, the most yet), 0 timeouts; present avg still 5-20 ms (in single-buffer mode the
+  copy waits for the panel to finish the previous frame, sweet_fbcon_wait_idle).
+- 2026-10-23 **boot 60 (r58, E6: sweetgl.dylib (PRs #1 + #2, Mesa 26.3.0-rc2) in backboardd): Mesa runs on the A540.**
+  ROOTFIX installed /usr/lib/sweetgl-92a13443.dylib (19.2 MB, write-if-absent); SWEET ENV injected it; sweetgl found
+  the iPhone X (dsc-x) shared cache, installed its QuartzCore fixes, opened "screen FD540 (freedreno)" and made
+  CA's EAGLContext (API 3) on Mesa; backboardd flushed 37-60 frames/s; GPU copy (taimengpucopy=1) 900+ frames at
+  ~7-8 ms. **The panel stayed black**: every attach of the display surfaces failed, "attachImage: surface 2 b3a8
+  1125x2436 pitch 0 plane 0: format failed". On the iPhone X root backboardd's display surfaces are 'b3a8': BGRA8
+  plane 0 (bpe 4, rows 4544) plus an A8 plane (13.88 MB); bind_surface refused multi-plane surfaces, and the kernel
+  IOSurface reports no per-plane rows. Also texImageIOSurface copy errors 0x506 on LA08 230x186 / 256x1 surfaces.

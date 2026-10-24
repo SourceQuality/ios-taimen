@@ -1431,6 +1431,7 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 	case 'A008':
 		return gl_format(GL_ALPHA, GL_UNSIGNED_BYTE, internalformat);
 	case 'BGRA':
+	case 'b3a8':            /* plane 0 of the iPhone X display surfaces (bind_surface) */
 		*internalformat = GL_RGBA8;
 		return PIPE_FORMAT_B8G8R8A8_UNORM;
 	case 'RGBA':
@@ -1623,7 +1624,17 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	size_t w = IOSurfaceGetWidthOfPlane(s, plane), h = IOSurfaceGetHeightOfPlane(s, plane);
 	size_t pitch = IOSurfaceGetBytesPerRowOfPlane(s, plane);
 	struct sgl_image img = {0};
-	bool multi = IOSurfaceGetPlaneCount(s) > 1 || plane != 0;   /* ponytail: YUV surfaces not yet */
+	/*
+	 * 'b3a8' (taimen's iPhone X root): backboardd's display surfaces are BGRA8 in plane 0 plus an
+	 * A8 plane (bpe 4, rows 4544 for 1125 px). The kernel IOSurface reports no per-plane rows
+	 * (pitch 0, boot 60), so plane 0 is the surface's own rows from its base; the alpha plane is
+	 * not drawn (the display path reads plane 0 only).
+	 */
+	bool b3a8 = fourcc == 'b3a8' && plane == 0;
+	if (b3a8 && pitch == 0) {
+		pitch = IOSurfaceGetBytesPerRow(s);
+	}
+	bool multi = !b3a8 && (IOSurfaceGetPlaneCount(s) > 1 || plane != 0);   /* ponytail: YUV surfaces not yet */
 	img.format = format && !multi ? gl_format(format, type, &img.internalformat) : PIPE_FORMAT_NONE;
 	if (img.format == PIPE_FORMAT_NONE && !multi) {
 		img.format = surface_format(fourcc, IOSurfaceGetBytesPerElementOfPlane(s, plane), &img.internalformat);
@@ -1651,13 +1662,17 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	uint32_t handle = 0;
 	uint64_t size = 0;
 	const char *step = img.format == PIPE_FORMAT_NONE ? "format" : "kernel import";
+	uintptr_t pbase = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(s, plane);
+	if (b3a8 && pbase == 0) {
+		pbase = (uintptr_t)IOSurfaceGetBaseAddress(s);
+	}
 	struct surf_res key = {
 		.id = IOSurfaceGetID(s),
 		.format = img.format,
 		.w = (uint32_t)w,
 		.h = (uint32_t)h,
 		.pitch = (uint32_t)pitch,
-		.base = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(s, plane),
+		.base = pbase,
 	};
 	img.res = img.format != PIPE_FORMAT_NONE ? surf_res_get(&key) : NULL;
 	if (img.res == NULL && img.format != PIPE_FORMAT_NONE &&
@@ -1678,7 +1693,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 			.handle = handle,
 			.stride = (unsigned)pitch,
 			/* client-memory surfaces start inside their first page (kernel 0157) */
-			.offset = (unsigned)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(s, plane) & vm_page_mask),
+			.offset = (unsigned)(pbase & vm_page_mask),
 			.format = img.format,
 			.modifier = DRM_FORMAT_MOD_LINEAR,
 		};
