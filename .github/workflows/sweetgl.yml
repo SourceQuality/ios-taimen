@@ -91,6 +91,9 @@ jobs:
           sh tools/sweetgl/mesa-setup.sh
 
       - name: Build
+        env:
+          # keep going after errors so one run reports every compile failure
+          NINJA_FLAGS: "-k 0"
         run: sh tools/sweetgl/build.sh
 
       - name: ccache stats

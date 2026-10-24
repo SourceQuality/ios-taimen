@@ -46,3 +46,24 @@ index 29134ba..0c3fdbb 100644
     if (rsc->layout.pitch0 < (prsc->width0 * rsc->layout.cpp) ||
         fd_resource_pitch(rsc, 0) != rsc->layout.pitch0)
        return false;
+diff --git a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
+index 4596772..bf8486d 100644
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -33,6 +33,8 @@
+    if (ir3_shader_debug & IR3_DBG_NOCACHE)
+       return;
+ 
++#ifndef __APPLE__
++   /* no ELF build id on Mach-O (util/build_id.h); the cache is disabled anyway */
+    const char *renderer = fd_dev_name(compiler->dev_id);
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+@@ -55,6 +57,7 @@
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
++#endif
+ }
+ 
+ void

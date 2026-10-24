@@ -19,7 +19,8 @@ LIBS="src/mesa/libmesa.a src/gallium/auxiliary/libgallium.a
 	src/mesa/glapi/glapi/libglapi_bridge.a src/mesa/glapi/shared-glapi/libglapi.a
 	src/util/libxmlconfig.a src/util/libmesa_util.a src/util/libmesa_util_simd.a src/util/blake3/libblake3.a
 	src/c11/impl/libmesa_util_c11.a"
-(cd "$B" && ninja $LIBS)
+# NINJA_FLAGS: e.g. "-k 0" to see every compile error in one run
+(cd "$B" && ninja $NINJA_FLAGS $LIBS)
 O=$H/out
 mkdir -p "$O"
 nm -g "$B/src/mesa/glapi/glapi/libglapi_bridge.a" > "$O/bridge.nm"
