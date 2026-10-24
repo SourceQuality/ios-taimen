@@ -1,0 +1,158 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 038f88e..33a8799 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -367,7 +367,7 @@ rootfix_findrm(const char *path, uint32_t depth, const char *prefix, const char
+ 		return 0;
+ 	}
+ 	char *buf = kalloc_data(bsz, Z_WAITOK);
+-	char (*subs)[64] = depth > 1 ? kalloc_data(64 * 64, Z_WAITOK | Z_ZERO) : NULL;
++	char (*subs)[64] = depth > 1 ? kalloc_data(256 * 64, Z_WAITOK | Z_ZERO) : NULL;
+ 	char (*hits)[96] = kalloc_data(8 * 96, Z_WAITOK | Z_ZERO);
+ 	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
+ 	unsigned nsub = 0, nhit = 0;
+@@ -400,7 +400,7 @@ rootfix_findrm(const char *path, uint32_t depth, const char *prefix, const char
+ 				continue;
+ 			}
+ 			if (d->d_type == DT_DIR) {
+-				if (subs != NULL && nsub < 64 && d->d_namlen < 64) {
++				if (subs != NULL && nsub < 256 && d->d_namlen < 64) {
+ 					strlcpy(subs[nsub++], d->d_name, 64);
+ 				}
+ 			} else if (d->d_type == DT_REG && d->d_namlen >= pl + sl && d->d_namlen < 96 &&
+@@ -434,7 +434,7 @@ out:
+ 		kfree_data(hits, 8 * 96);
+ 	}
+ 	if (subs != NULL) {
+-		kfree_data(subs, 64 * 64);
++		kfree_data(subs, 256 * 64);
+ 	}
+ 	if (buf != NULL) {
+ 		kfree_data(buf, bsz);
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 76fd7a1..7a2a3ae 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -1204,6 +1204,7 @@ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
+ static bool m6_on, q_announced, m7_on, m8_on, m9_on;
+ static bool ce_start(void);
++static bool wlan_smmu(void);
+ static void radio_poll(unsigned ms);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
+ static void wlfw_rx(const uint8_t *d, uint32_t len);
+@@ -2487,7 +2488,7 @@ svc_summary(void)
+ 	}
+ }
+ 
+-extern "C" bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
++extern "C" bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
+ 
+ /* ---------------------------------------------------------------- M7: WLFW (QMI 0x45) */
+ 
+@@ -2510,6 +2511,8 @@ extern "C" bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
+ #define WLFW_PIN_RESULT_IND     0x2C
+ #define WLFW_MSA_INFO           0x2D
+ #define WLFW_MSA_READY          0x2E
++#define WLFW_VBATT              0x32
++#define WLFW_FEATURE_MASK       0x3B
+ #define WLFW_MSA_SIZE           0x00100000u     /* icnss msa_mem_size */
+ #define WLFW_CLIENT_ID          0x4b4e454c      /* icnss WLFW_CLIENT_ID */
+ #define VMID_WLAN               0x18
+@@ -2772,6 +2775,31 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		if (ok) {
+ 			w_on_cap(d, len);
+ 		}
++		/* icnss: wlfw_dynamic_feature_mask_send_sync_msg (FW_REJUVENATE), then the VPH voltage */
++		wm_new(&m, WLFW_FEATURE_MASK);
++		{
++			uint64_t mask = 1;
++			wm_tlv(&m, 0x10, &mask, 8);
++		}
++		wm_send(&m, "feature mask sent");
++		break;
++	case WLFW_FEATURE_MASK: {
++		const uint8_t *v = qm_find(d, len, 0x10, &l);
++		uint64_t prev = 0;
++		if (v != NULL && l >= 8) {
++			memcpy(&prev, v, 8);
++		}
++		LOG("M7: t=%u ms: dynamic feature mask %s err %u (previous %#llx)", g_ms, ok ? "ok" : "refused", err, prev);
++		wm_new(&m, WLFW_VBATT);
++		{
++			uint64_t uv = 3900000;                  /* icnss_init_vph_monitor: VPH_PWR */
++			wm_tlv(&m, 0x01, &uv, 8);
++		}
++		wm_send(&m, "vbatt sent");
++		break;
++	}
++	case WLFW_VBATT:
++		LOG("M7: t=%u ms: vbatt %s err %u", g_ms, ok ? "ok" : "FAILED", err);
+ 		w_step = "waiting for FW_READY";
+ 		break;
+ 	case WLFW_WLAN_CFG:
+@@ -2788,6 +2816,11 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		if (ok) {
+ 			w_mission = true;
+ 			w_step = "WLAN on (mission mode)";
++			/* the SMMU stream only now: if programming it stalls this CPU, M7's result is logged */
++			if (m8_on && !wlan_smmu()) {
++				LOG("M8: no SMMU stream for the WLAN: M8/M9 off");
++				m8_on = m9_on = false;
++			}
+ 			if (m8_on) {
+ 				IOSleep(100);
+ 				(void)ce_start();               /* only now: before mission a CE access hangs the bus */
+@@ -2800,19 +2833,24 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
+-/* the WLAN rails (icnss_hw_power_on; plan stage 1): before the modem boots */
+ static void
+ wlfw_summary(void)
+ {
+ 	LOG("M7: WLFW %s%s", w_step, w_fw_ready ? " (firmware ready)" : "");
+ }
+ 
++/*
++ * The WLAN rails (icnss_hw_power_on; plan stage 1), before the modem boots. Android drives L7, L17
++ * and L25 through their pin-ctrl twins (enable and high-power mode follow the WCN3990's HW_EN2) and
++ * L5's mode follows EN0. Boot 113 voted a plain software enable and the firmware never got to
++ * FW_READY: probably low-power mode. Here: on, with a 100 mA load each, so the RPM picks high power.
++ */
+ static void
+ w_rails(void)
+ {
+-	bool l5 = sweet_rpm_ldoa(5, 800000), l7 = sweet_rpm_ldoa(7, 1800000);
+-	bool l17 = sweet_rpm_ldoa(17, 1304000), l25 = sweet_rpm_ldoa(25, 3312000);
+-	LOG("M7: WLAN rails L5 0.8 V %s, L7 1.8 V %s, L17 1.304 V %s, L25 3.312 V %s", l5 ? "ok" : "FAILED",
++	bool l5 = sweet_rpm_ldoa_load(5, 800000, 100), l7 = sweet_rpm_ldoa_load(7, 1800000, 100);
++	bool l17 = sweet_rpm_ldoa_load(17, 1304000, 100), l25 = sweet_rpm_ldoa_load(25, 3312000, 100);
++	LOG("M7: WLAN rails (100 mA each) L5 0.8 V %s, L7 1.8 V %s, L17 1.304 V %s, L25 3.312 V %s", l5 ? "ok" : "FAILED",
+ 	    l7 ? "ok" : "FAILED", l17 ? "ok" : "FAILED", l25 ? "ok" : "FAILED");
+ }
+ 
+@@ -2911,6 +2949,12 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	return ok;
+ }
+ 
++static bool
++wlan_smmu(void)
++{
++	return smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN");
++}
++
+ /* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
+ 
+ #define CE_PA               (0x18800000ull + 0x240000)
+@@ -4143,10 +4187,6 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 	if (m7_on) {
+ 		w_rails();                              /* before the modem boots (flame lesson 6) */
+ 	}
+-	if (m8_on && !smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN")) {
+-		LOG("M8: no SMMU stream for the WLAN: M8/M9 off");
+-		m8_on = m9_on = false;
+-	}
+ 	if (level >= 4 && !m3()) {
+ 		LOG("M3 failed: stop (the modem may hold the MBA carve-out until a reset)");
+ 		return;
