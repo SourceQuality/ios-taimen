@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 089e24d..2de6efe 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -869,10 +869,40 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * The presenter's 11.2 MB copy per frame runs at ~1 GB/s on a silver core and ~7.9 GB/s on a gold
++ * one at 1728 MHz (boot 46), and XNU otherwise picks the lowest-numbered idle CPU, a silver one
++ * (docs/taimen-amp-plan.md). With all 8 cores up it is bound to CPU 7 (0237); taimenpresentcpu=N
++ * picks another, -1 leaves it to the scheduler.
++ */
++extern "C" struct processor *thread_bind(struct processor *processor);
++extern "C" struct processor *cpu_to_processor(int cpu);
++extern "C" unsigned int ml_get_cpu_count(void);
++
++static void
++taimen_presenter_cpu(void)
++{
++	int cpu = 7;
++	(void)PE_parse_boot_argn("taimenpresentcpu", &cpu, sizeof(cpu));
++	unsigned n = ml_get_cpu_count();
++	if (cpu < 0 || (unsigned)cpu >= n || n < 8) {
++		IOLog("TAIMEN FB: presenter left to the scheduler (taimenpresentcpu %d, %u cpus)\n", cpu, n);
++		return;
++	}
++	thread_bind(cpu_to_processor(cpu));
++	thread_block(THREAD_CONTINUE_NULL);     /* migrate */
++	IOLog("TAIMEN FB: presenter bound to cpu %d\n", cpu);
++}
++#endif
++
+ void
+ AppleCLCD::presenter(void *arg, __unused wait_result_t wr)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)arg;
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	taimen_presenter_cpu();
++#endif
+ 	IOLockLock(fb->fLock);
+ 	for (;;) {
+ 		/* blanked: setPower(true) presents what is pending */

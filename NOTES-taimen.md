@@ -501,3 +501,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-23 **boot 56 (r55, taimengpuclk=596): gfx3d at 596 MHz.** rwmx vlvl 256 ok; PM8005 S1 752 -> 970 mV
   (FTS426 0x40/0x41, LSB then MSB, read back 970: the first PMIC write from XNU on taimen); GPUPLL0 L 0x3e FRAC 0x1555
   locked (MODE 0xd0000005); **measured 596 MHz**; the RGBA8 blit 0 mismatches. 82 s fastboot to fastboot.
+- 2026-10-23 **boot 57 (r56 = +0235, sweetgpu=8 sweetgpuclk=600): the GPU service runs.** gfx3d 342 MHz (S1 775 mV,
+  measured 341), GPU VA window 8-16 GB, scattered buffers mapped, sweet_gpu_quad API self-test OK (0 bad pixels,
+  EINVAL/EFAULT as expected); MX 256, S1 970 mV, gfx3d measured 595 MHz, API OK again. The quad bench returned 0
+  silently (no 4 MB contiguous buffer on the 4K kernel, most likely).
+- 2026-10-23 boot 58 (r57 = +0236): quad bench at taimen's 1125x2436 (pitch 4608, scattered pages): 19.6 ms at 342
+  MHz, 11.5 ms at 596 MHz. **E5 works**: with taimengpucopy=1 the A540 copies each iOS frame into the scan buffer
+  ("frame 1/101 by the GPU in ~8 ms"), no fallbacks, 0 timeouts; not faster than the CPU copy while the CPU renders
+  (present avg 8-23 ms, against 5-8 ms: sweet_gpu_quad cleans the 11 MB source out of the CPU caches first). Off by
+  default until Mesa renders on the GPU. 0237 binds the presenter thread to CPU 7 (gold) instead.
