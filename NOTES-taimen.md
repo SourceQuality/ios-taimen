@@ -479,3 +479,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   drive after copying and the reader went straight to fastboot; the reader was not reflashed (inputs unchanged).
   **fastboot boot to fastboot again in 64 s** (was ~5-6 min). The PowerShell file list printed during the copy can
   show short sizes (the \wsl.localhost view lags); the files are complete.
+- 2026-10-23 boot 53 (r53 = +0232 zap, sweetgpu=3): **SCM from XNU works on taimen**: INFO
+  IS_CALL_AVAIL(PAS_INIT_IMAGE) -> 0/1. PAS_IS_SUPPORTED(13) -> 0/0, and 0232 stopped on it; 0233 only logs it
+  (mainline's zap loader never asks; Android loaded this zap through PAS 13).
+- 2026-10-23 **boot 54 (r54 = +0233): the A540 leaves secure mode and blits.** a540_zap: metadata (6684 bytes) at
+  0x9ef00000, init_image 0/0, mem_setup 0x95a00000 + 0x2000 0/0, segment written, auth_and_reset 0/0;
+  CP_SET_SECURE_MODE 0 -> TRUST 0, marker 5ec0de00 landed. **RGBA8 64x64 2D copy: 0 mismatches ("GPU 2D BLIT
+  WORKS")**. RGBA8 -> RGB888 and the 32x32 -> 46x46 scale into RGB888 came out partly written (the dst holds 4-byte
+  pixels with alpha 0x80: the A540 2D path does not take RB5_R8G8B8_UNORM as the A530 did). Not needed on taimen: the
+  scan buffers are 32-bit and QSEED3 scales. CB0 FSR 0x400 with FAR 0 throughout. 70 s fastboot to fastboot.
