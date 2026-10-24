@@ -1,0 +1,449 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 1696030..b3764fe 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -304,8 +304,9 @@ ufs_sync_cache(void)
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++/* The GPT entry named want on su.lun: its first block and length. ENXIO: no GPT; ENOENT: no such name. */
+ static int
+-ufs_find_partition(const char *want)
++ufs_gpt_lookup(const char *want, uint64_t *first_out, uint64_t *nblocks_out)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
+@@ -313,7 +314,6 @@ ufs_find_partition(const char *want)
+ 		return error;
+ 	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
+ 		return ENXIO;
+ 	}
+ 	uint64_t entry_lba;
+@@ -350,14 +350,95 @@ ufs_find_partition(const char *want)
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		*first_out = first;
++		*nblocks_out = last - first + 1;
+ 		return 0;
+ 	}
+-	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+ }
+ 
++static int
++ufs_find_partition(const char *want)
++{
++	uint64_t first = 0, n = 0;
++	int error = ufs_gpt_lookup(want, &first, &n);
++	if (error == ENXIO) {
++		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
++	} else if (error == ENOENT) {
++		printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
++	}
++	if (error == 0) {
++		su.first_block = first;
++		su.nblocks = n;
++	}
++	return error;
++}
++
++/*
++ * Read-only access to any GPT partition on LUNs 0-5 (xnu 0265, TaimenModem: modem_a and the EFS
++ * partitions, docs/taimen-wifi-plan.md stage 4). Under the driver lock, su.lun switched for these
++ * commands and put back; the root partition's state is not touched. Each LUN's first command is
++ * tried twice (a unit attention after the switch).
++ */
++int sweet_ufs_part_find(const char *name, uint8_t *lun, uint64_t *first, uint64_t *nblocks);
++int sweet_ufs_part_read(uint8_t lun, uint64_t first, uint64_t nblocks, uint64_t off, void *dst, uint32_t len);
++
++int
++sweet_ufs_part_find(const char *name, uint8_t *lun, uint64_t *first, uint64_t *nblocks)
++{
++	int error = ENODEV;
++	if (!su.ready) {
++		return ENODEV;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t root = su.lun;
++	for (uint8_t l = 0; l < 6; l++) {
++		su.lun = l;
++		error = ufs_gpt_lookup(name, first, nblocks);
++		if (error != 0 && error != ENXIO && error != ENOENT) {
++			error = ufs_gpt_lookup(name, first, nblocks);
++		}
++		if (error == 0) {
++			*lun = l;
++			break;
++		}
++	}
++	su.lun = root;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error == 0 ? 0 : ENOENT;
++}
++
++int
++sweet_ufs_part_read(uint8_t lun, uint64_t first, uint64_t nblocks, uint64_t off, void *dst, uint32_t len)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = 0;
++	if (!su.ready || lun > 5 || off > nblocks * UFS_BLOCK || len > nblocks * UFS_BLOCK - off) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t root = su.lun;
++	su.lun = lun;
++	for (uint32_t done = 0; done < len && error == 0;) {
++		uint64_t pos = off + done;
++		uint64_t blk = pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t nblk = (uint32_t)MIN((uint64_t)(BOUNCE_SIZE / UFS_BLOCK), (skip + (len - done) + UFS_BLOCK - 1) / UFS_BLOCK);
++		error = ufs_read_blocks(first + blk, nblk);
++		if (error) {
++			error = ufs_read_blocks(first + blk, nblk);
++		}
++		if (error == 0) {
++			uint32_t chunk = MIN(nblk * UFS_BLOCK - skip, len - done);
++			memcpy((uint8_t *)dst + done, b + skip, chunk);
++			done += chunk;
++		}
++	}
++	su.lun = root;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index c471041..9ed09e2 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * taimen (MSM8998) Wi-Fi through the modem DSP, docs/taimen-wifi-plan.md. Boot-arg taimenwifi=N
+- * runs the milestones up to N (section 4).
++ * runs milestones M0 through M(N-1) (section 4).
+  *
+  * M0 (this file so far): a read-only look at what the modem path needs, nothing written.
+  *   SMEM      0x86000000, 2 MB. Downstream smem.c expects version 11: global items in the
+@@ -56,6 +56,20 @@ extern "C" void taimen_modem_init(void);
+ #define SCM_FN(svc, cmd)        (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+ #define SCM_SIP_FNID(svc, cmd)  (0x02000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+ 
++#define PT_LOAD                 1
++#define MDT_TYPE_MASK           (7u << 24)
++#define MDT_TYPE_HASH           (2u << 24)
++
++struct elf32_ehdr {
++	uint8_t  e_ident[16];
++	uint16_t e_type, e_machine;
++	uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
++	uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
++} __attribute__((packed));
++struct elf32_phdr {
++	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
++} __attribute__((packed));
++
+ struct smem_global_entry { uint32_t allocated, offset, size, aux_base; } __attribute__((packed));
+ struct smem_header {
+ 	uint32_t proc_comm[16];
+@@ -225,6 +239,184 @@ smem_global_get(uint16_t item, uint32_t *size)
+ 	return smem + h->toc[item].offset;
+ }
+ 
++/* ---------------------------------------------------------------- UFS partitions and FAT */
++
++/*
++ * M2 (0265): the firmware the modem boots from. modem_a is VFAT (Android mounts it at /firmware):
++ * mba.mbn and modem.mdt + modem.bNN in image/; the EFS partitions (modemst1, modemst2, fsg, fsc)
++ * are raw. Read through sweet_ufs.c's read-only partition API (any LUN), the FAT here: FAT16/32,
++ * 8.3 names (the firmware names fit, VFAT keeps a short entry next to each long one), one FAT
++ * block cached.
++ */
++extern "C" int sweet_ufs_part_find(const char *name, uint8_t *lun, uint64_t *first, uint64_t *nblocks);
++extern "C" int sweet_ufs_part_read(uint8_t lun, uint64_t first, uint64_t nblocks, uint64_t off, void *dst,
++    uint32_t len);
++
++struct part {
++	uint8_t lun;
++	uint64_t first, nblocks;
++};
++
++static bool
++part_open(const char *name, struct part *p)
++{
++	return sweet_ufs_part_find(name, &p->lun, &p->first, &p->nblocks) == 0;
++}
++
++static int
++part_read(const struct part *p, uint64_t off, void *dst, uint32_t len)
++{
++	return sweet_ufs_part_read(p->lun, p->first, p->nblocks, off, dst, len);
++}
++
++struct fat {
++	struct part p;
++	uint32_t bps, spc, rsvd, nfats, fatsz, root_ents, root_clus, cluster_bytes;
++	uint64_t fat_off, root_off, data_off;
++	int bits;                               /* 16 or 32 */
++	uint8_t cache[4096];
++	uint64_t cache_off;                     /* ~0: empty */
++};
++
++struct fat_file {
++	uint32_t clus, size;
++	bool dir;
++};
++
++#define FAT_EOC(f, c)   ((f)->bits == 16 ? (c) >= 0xFFF8u : (c) >= 0x0FFFFFF8u)
++
++static bool
++fat_mount(struct fat *f, const char *name)
++{
++	uint8_t bs[512];
++	if (!part_open(name, &f->p) || part_read(&f->p, 0, bs, sizeof(bs)) != 0 || bs[510] != 0x55 || bs[511] != 0xAA) {
++		return false;
++	}
++	f->bps = bs[11] | bs[12] << 8;
++	f->spc = bs[13];
++	f->rsvd = bs[14] | bs[15] << 8;
++	f->nfats = bs[16];
++	f->root_ents = bs[17] | bs[18] << 8;
++	uint32_t fatsz16 = bs[22] | bs[23] << 8;
++	uint32_t fatsz32 = bs[36] | bs[37] << 8 | bs[38] << 16 | (uint32_t)bs[39] << 24;
++	f->fatsz = fatsz16 != 0 ? fatsz16 : fatsz32;
++	f->bits = f->root_ents != 0 ? 16 : 32;  /* FAT12 does not hold a modem image */
++	f->root_clus = bs[44] | bs[45] << 8 | bs[46] << 16 | (uint32_t)bs[47] << 24;
++	if (f->bps == 0 || f->spc == 0 || f->nfats == 0 || f->fatsz == 0) {
++		return false;
++	}
++	f->cluster_bytes = f->bps * f->spc;
++	f->fat_off = (uint64_t)f->rsvd * f->bps;
++	f->root_off = f->fat_off + (uint64_t)f->nfats * f->fatsz * f->bps;
++	f->data_off = f->root_off + (((uint64_t)f->root_ents * 32 + f->bps - 1) / f->bps) * f->bps;
++	f->cache_off = ~0ull;
++	return true;
++}
++
++static uint32_t
++fat_next(struct fat *f, uint32_t clus)
++{
++	uint64_t off = f->fat_off + (uint64_t)clus * (f->bits / 8);
++	uint64_t blk = off & ~(uint64_t)(sizeof(f->cache) - 1);
++	if (f->cache_off != blk) {
++		if (part_read(&f->p, blk, f->cache, sizeof(f->cache)) != 0) {
++			return 0x0FFFFFFFu;
++		}
++		f->cache_off = blk;
++	}
++	const uint8_t *e = f->cache + (off - blk);
++	return f->bits == 16 ? (uint32_t)(e[0] | e[1] << 8) :
++	       (e[0] | e[1] << 8 | e[2] << 16 | (uint32_t)e[3] << 24) & 0x0FFFFFFFu;
++}
++
++/* Bytes [off, off + len) of a file or directory (clus 0 with bits 16: the fixed root). */
++static int
++fat_read(struct fat *f, const struct fat_file *ff, uint64_t off, void *dst, uint32_t len)
++{
++	if (ff->clus == 0 && f->bits == 16) {
++		return part_read(&f->p, f->root_off + off, dst, len);
++	}
++	uint32_t clus = ff->clus;
++	for (uint64_t skip = off / f->cluster_bytes; skip > 0; skip--) {
++		clus = fat_next(f, clus);
++		if (clus < 2 || FAT_EOC(f, clus)) {
++			return EIO;
++		}
++	}
++	uint32_t done = 0, in = (uint32_t)(off % f->cluster_bytes);
++	while (done < len) {
++		if (clus < 2 || FAT_EOC(f, clus)) {
++			return EIO;
++		}
++		uint32_t n = MIN(f->cluster_bytes - in, len - done);
++		int err = part_read(&f->p, f->data_off + (uint64_t)(clus - 2) * f->cluster_bytes + in,
++		    (uint8_t *)dst + done, n);
++		if (err != 0) {
++			return err;
++		}
++		done += n;
++		in = 0;
++		if (done < len) {
++			clus = fat_next(f, clus);
++		}
++	}
++	return 0;
++}
++
++static void
++fat_83(const char *name, char out[11])
++{
++	memset(out, ' ', 11);
++	const char *dot = strchr(name, '.');
++	for (int i = 0; i < 8 && name[i] != 0 && &name[i] != dot; i++) {
++		out[i] = (char)(name[i] >= 'a' && name[i] <= 'z' ? name[i] - 32 : name[i]);
++	}
++	for (int i = 0; dot != NULL && i < 3 && dot[1 + i] != 0; i++) {
++		char c = dot[1 + i];
++		out[8 + i] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c);
++	}
++}
++
++/*
++ * Entry idx of a directory (dir NULL: the root) into e: 1 a live short entry, 0 one to skip
++ * (deleted, long-name part, volume label), -1 the end.
++ */
++static int
++fat_dir_entry(struct fat *f, const struct fat_file *dir, uint32_t idx, uint8_t e[32])
++{
++	struct fat_file root = { f->bits == 16 ? 0 : f->root_clus, f->bits == 16 ? f->root_ents * 32u : 0, true };
++	const struct fat_file *d = dir != NULL ? dir : &root;
++	uint64_t off = (uint64_t)idx * 32;
++	if (off >= (d->size != 0 ? d->size : 0x100000u) || fat_read(f, d, off, e, 32) != 0 || e[0] == 0) {
++		return -1;
++	}
++	return e[0] == 0xE5 || (e[11] & 0x0F) == 0x0F || (e[11] & 0x08) ? 0 : 1;
++}
++
++static void
++fat_entry_file(const struct fat *f, const uint8_t *e, struct fat_file *out)
++{
++	out->clus = (uint32_t)(e[26] | e[27] << 8) | (f->bits == 32 ? (uint32_t)(e[20] | e[21] << 8) << 16 : 0);
++	out->size = e[28] | e[29] << 8 | e[30] << 16 | (uint32_t)e[31] << 24;
++	out->dir = (e[11] & 0x10) != 0;
++}
++
++static bool
++fat_lookup(struct fat *f, const struct fat_file *dir, const char *name, struct fat_file *out)
++{
++	char want[11];
++	uint8_t e[32];
++	int r;
++	fat_83(name, want);
++	for (uint32_t i = 0; (r = fat_dir_entry(f, dir, i, e)) >= 0; i++) {
++		if (r == 1 && memcmp(e, want, 11) == 0) {
++			fat_entry_file(f, e, out);
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* ---------------------------------------------------------------- milestones */
+ 
+ static void
+@@ -320,6 +512,97 @@ m1(void)
+ 	return r1 == 0 && r2 == 0;
+ }
+ 
++/* M2: modem_a's image/ (mba.mbn, modem.mdt and its segments) and the EFS partitions, read only. */
++static struct fat modem_fs;
++static uint8_t m2_buf[0x1000];
++
++static bool
++m2(void)
++{
++	struct fat *f = &modem_fs;
++	if (!fat_mount(f, "modem_a")) {
++		LOG("M2: modem_a: not found or not FAT");
++		return false;
++	}
++	LOG("M2: modem_a on LUN %u at block %#llx, %llu MiB: FAT%d, %u-byte clusters, %u FATs of %u sectors",
++	    f->p.lun, f->p.first, f->p.nblocks * 4096 >> 20, f->bits, f->cluster_bytes, f->nfats, f->fatsz);
++	struct fat_file img = {}, mba = {}, mdt = {};
++	if (!fat_lookup(f, NULL, "image", &img) || !img.dir) {
++		LOG("M2: modem_a has no image/ directory");
++		return false;
++	}
++	char line[192];
++	int n = 0, files = 0, r;
++	uint8_t e[32];
++	for (uint32_t i = 0; (r = fat_dir_entry(f, &img, i, e)) >= 0; i++) {
++		if (r != 1 || e[0] == '.') {
++			continue;
++		}
++		char nm[13];
++		int k = 0;
++		for (int c = 0; c < 8 && e[c] != ' '; c++) {
++			nm[k++] = (char)e[c];
++		}
++		if (e[8] != ' ') {
++			nm[k++] = '.';
++			for (int c = 8; c < 11 && e[c] != ' '; c++) {
++				nm[k++] = (char)e[c];
++			}
++		}
++		nm[k] = 0;
++		files++;
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", nm);
++		if (n > 150) {
++			LOG("M2:   image/:%s", line);
++			n = 0;
++		}
++	}
++	if (n > 0) {
++		LOG("M2:   image/:%s", line);
++	}
++	bool have_mba = fat_lookup(f, &img, "mba.mbn", &mba);
++	bool have_mdt = fat_lookup(f, &img, "modem.mdt", &mdt);
++	unsigned phnum = 0, loads = 0;
++	uint64_t load_bytes = 0;
++	if (have_mdt && fat_read(f, &mdt, 0, m2_buf, MIN(mdt.size, (uint32_t)sizeof(m2_buf))) == 0 &&
++	    memcmp(m2_buf, "\x7f" "ELF", 4) == 0) {
++		const struct elf32_ehdr *eh = (const struct elf32_ehdr *)m2_buf;
++		phnum = eh->e_phnum;
++		for (unsigned i = 0; i < phnum && eh->e_phoff + (i + 1) * sizeof(struct elf32_phdr) <= sizeof(m2_buf); i++) {
++			const struct elf32_phdr *ph = (const struct elf32_phdr *)(m2_buf + eh->e_phoff) + i;
++			if (ph->p_type == PT_LOAD && ph->p_filesz != 0 && (ph->p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH) {
++				loads++;
++				load_bytes += ph->p_filesz;
++			}
++		}
++	}
++	uint8_t mh[4] = {};
++	if (have_mba) {
++		(void)fat_read(f, &mba, 0, mh, sizeof(mh));
++	}
++	LOG("M2: %d files in image/; mba.mbn %s (%u bytes, %s), modem.mdt %s (%u bytes): %u program headers, %u "
++	    "loadable segments, %llu KiB", files, have_mba ? "found" : "MISSING", mba.size,
++	    memcmp(mh, "\x7f" "ELF", 4) == 0 ? "ELF" : "not ELF", have_mdt ? "found" : "MISSING", mdt.size, phnum,
++	    loads, load_bytes >> 10);
++	static const char *const efs[] = {"modemst1", "modemst2", "fsg", "fsc"};
++	unsigned efs_ok = 0;
++	for (unsigned i = 0; i < sizeof(efs) / sizeof(efs[0]); i++) {
++		struct part p;
++		if (!part_open(efs[i], &p) || part_read(&p, 0, m2_buf, 512) != 0) {
++			LOG("M2: %s: not found or unreadable", efs[i]);
++			continue;
++		}
++		unsigned nz = 0;
++		for (unsigned b = 0; b < 512; b++) {
++			nz += m2_buf[b] != 0;
++		}
++		efs_ok++;
++		LOG("M2: %s on LUN %u at block %#llx, %llu KiB; first 512 bytes: %u non-zero", efs[i], p.lun, p.first,
++		    p.nblocks * 4, nz);
++	}
++	return have_mba && have_mdt && loads > 0 && efs_ok == 4;
++}
++
+ static void
+ modem_thread(void *arg, wait_result_t wr __unused)
+ {
+@@ -333,6 +616,10 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 		LOG("M1 failed: stop");
+ 		return;
+ 	}
++	if (level >= 3 && !m2()) {
++		LOG("M2 failed: stop");
++		return;
++	}
+ }
+ 
+ void
