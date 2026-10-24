@@ -1,0 +1,44 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index abbf4ac..2a01de2 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -257,13 +257,11 @@ rootfix_list(const char *path, uint32_t depth, vfs_context_t ctx)
+ 	vnode_t vp = NULLVP;
+ 	int err = vnode_lookup(path, 0, &vp, ctx);
+ 	if (err != 0) {
+-		printf("TAIMEN ROOTFIX: ls %s: not there (%d)
+-", path, err);
++		printf("TAIMEN ROOTFIX: ls %s: not there (%d)\n", path, err);
+ 		return 0;
+ 	}
+ 	if (!vnode_isdir(vp)) {
+-		printf("TAIMEN ROOTFIX: ls %s: not a directory
+-", path);
++		printf("TAIMEN ROOTFIX: ls %s: not a directory\n", path);
+ 		vnode_put(vp);
+ 		return 0;
+ 	}
+@@ -306,8 +304,7 @@ rootfix_list(const char *path, uint32_t depth, vfs_context_t ctx)
+ 				strlcpy(subs[nsub++], d->d_name, 64);
+ 			}
+ 			if (ll + d->d_namlen + 2 > 200) {
+-				printf("TAIMEN ROOTFIX: ls %s:%s
+-", path, line);
++				printf("TAIMEN ROOTFIX: ls %s:%s\n", path, line);
+ 				ll = 0;
+ 				line[0] = 0;
+ 			}
+@@ -315,11 +312,9 @@ rootfix_list(const char *path, uint32_t depth, vfs_context_t ctx)
+ 		}
+ 	}
+ 	if (ll > 0) {
+-		printf("TAIMEN ROOTFIX: ls %s:%s
+-", path, line);
++		printf("TAIMEN ROOTFIX: ls %s:%s\n", path, line);
+ 	}
+-	printf("TAIMEN ROOTFIX: ls %s: %u entries%s
+-", path, n, err != 0 ? " (readdir error)" : "");
++	printf("TAIMEN ROOTFIX: ls %s: %u entries%s\n", path, n, err != 0 ? " (readdir error)" : "");
+ 	vnode_put(vp);
+ 	vp = NULLVP;
+ 	for (unsigned i = 0; i < nsub; i++) {
