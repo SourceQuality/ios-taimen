@@ -1,14 +1,17 @@
+# meson cross file for iOS 16 arm64. The constants toolchain, sdk, sweetgl and
+# cc_wrapper (['ccache'] when installed) come from out/ios-paths.txt, which
+# mesa-setup.sh writes from xcrun and passes as the first --cross-file.
 [binaries]
-c = ['/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang', '-arch', 'arm64', '-isysroot', '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk', '-miphoneos-version-min=16.0']
-cpp = ['/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++', '-arch', 'arm64', '-isysroot', '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk', '-miphoneos-version-min=16.0']
-objc = ['/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang', '-arch', 'arm64', '-isysroot', '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk', '-miphoneos-version-min=16.0']
-ar = '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ar'
-strip = '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/strip'
+c = cc_wrapper + [toolchain / 'clang', '-arch', 'arm64', '-isysroot', sdk, '-miphoneos-version-min=16.0']
+cpp = cc_wrapper + [toolchain / 'clang++', '-arch', 'arm64', '-isysroot', sdk, '-miphoneos-version-min=16.0']
+objc = cc_wrapper + [toolchain / 'clang', '-arch', 'arm64', '-isysroot', sdk, '-miphoneos-version-min=16.0']
+ar = toolchain / 'ar'
+strip = toolchain / 'strip'
 pkg-config = 'false'
 
 [built-in options]
-c_args = ['-I/Volumes/SamsungSSD/ios-sailfish/tools/sweetgl/include']
-cpp_args = ['-I/Volumes/SamsungSSD/ios-sailfish/tools/sweetgl/include']
+c_args = ['-I' + sweetgl / 'include']
+cpp_args = ['-I' + sweetgl / 'include']
 
 [host_machine]
 system = 'darwin'
