@@ -19,10 +19,12 @@ args=${*:-}
 # every step self-tested, gold memcpy 7.9 GB/s); sweetkeys=1: power, volume up, volume down as
 # Home (xnu 0225-0226); taimenhwscale=2: QSEED3 full screen
 # (xnu 0218, boot 36); sweetperf=1 taimenddr=1804: the perf thread votes DDR to 1804 MHz through
-# the RPM (xnu 0224, boot 44: bimc 648 -> 902 MHz, memcpy ~0.8 -> 1.09 GB/s). Later extra args
-# override all of these (the last occurrence wins).
+# the RPM (xnu 0224, boot 44: bimc 648 -> 902 MHz, memcpy ~0.8 -> 1.09 GB/s); taimenamp=1: idle
+# placement gold first above utility priority, silver for utility and background (xnu 0248, boots
+# 82-83: Control Center frames under 20 ms 41 -> 69 %). Later extra args override all of these
+# (the last occurrence wins).
 if [ "${ROOT:-0}" = 1 ]; then
-	args="cpus=8 taimengold=1728 sweetkeys=1 taimenhwscale=2 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
+	args="cpus=8 taimengold=1728 taimenamp=1 sweetkeys=1 taimenhwscale=2 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
 fi
 # GPU (ROOT=1 boots once tools/taimen/sweetgl-install.sh has run; GPU=0: CoreAnimation's CPU
 # renderer): CA draws with Mesa on the A540, sweetgl injected into backboardd (boots 60-75: ~60

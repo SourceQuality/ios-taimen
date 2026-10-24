@@ -657,3 +657,6 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   at 1728 MHz, preferred with taimenamp". Swap gaps under 20 ms: Control Center windows ~69 % (61-75 %; boot 79
   stock ~41 %, boot 81 gold-only ~54 %), Settings launch/close ~45 % (33 %, 38 %). Gold first for above-utility
   threads beats gold-only: silver keeps the background work off the gold cores.
+- 2026-10-24 boot 83 (r70, taimenamp=1, 25 gesture cycles, 620 s): all 25 cycles done, no panic, no GPU hang,
+  wired ~65k pages, free 7-15k; swap gaps through it as in boot 82 (Control Center windows 97-114 under 20 ms
+  of ~130-160). taimenamp=1 is now in boot-xnu.sh's ROOT=1 defaults.
