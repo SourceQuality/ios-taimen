@@ -846,3 +846,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   DYNAMIC_FEATURE_MASK (FW_REJUVENATE) and VBATT (icnss_init_vph_monitor). 0282: rails with a 100 mA load, both
   messages. The LaunchServices database was not under /private/var/containers/Data/System (depth 4) nor mobile's
   Library/Caches: 0 removed; boot 114 searches wider.
+- 2026-10-24 boot 114 (r102 = +0263-0282, the defaults + a wider LaunchServices search + taimenwifi=10, 420 s):
+  **the 32 stock apps are on the home screen.** LaunchServices' database is
+  /private/var/mobile/Containers/Data/InternalDaemon/<UUID>/Library/Caches/com.apple.LaunchServices-4035-v2.csstore
+  (op 9 removed it; /private/var/containers/Data holds only System); lsd rebuilt it from the app directories and
+  the end screenshot shows Calendar, Photos, Mail, Clock, News, Reminders, TV, Podcasts, Maps, Health, Wallet,
+  Music next to the old six. So: apps written by op 8 (boot 111) + the database removed once. Later boots must
+  not remove it again. Wi-Fi: the rails voted with 100 mA each (all acked), DYNAMIC_FEATURE_MASK ok (previous 0),
+  VBATT ok, and still no FW_READY in 260 s; M8/M9 never started. 0283 (MSA 1 MB aligned, PDR listener) next.
