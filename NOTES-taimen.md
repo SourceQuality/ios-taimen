@@ -795,3 +795,19 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   stopped there: partition 3's header belongs to two other hosts, is XPU-protected, and reading it hung that
   CPU while iOS ran on (0270: M0 only reads partitions APPS is a host of). The phone came back to fastboot by
   itself after the deadline reset.
+- 2026-10-24 boot 110 (r93 = +0263-0273, the defaults + taimenwifi=6 + a ROOTFIX with --list, 240 s):
+  **the stock apps are gone from the phone**: /private/var/staged_system_apps is empty, containers/Bundle is
+  empty, /Applications has 143 entries (the system's own UI services and the 6 visible apps). iOS's first boot
+  removed the staged copies after its install of them failed. The image has them: 32 apps, 3840 files, 5575
+  directories, 487 MiB. Too big for the payload (ABL starts none over ~35 MiB), so 0275 adds ROOTFIX op 8 (apply
+  an RFX1 blob from a raw partition) and mkrootfix --apps-archive / --apps-part: the apps go to system_b.
+  Wi-Fi: **M0-M2 pass.** SMEM ptable (12 entries): APPS<->MPSS is partition 7 at 0xf3000, 0x94000 bytes, empty;
+  items 421/428/435/478 absent (the modem is cold); hyp_assign available, PAS_IS_SUPPORTED(modem) = -1 (no PAS:
+  the MBA path, as Linux). M1: pool page HLOS -> HLOS+MSS_MSA -> HLOS, both 0, reads and writes fine. M2:
+  modem_a FAT16 (16 KB clusters, LUN 4), image/ = mba.mbn (234152 bytes, ELF), modem.mdt (8348 bytes, 29 phdrs,
+  24 loadable, 54693 KiB in modem.b00-b27), modemr.jsn, qdsp6m.qdb; no wlanmdsp.mbn or modemuw.jsn there (the
+  WLAN PD firmware is elsewhere: vendor). EFS: modemst1/2 (LUN 5), fsg (LUN 4), fsc. M3: proxy votes ok, MBA
+  in its carve-out and assigned to MSS_MSA, restart released, branch clocks on, Q6 out of reset (pwr 0x30c0000,
+  mem 0x1fffffff, reset 0x4, gfmux 0x102), but **PBL status stayed 0 for 1 s**. Cause found: the mss node's
+  bus_clk is clk_gcc_bimc_mss_q6_axi_clk = GCC 0x4401C; M3 had enabled GCC_MSS_Q6_BIMC_AXI_CBCR 0x8A040 instead,
+  so the Q6 had no path to DDR for the MBA (0276).

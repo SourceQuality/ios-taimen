@@ -125,11 +125,11 @@ class Blob:
 
     def pack(self):
         pad = lambda b: b + b'\0' * (-len(b) % 4)
-        out = struct.pack('<4sI', b'RFX1', len(self.recs))
+        out = [struct.pack('<4sI', b'RFX1', len(self.recs))]      # joined once: the apps blob is ~250 MB
         for op, mode, uid, gid, path, data in self.recs:
             p = path.encode() + b'\0'
-            out += struct.pack('<6I', op, mode, uid, gid, len(p), len(data)) + pad(p) + pad(data)
-        return out
+            out += [struct.pack('<6I', op, mode, uid, gid, len(p), len(data)), pad(p), pad(data)]
+        return b''.join(out)
 
 
 def launchd(plist):
