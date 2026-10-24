@@ -690,3 +690,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   SwapWait answered at once, so CA reused a surface the presenter was still copying: torn and half-drawn frames.
   xnu 0249: SwapWait honest (done once copied), a reuse counter, and the GPU copy skips the source clean when the
   seed has not moved.
+- 2026-10-24 boots 89-91 (r71 = +0249, GPU default, gesture script, 260 s each): **0249 ends the
+  flicker's cause, two scan buffers end the slow presents.** Per 10 s window, "swaps of the surface
+  being copied": 89 (0249) 0-1; 90 (sweetfb_swapwait=0, the old answer) 45-75, CA drew over the
+  frame the presenter was copying. With 0249 CA waits for the copy, so its rate is the presenter's:
+  89 presented 78 % of the swaps at 27-31 ms each (one buffer: wait for the panel, then copy).
+  91 (taimenhwscale=3, two scan buffers, no panel wait before the copy): present 8-15 ms, presents =
+  swaps (99 %+), reuse 0, the GPU copy ~4 ms; screenshots of Control Center and Settings correct.
+  taimenhwscale=3 is the ROOT=1 default from here.
