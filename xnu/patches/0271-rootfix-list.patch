@@ -1,0 +1,155 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 872f882..abbf4ac 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -6,7 +6,8 @@
+  *   blob     "RFX1", u32 count, then records: u32 op, mode, uid, gid, path length, data
+  *            length, the NUL-terminated path, the data (both padded to 4 bytes)
+  *   ops      1 write (create or replace), 2 write only if absent (prefs iOS may own later),
+- *            3 mkdir if absent, 4 remove if present, 5 as 2 from u32 size + zlib data;
++ *            3 mkdir if absent, 4 remove if present, 5 as 2 from u32 size + zlib data,
++ *            6 rename, 7 list a directory into the log (mode: depth, 1 or 2);
+  *            owner and mode set on what was written or created; "@HOSTUUID@" in a path
+  *            is replaced by IOPlatformUUID
+  * Without the blob nothing happens. Boot-arg taimenrootfix=0 skips it.
+@@ -24,6 +25,7 @@
+ #include <kern/thread.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
++#include <sys/dirent.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <uuid/uuid.h>
+@@ -44,6 +46,7 @@ void taimen_rootfix(void);
+ #define RFX_REMOVE      4u
+ #define RFX_CREATE_Z    5u      /* as RFX_CREATE; data: u32 size, then a zlib stream */
+ #define RFX_RENAME      6u      /* path -> data (a NUL-terminated path), if path exists and data does not */
++#define RFX_LIST        7u      /* log a directory's names; mode 2 also each subdirectory's */
+ 
+ /*
+  * "@HOSTUUID@" in a path becomes IOPlatformUUID (gethostuuid; from the ADT's unique-chip-id
+@@ -242,6 +245,107 @@ rootfix_rename(const char *path, const uint8_t *data, uint32_t dlen, vfs_context
+ 	return taimen_rename(path, (const char *)data, ctx);
+ }
+ 
++/*
++ * RFX_LIST (0271): a directory's entries into the log, in lines of ~200 characters; depth 2 also
++ * lists each subdirectory (64 at most), one line or more each. Boot 109: the 32 staged apps were
++ * no longer in /private/var/staged_system_apps; this shows where iOS left them.
++ */
++static int
++rootfix_list(const char *path, uint32_t depth, vfs_context_t ctx)
++{
++	const size_t bsz = 8192;
++	vnode_t vp = NULLVP;
++	int err = vnode_lookup(path, 0, &vp, ctx);
++	if (err != 0) {
++		printf("TAIMEN ROOTFIX: ls %s: not there (%d)
++", path, err);
++		return 0;
++	}
++	if (!vnode_isdir(vp)) {
++		printf("TAIMEN ROOTFIX: ls %s: not a directory
++", path);
++		vnode_put(vp);
++		return 0;
++	}
++	char *buf = kalloc_data(bsz, Z_WAITOK);
++	char *line = kalloc_data(256, Z_WAITOK | Z_ZERO);
++	char (*subs)[64] = depth > 1 ? kalloc_data(64 * 64, Z_WAITOK | Z_ZERO) : NULL;
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	unsigned n = 0, nsub = 0;
++	size_t ll = 0;
++	int eof = 0;
++	off_t off = 0;
++	if (buf == NULL || line == NULL || uio == NULL || (depth > 1 && subs == NULL)) {
++		err = ENOMEM;
++		goto out;
++	}
++	for (unsigned pass = 0; !eof && pass < 256; pass++) {
++		int numdirent = 0;
++		uio_reset(uio, off, UIO_SYSSPACE, UIO_READ);
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), bsz);
++		if ((err = VNOP_READDIR(vp, uio, 0, &eof, &numdirent, ctx)) != 0) {
++			break;
++		}
++		size_t got = bsz - (size_t)uio_resid(uio);
++		if (got == 0) {
++			break;
++		}
++		off = uio_offset(uio);
++		for (char *q = buf; q + __offsetof(struct dirent, d_name) < buf + got;) {
++			struct dirent *d = (struct dirent *)q;
++			if (d->d_reclen == 0) {
++				break;
++			}
++			q += d->d_reclen;
++			if (d->d_ino == 0 || (d->d_namlen == 1 && d->d_name[0] == '.') ||
++			    (d->d_namlen == 2 && d->d_name[0] == '.' && d->d_name[1] == '.')) {
++				continue;
++			}
++			n++;
++			if (subs != NULL && d->d_type == DT_DIR && nsub < 64 && d->d_namlen < 64) {
++				strlcpy(subs[nsub++], d->d_name, 64);
++			}
++			if (ll + d->d_namlen + 2 > 200) {
++				printf("TAIMEN ROOTFIX: ls %s:%s
++", path, line);
++				ll = 0;
++				line[0] = 0;
++			}
++			ll = MIN(ll + (size_t)snprintf(line + ll, 256 - ll, " %s", d->d_name), 255);
++		}
++	}
++	if (ll > 0) {
++		printf("TAIMEN ROOTFIX: ls %s:%s
++", path, line);
++	}
++	printf("TAIMEN ROOTFIX: ls %s: %u entries%s
++", path, n, err != 0 ? " (readdir error)" : "");
++	vnode_put(vp);
++	vp = NULLVP;
++	for (unsigned i = 0; i < nsub; i++) {
++		char child[256];
++		snprintf(child, sizeof(child), "%s/%s", path, subs[i]);
++		(void)rootfix_list(child, depth - 1, ctx);
++	}
++out:
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	if (uio != NULL) {
++		uio_free(uio);
++	}
++	if (subs != NULL) {
++		kfree_data(subs, 64 * 64);
++	}
++	if (line != NULL) {
++		kfree_data(line, 256);
++	}
++	if (buf != NULL) {
++		kfree_data(buf, bsz);
++	}
++	return err;
++}
++
+ static const uint8_t *rootfix_blob;
+ static uint64_t rootfix_len;
+ static int rootfix_chan;
+@@ -277,6 +381,7 @@ rootfix_apply(void)
+ 		}
+ 		int err = op == RFX_MKDIR ? rootfix_mkdir(path, mode, uid, gid, ctx) :
+ 		    op == RFX_RENAME ? rootfix_rename(path, data, dlen, ctx) :
++		    op == RFX_LIST ? rootfix_list(path, mode, ctx) :
+ 		    op == RFX_REMOVE ? rootfix_remove(path, ctx) :
+ 		    op == RFX_CREATE_Z ? rootfix_create_z(path, data, dlen, mode, uid, gid, ctx) :
+ 		    (op == RFX_WRITE || op == RFX_CREATE) ?
+@@ -288,7 +393,7 @@ rootfix_apply(void)
+ 		} else {
+ 			failed++;
+ 		}
+-		if (err != EEXIST) {
++		if (err != EEXIST && op != RFX_LIST) {
+ 			printf("TAIMEN ROOTFIX: %s %s (%u bytes, %o %u:%u): %s%d\n",
+ 			    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" :
+ 			    op == RFX_CREATE_Z ? "create (zlib)" : op == RFX_RENAME ? "rename" : "write",

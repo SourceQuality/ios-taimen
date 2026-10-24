@@ -25,13 +25,14 @@ migration registers them (the Pixel 1 port did the same move on the Mac before f
 
 Records: "RFX1", count, then {op, mode, uid, gid, path length, data length, path, data}
 (op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present, 5 as 2 with the data a
-u32 size and a zlib stream, 6 rename path to the NUL-terminated path in data; 4-byte padding).
+u32 size and a zlib stream, 6 rename path to the NUL-terminated path in data, 7 list the directory
+into the log, mode its depth; 4-byte padding).
 """
 import argparse, os, plistlib, struct, subprocess, sys, tempfile, zlib
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
-WRITE, CREATE, MKDIR, REMOVE, CREATE_Z, RENAME = 1, 2, 3, 4, 5, 6
+WRITE, CREATE, MKDIR, REMOVE, CREATE_Z, RENAME, LIST = 1, 2, 3, 4, 5, 6, 7
 STAGED = 'private/var/staged_system_apps'
 SEVENZIP = os.environ.get('SEVENZIP', '/mnt/c/Program Files/7-Zip/7z.exe')
 
@@ -119,6 +120,8 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--migrate', action='store_true')
     ap.add_argument('--stage-apps', action='store_true')
+    ap.add_argument('--list', action='append', default=[], metavar='/DIR[:DEPTH]',
+                    help='log the directory (and with depth 2 its subdirectories) at boot (xnu 0271)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     a = ap.parse_args()
@@ -177,6 +180,9 @@ def main():
         for app in apps:
             b.add(RENAME, f'/{STAGED}/{app}', f'/Applications/{app}'.encode() + b'\0', 0o755, 0, 0)
         print(f'--stage-apps: {len(apps)} apps to /Applications: ' + ', '.join(x[:-4] for x in apps))
+    for spec in a.list:
+        d, _, depth = spec.partition(':')
+        b.add(LIST, d, b'', int(depth or 1), 0, 0)
     for f in a.file:
         dest, src = f.split('=', 1)
         assert dest.startswith('/'), dest
