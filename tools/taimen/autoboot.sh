@@ -44,6 +44,8 @@ timeout 20 fastboot --set-active=a > /dev/null 2>&1 || say "fastboot --set-activ
 reboot_s=$(echo "$*" | sed -n 's/.*taimenreboot=\([0-9]*\).*/\1/p')
 NO_ALERT=1 BOOT_WAIT=25 "$P/tools/taimen/boot-xnu.sh" "$kernel" "$out" "$@" > "$out/boot.log" 2>&1
 grep -E "warning|fastboot boot at|Booting" "$out/boot.log"
+# refused before the phone was booted (boot-args too long, payload build): nothing to wait for
+grep -q "fastboot boot at" "$out/boot.log" || { tail -3 "$out/boot.log"; say "boot-xnu.sh stopped before booting"; exit 6; }
 rm -rf "$out/reader"
 # kernel start ~25 s after the fastboot boot, reset + ABL + reader + USB ~60 s, more under load
 # (boot 30: the drive came ~4 min after the deadline)
