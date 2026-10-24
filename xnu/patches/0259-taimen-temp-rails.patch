@@ -1,0 +1,16 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 3874455..8933fb4 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -1528,8 +1528,9 @@ taimen_gold_watch(void)
+ 		}
+ 	}
+ 	if (hot > -1000) {
+-		printf("TAIMEN TEMP: hottest tsens%d sensor %u at %d.%d C, gold %u MHz\n", hot_t, hot_i, hot / 10,
+-		    (hot < 0 ? -hot : hot) % 10, tg_mhz);
++		printf("TAIMEN TEMP: hottest tsens%d sensor %u at %d.%d C, gold %u MHz; rails gold %u silver %u mV\n",
++		    hot_t, hot_i, hot / 10, (hot < 0 ? -hot : hot) % 10, tg_mhz, to_gold.on ? to_rail_mv(&to_gold) : 0,
++		    to_silver.on ? to_rail_mv(&to_silver) : 0);
+ 	}
+ }
+ 
