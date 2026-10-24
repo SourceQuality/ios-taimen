@@ -1,0 +1,156 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 104643c..68926b0 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1985,6 +1985,105 @@ compute_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * GPU clock on taimen (E4, docs/taimen-gpu-plan.md 2.2 step 10, 2.3; 0234): GPUPLL0 (Fabia) at
++ * twice the gfx3d rate with out_even undivided, gfx3d RCG = out_even / 2 (source 1, field 3).
++ * Boot 48: ABL left the PLL off at L/CAL_L 0x1a, FRAC 0xc555 (514 MHz VCO) and USER_CTL 0x107
++ * (out_even / 2). The rail (PM8005 S1, FTS426: mV in 0x40/0x41) goes up to the corner's ceiling
++ * first when it is below it, LSB then MSB (the FTS426 may latch on the high byte; gfx3d is on XO
++ * meanwhile, so the brief in-between value is harmless), MX through the RPM above 414 MHz;
++ * mem-acc stays 0 (its setting from 414 MHz up), and the rail stays where it is when the clock
++ * goes down. No CPR, no GPMU: 596 MHz at most.
++ */
++extern bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
++
++static vm_offset_t g_gpucc;
++
++static uint32_t
++taimen_gfx_measure(vm_offset_t gpu)
++{
++	gw(gpu, 0x464, 1);                      /* RBBM_PERFCTR_CNTL */
++	gw(gpu, 0xbb0, 0);                      /* CP_PERFCTR_CP_SEL_0 = PERF_CP_ALWAYS_COUNT */
++	uint32_t c0 = gr(gpu, 0x3a0), a0 = gr(gpu, 0x4d2);
++	delay(10000);
++	uint32_t c1 = gr(gpu, 0x3a0), a1 = gr(gpu, 0x4d2);
++	return a1 != a0 ? (uint32_t)((uint64_t)(c1 - c0) * 192 / (a1 - a0) / 10) : 0;
++}
++
++static bool
++taimen_gfx_set(vm_offset_t gpu, unsigned mhz)
++{
++	static const struct {
++		unsigned mhz, l, frac, mv, mx;
++	} row[] = {
++		{257, 0x1a, 0xc555, 725, 128}, {342, 0x23, 0xa000, 775, 128}, {414, 0x2b, 0x2000, 880, 128},
++		{515, 0x35, 0xa555, 920, 256}, {596, 0x3e, 0x1555, 970, 256},
++	};
++	unsigned r = 0;
++	while (r < sizeof(row) / sizeof(row[0]) && row[r].mhz != mhz) {
++		r++;
++	}
++	if (r == sizeof(row) / sizeof(row[0])) {
++		printf("SWEET GPU: no %u MHz row (257, 342, 414, 515, 596)\n", mhz);
++		return false;
++	}
++	vm_offset_t cc = g_gpucc != 0 ? g_gpucc : (g_gpucc = ml_io_map(GPUCC_PA, 0x2000));
++	uint8_t lo = 0, hi = 0;
++	if (cc == 0 || !sweet_pmic_read(0x514, 0x40, &lo) || !sweet_pmic_read(0x514, 0x41, &hi)) {
++		return false;
++	}
++	unsigned have = (unsigned)hi << 8 | lo;
++	/* gfx3d on XO while the PLL changes */
++	wr(cc, 0x1074, 0);
++	wr(cc, 0x1070, 0x3);
++	if (!poll(cc, 0x1070, 1u, 0, 1)) {
++		printf("SWEET GPU: gfx3d rcg to XO: timeout\n");
++		return false;
++	}
++	if (row[r].mx > 128 && !sweet_rpm_rail_level(0x786d7772u, row[r].mx)) {    /* "rwmx" */
++		return false;
++	}
++	if (row[r].mv > have) {
++		unsigned mv = row[r].mv;
++		bool ok = sweet_pmic_write(0x514, 0x40, (uint8_t)mv) && sweet_pmic_write(0x514, 0x41, (uint8_t)(mv >> 8));
++		delay(4000);
++		ok = ok && sweet_pmic_read(0x514, 0x40, &lo) && sweet_pmic_read(0x514, 0x41, &hi);
++		printf("SWEET GPU: S1 %u -> %u mV: %s (reads %u)\n", have, mv, ok ? "written" : "FAILED",
++		    (unsigned)hi << 8 | lo);
++		if (!ok || ((unsigned)hi << 8 | lo) != mv) {
++			return false;
++		}
++		have = mv;
++	}
++	wr(cc, 0x0, 0);                                         /* PLL off */
++	wr(cc, 0x4, row[r].l);
++	wr(cc, 0x8, row[r].l);                                  /* CAL_L = L (downstream set_rate) */
++	wr(cc, 0x38, row[r].frac);
++	wr(cc, 0xc, (rd(cc, 0xc) & ~0xf07u));                   /* out_even / 1, outputs off */
++	wr(cc, 0x2c, 0);                                        /* OPMODE STANDBY */
++	wr(cc, 0x0, rd(cc, 0x0) | (1u << 2));                   /* RESET_N */
++	wr(cc, 0x2c, 1);                                        /* OPMODE RUN */
++	delay(50);
++	if (!poll(cc, 0x0, 1u << 31, 1u << 31, 1)) {
++		printf("SWEET GPU: GPUPLL0 L %#x did not lock (mode %08x opmode %08x)\n", row[r].l, rd(cc, 0x0),
++		    rd(cc, 0x2c));
++		wr(cc, 0x0, 0);
++		return false;
++	}
++	wr(cc, 0xc, rd(cc, 0xc) | 7u);                          /* main, aux, even outputs */
++	wr(cc, 0x0, rd(cc, 0x0) | 1u);                          /* OUTCTRL */
++	wr(cc, 0x1074, (1u << 8) | 3u);                         /* gfx3d = out_even / 2 */
++	wr(cc, 0x1070, 0x3);
++	bool upd = poll(cc, 0x1070, 1u, 0, 1);
++	uint32_t got = taimen_gfx_measure(gpu);
++	printf("SWEET GPU: gfx3d %u MHz (L %#x frac %#x, S1 %u mV, MX %u): pll mode %08x user %08x rcg %08x/%08x %s, measured %u MHz\n",
++	    mhz, row[r].l, row[r].frac, have, row[r].mx, rd(cc, 0x0), rd(cc, 0xc), rd(cc, 0x1070), rd(cc, 0x1074),
++	    upd ? "ok" : "UPDATE TIMEOUT", got);
++	return upd && got * 100 > mhz * 95 && got * 100 < mhz * 105;
++}
++#endif
++
+ /* Step 2: command processor. */
+ static void
+ cp_test(vm_offset_t gpu, int level)
+@@ -2229,6 +2328,16 @@ cp_test(vm_offset_t gpu, int level)
+ 			return;
+ 		}
+ 		blit_test(gpu, smmu, scratch_va, scratch);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		/* E4 (0234): taimengpuclk=MHZ, then the blits again at that clock */
++		int mhz = 0;
++		if (PE_parse_boot_argn("taimengpuclk", &mhz, sizeof(mhz)) && mhz > 19) {
++			printf("SWEET GPU: XO measured %u MHz\n", taimen_gfx_measure(gpu));
++			if (taimen_gfx_set(gpu, (unsigned)mhz)) {
++				blit_test(gpu, smmu, scratch_va, scratch);
++			}
++		}
++#endif
+ 		if (level >= 4) {
+ 			gpu_wait(2);
+ 			compute_test(gpu, smmu, scratch_va, scratch);
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index 3e773c2..04f9d49 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -408,6 +408,24 @@ sweet_rpm_mx_corner(uint32_t corner)
+ 	return ok;
+ }
+ 
++/*
++ * msm8998 power-domain level (mainline rpmpd.c: msm8998 "rwcx" / "rwmx" id 0, KEY_LEVEL "vlvl";
++ * levels 128 SVS, 256 NOM, 384 TURBO), enable "swen" = 1 with it, sleep and active set
++ * (taimen GPU clocks, docs/taimen-gpu-plan.md 2.4).
++ */
++bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
++bool
++sweet_rpm_rail_level(uint32_t type, uint32_t level)
++{
++	uint32_t kv[4] = {0x6e657773u, 1u, 0x6c766c76u, level};          /* swen = 1, vlvl */
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request("rail sleep", 1, type, 0, kv, 2) && rpm_request("rail active", 0, type, 0, kv, 2);
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: %c%c%c%c vlvl %u: %s\n", (char)type, (char)(type >> 8), (char)(type >> 16),
++	    (char)(type >> 24), level, ok ? "ok" : "FAILED");
++	return ok;
++}
++
+ /* LDOn on at uv with a load of ma (key "ma": the RPM picks high-power mode for it). */
+ bool
+ sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma)
