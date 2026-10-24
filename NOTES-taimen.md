@@ -642,3 +642,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   the Settings launch/close and Control Center windows mostly 20-37 ms swap gaps with many under 20
   (~35-50 frames/s); 1200-2700 submits per 10 s at ~0.1 ms of kernel time, glFinish 2-4 ms per frame,
   backboardd 20-22 % CPU, SpringBoard 26-42 %, Preferences 26 % while it launches.
+- 2026-10-24 boot 80 (r68, the gesture script, PC profiler on backboardd): no hotspot. CA::OGL render_layers /
+  LayerNode::apply / ImagingNode::render hold ~12 % of the inclusive samples, the Updater's prepare_layer ~4 %,
+  Mesa's draw path (fd5_program_emit, fd5_emit_state, update_program, u_vbuf, hash lookups) a few hundred
+  samples spread thin, the kernel ~2.6 % (sweet_gpu_wait, the GPU user client). The heavier scenes are CPU work in
+  CA and Mesa. With one scheduler pset, wakeups go to the lowest idle CPU, a silver one (amp plan; which cores
+  these threads ran on is not measured). xnu 0247 taimenslow=0 measures gold-only placement.
