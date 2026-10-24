@@ -622,3 +622,16 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-24 boot 77 (r64, the plain ROOT=1 default, only taimenreboot and swipes added): boot-xnu.sh took the GPU
   setup from ../out/sweetgl/current.env ("GPU boot: sweetgl 565f8e0"), the heap came up, sweetgl waited 5.9 s for
   the GPU service, Mesa drew at the same ~60 frames/s.
+- 2026-10-24 boot 78 (r65 = +0243 taimengest: synthetic Settings launch / home / Control Center, the GPU default):
+  **ABL did not start it**: "+23s: back in fastboot", the shim log unchanged, no XNU log, empty pstore; the same
+  again in 78b. The payload was 36715104 bytes against boot 77's 36698688 (r65's kernel is 16 KB larger): ABL
+  starts no ramdisk over ~35 MiB (36700160 lies between), and the 19 MB sweetgl dylib in the ROOTFIX had used up
+  the room. autoboot then waited 14 min for a reader and would have raised the "phone hung" alert: it now exits
+  (7) when boot-xnu.sh sees the phone back in fastboot, and boot-xnu.sh refuses payloads over 35 MiB (after
+  retrying with the base ROOTFIX when the dylib is already on the phone). xnu 0244: sweetenv leaves out a
+  DYLD_INSERT_LIBRARIES file that is missing (dyld would refuse to start backboardd). xnu 0245 + mkrootfix.py
+  --zfile: zlib-compressed ROOTFIX files (op 5), the dylib 19190992 -> 4376919 bytes, the default ROOTFIX 5.2 MB.
+- 2026-10-24 boot 78c (r66 = +0244, base ROOTFIX by the size rule, gestures): booted, the dylib from earlier boots
+  was there and injected, all six gesture cycles ran; but **PM8005 S1 (GFX) was off** ("S1 ok en 00 752 mV", every
+  earlier boot en 80) after the two refused images, the GPU service stopped ("GFX rail off"), sweetgl waited its
+  60 s and CA drew with its CPU renderer. xnu 0246 switches S1 on at 752 mV when found off.
