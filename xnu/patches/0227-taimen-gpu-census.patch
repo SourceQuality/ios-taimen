@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 400be5c..4a8e3ed 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -834,6 +834,44 @@ taimen_gold(unsigned cap_mhz)
+ 	kfree_data(buf, words * 8);
+ }
+ 
++/*
++ * GPU census E0 (taimengpucensus=1, docs/taimen-gpu-plan.md 8.1): the GCC GPU branches, the GPU
++ * clock controller (GDSCs, RCGs, branches, GPUPLL0) and mem-acc as ABL left them, read only, except
++ * gcc_gpu_cfg_ahb_clk (0x171004 bit 0), turned on before the GPU CC is read in case its registers
++ * need it (plan 2.2 step 1, unverified). The GFX rail (PM8005 S1) is taimenvread's.
++ */
++static void
++taimen_gpu_census(void)
++{
++	static const uint16_t gcc171[] = {0x004, 0x010, 0x028};         /* cfg_ahb, gpu_bimc_gfx, GPU_MISC */
++	static const uint16_t gcc146[] = {0x040};                       /* bimc_gfx */
++	static const uint16_t gcc188[] = {0x010};                       /* gpu_iref_en */
++	static const uint16_t gcc152[] = {0x00c};                       /* GPLL0 vote */
++	static const uint16_t pll[] = {0x0, 0x4, 0x8, 0xc, 0x14, 0x2c, 0x38, 0x130, 0x430};
++	static const uint16_t cc[] = {0x1004, 0x1008, 0x1020, 0x1070, 0x1074, 0x1090, 0x1094, 0x1098, 0x10a0,
++		                      0x10a4, 0x10b0, 0x10b4, 0x10d0};
++	static const uint16_t memacc[] = {0x004};
++#define TREGS(name, pa, size, o) taimen_regs(name, pa, size, o, sizeof(o) / sizeof(o[0]))
++	printf("TAIMEN GPU: census (taimengpucensus=1)\n");
++	TREGS("gcc-gpu", 0x171000, 0x1000, gcc171);
++	TREGS("gcc-bimc-gfx", 0x146000, 0x1000, gcc146);
++	TREGS("gcc-iref", 0x188000, 0x1000, gcc188);
++	TREGS("gcc-gpll0-vote", 0x152000, 0x1000, gcc152);
++	vm_offset_t ahb = ml_io_map(0x171000, 0x1000);
++	if (ahb == 0) {
++		return;
++	}
++	uint32_t before = clk_rd(ahb, 0x4);
++	clk_wr(ahb, 0x4, before | 1u);
++	delay(10);
++	printf("TAIMEN GPU: gcc cfg_ahb %#x -> %#x\n", before, clk_rd(ahb, 0x4));
++	TREGS("gpucc", 0x5065000, 0x2000, pll);         /* PLL0 +0..+0x38, GX_DOMAIN_MISC +0x130, DD_WRAP +0x430 */
++	TREGS("gpucc", 0x5065000, 0x2000, cc);          /* GDSCs, RCGs, branches at +0x1000.. */
++	TREGS("mem-acc", 0x1fcf000, 0x1000, memacc);
++#undef TREGS
++	printf("TAIMEN GPU: census done\n");
++}
++
+ /* Every perf tick while gold runs off GPLL0: any TSENS sensor above 90.0 C parks it. */
+ static void
+ taimen_gold_watch(void)
+@@ -905,6 +943,10 @@ taimen_clocks(void)
+ 	if (gold > 0) {
+ 		taimen_gold((unsigned)gold);
+ 	}
++	int gpucensus = 0;
++	if (PE_parse_boot_argn("taimengpucensus", &gpucensus, sizeof(gpucensus)) && gpucensus > 0) {
++		taimen_gpu_census();
++	}
+ }
+ #endif
+ 
