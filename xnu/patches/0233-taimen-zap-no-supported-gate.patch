@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index d57fe28..104643c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -670,17 +670,19 @@ zap_load(void)
+ 		return false;
+ 	}
+ 	/*
+-	 * XNU has made no SCM call on taimen before; PSCI over smc works, hvc resets the board. Ask
+-	 * TZ first, harmlessly (docs/taimen-gpu-plan.md 3.3): INFO IS_CALL_AVAIL for PAS_INIT_IMAGE,
+-	 * then PAS_IS_SUPPORTED(13). Raw x0/x1 are logged; anything but 0/1 stops here.
++	 * XNU had made no SCM call on taimen before; PSCI over smc works, hvc resets the board. Ask
++	 * TZ first, harmlessly (docs/taimen-gpu-plan.md 3.3): INFO IS_CALL_AVAIL for PAS_INIT_IMAGE
++	 * must answer 0/1. Boot 53: it did, and PAS_IS_SUPPORTED(13) answered 0/0. That one is only
++	 * logged (0233): mainline's zap loader never asks it, and Android loaded this a540_zap
++	 * through PAS id 13 on this phone; the PAS calls below report their own errors.
+ 	 */
+ 	uint64_t avail = 0, supported = 0;
+ 	int64_t ra = scm_call(6, 1, 1, 0x02000201ull, 0, 0, &avail);
+ 	int64_t rs = scm_call(2, 7, 1, GPU_PAS_ID, 0, 0, &supported);
+ 	printf("SWEET GPU: scm is_call_avail(pas_init_image) -> %lld/%llx, pas_is_supported(13) -> %lld/%llx\n",
+ 	    ra, avail, rs, supported);
+-	if (ra != 0 || avail != 1 || rs != 0 || supported != 1) {
+-		printf("SWEET GPU: TZ does not offer PAS for the GPU from here, stop\n");
++	if (ra != 0 || avail != 1) {
++		printf("SWEET GPU: no PAS_INIT_IMAGE through SCM from here, stop\n");
+ 		return false;
+ 	}
+ #else
