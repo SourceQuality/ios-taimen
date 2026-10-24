@@ -872,3 +872,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   HTT host rx ring the radio receives but nothing reaches the firmware's rx path (no beacons) — and a starved rx
   task fits the watchdog too. 0285 ports topaz 0125 (HTT version, frag bank, 64-bit rx ring, aggr) before the
   scan. The modem never raised an IPA power query (no "ipa" entry in its SMP2P item).
+- 2026-10-24 boot 117 (r105 = +0263-0285, a plain ROOTFIX + taimenwifi=10, 420 s): **the passive scan works.**
+  HTT VERSION_REQ -> VERSION_CONF 3.83 in 2 ms, frag bank, the 64-bit rx ring (255 buffers) and aggr cfg
+  accepted; the scan (37 channels, all passive) completed in 2.6 s with 47 networks from 61 beacons/probe
+  responses (no htt msdus: management comes over WMI). The modem still went FATAL at +14.2 s, 9.5 s after
+  mission as in boot 116: DOG_HB starvation again, a different task address. So the rx ring is needed for the
+  scan but is not the crash. From 0286 the scan logs each network by channel and RSSI only: no SSIDs or BSSIDs
+  of other people's networks in the logs (boot 117's own log in out/ is local and never shared). Boot 118:
+  M0-M7 only, to see whether mission mode alone (no CE/HTC/WMI) brings the starvation.
