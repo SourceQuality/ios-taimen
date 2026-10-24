@@ -300,6 +300,18 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
 	return !used || IOConnectCallScalarMethod(conn, 16, &in, 1, NULL, NULL) == KERN_SUCCESS ? 0 : -EIO;
 }
 
+/* submits since the last sweet_drm_submit_stats (eagl.c logs them every 10 s) */
+static uint64_t submits, submit_ticks, submit_bos;
+
+void
+sweet_drm_submit_stats(uint64_t *n, uint64_t *ticks, uint64_t *bos)
+{
+	*n = submits;
+	*ticks = submit_ticks;
+	*bos = submit_bos;
+	submits = submit_ticks = submit_bos = 0;
+}
+
 static int
 gem_submit(struct drm_msm_gem_submit *r)
 {
@@ -348,8 +360,12 @@ gem_submit(struct drm_msm_gem_submit *r)
 	if (ret == 0) {
 		hdr[0] = nib;
 		hdr[1] = r->nr_bos;
+		uint64_t t0 = mach_absolute_time();
 		kern_return_t kr = IOConnectCallMethod(conn, 13, NULL, 0, buf, 8 + nib * 16 + r->nr_bos * 4,
 		    &seq, &n, NULL, NULL);
+		submit_ticks += mach_absolute_time() - t0;
+		submits++;
+		submit_bos += r->nr_bos;
 		if (kr != KERN_SUCCESS) {
 			sweet_drm_log("sweetgl: submit (%u IBs, %u bos) failed: %x", nib, r->nr_bos, kr);
 			ret = kr == kIOReturnNotReady ? -ENODEV : -EINVAL;

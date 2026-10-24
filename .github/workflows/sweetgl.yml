@@ -16,8 +16,8 @@ on:
 
 # Own group: never cancels (or waits for) the kernel builds in xnu.yml
 concurrency:
-  group: sweetgl-${{ github.ref }}
-  cancel-in-progress: true
+  group: sweetgl-${{ github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

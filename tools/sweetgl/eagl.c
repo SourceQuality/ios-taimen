@@ -1387,6 +1387,12 @@ slot_report(uint64_t span_us)
 		    ticks_us(slot_ticks[best]) / 1000, slot_calls[best]);
 		slot_ticks[best] = 0;
 	}
+	uint64_t sn, st, sb;
+	sweet_drm_submit_stats(&sn, &st, &sb);
+	if (o < (int)sizeof(line) - 80) {
+		snprintf(line + o, sizeof(line) - o, "; %llu submits, %llu ms in the kernel, %llu bos", sn,
+		    ticks_us(st) / 1000, sb);
+	}
 	sweet_drm_log("%s", line);
 	memset(slot_ticks, 0, sizeof(slot_ticks));
 	memset(slot_calls, 0, sizeof(slot_calls));
