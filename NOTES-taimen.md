@@ -764,3 +764,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   status 0x46 (6: inhibit, full). The first poll ran before SPMI was up ("read failed at step 1", the
   fallback), the next one switched to the gauge. Unplugged and discharging still to be seen on the
   phone itself. xnu 0258: taimencprcl=1, CPRh closed loop.
+- 2026-10-24 boot 103 (r81 build = +0258-0260, the defaults + taimencprcl=1, gestures, 300 s): **CPRh closed
+  loop**: gold settles at 1012 mV at 2342 MHz (open loop 1052), silver at 888 mV at 1900.8 (928): 40 mV, the
+  floor-to-ceiling range Linux allows. Every row checked, ran to its deadline, 41-43 C idle. In the ROOT=1
+  defaults. The first try did not boot: boot-args 615 of 607 bytes; the safe list lost sweettouch, sweetusb,
+  sweetcharge and sweetbl (dead on taimen), 46 bytes.
