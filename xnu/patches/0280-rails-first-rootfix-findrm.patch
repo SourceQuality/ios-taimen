@@ -1,0 +1,186 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index c2ce6f8..038f88e 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -9,7 +9,8 @@
+  *            3 mkdir if absent, 4 remove if present, 5 as 2 from u32 size + zlib data,
+  *            6 rename, 7 list a directory into the log (mode: depth, 1 or 2), 8 apply the
+  *            records stored on the raw partition named by the path ("/system_b": an RFX1 blob
+- *            from offset 0, too big for the payload: mkrootfix.py --apps-archive);
++ *            from offset 0, too big for the payload: mkrootfix.py --apps-archive), 9 remove the
++ *            files under the path matching prefix*suffix (data "prefix\0suffix\0", mode the depth);
+  *            owner and mode set on what was written or created; "@HOSTUUID@" in a path
+  *            is replaced by IOPlatformUUID
+  * Without the blob nothing happens. Boot-arg taimenrootfix=0 skips it.
+@@ -51,6 +52,7 @@ void taimen_rootfix(void);
+ #define RFX_RENAME      6u      /* path -> data (a NUL-terminated path), if path exists and data does not */
+ #define RFX_LIST        7u      /* log a directory's names; mode 2 also each subdirectory's */
+ #define RFX_PART        8u      /* the RFX1 blob on the partition named by the path (no nesting) */
++#define RFX_FINDRM      9u      /* remove matching files below the path (LaunchServices' database) */
+ 
+ /*
+  * "@HOSTUUID@" in a path becomes IOPlatformUUID (gethostuuid; from the ADT's unique-chip-id
+@@ -345,12 +347,122 @@ out:
+ 	return err;
+ }
+ 
++/*
++ * RFX_FINDRM (0280): every regular file below path (depth levels at most) whose name starts with
++ * prefix and ends with suffix is removed and logged. Boot 112: the 32 apps boot 111 wrote into
++ * /Applications were not registered (installd's LastBuildInfo.plist removed: no rescan); without
++ * its com.apple.LaunchServices-*.csstore, lsd rebuilds the database from the app directories.
++ */
++static int
++rootfix_findrm(const char *path, uint32_t depth, const char *prefix, const char *suffix, unsigned *found,
++    vfs_context_t ctx)
++{
++	const size_t bsz = 8192;
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return 0;
++	}
++	if (!vnode_isdir(vp)) {
++		vnode_put(vp);
++		return 0;
++	}
++	char *buf = kalloc_data(bsz, Z_WAITOK);
++	char (*subs)[64] = depth > 1 ? kalloc_data(64 * 64, Z_WAITOK | Z_ZERO) : NULL;
++	char (*hits)[96] = kalloc_data(8 * 96, Z_WAITOK | Z_ZERO);
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	unsigned nsub = 0, nhit = 0;
++	int err = 0, eof = 0;
++	off_t off = 0;
++	size_t pl = strlen(prefix), sl = strlen(suffix);
++	if (buf == NULL || hits == NULL || uio == NULL || (depth > 1 && subs == NULL)) {
++		err = ENOMEM;
++		goto out;
++	}
++	for (unsigned pass = 0; !eof && pass < 256; pass++) {
++		int numdirent = 0;
++		uio_reset(uio, off, UIO_SYSSPACE, UIO_READ);
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), bsz);
++		if ((err = VNOP_READDIR(vp, uio, 0, &eof, &numdirent, ctx)) != 0) {
++			break;
++		}
++		size_t got = bsz - (size_t)uio_resid(uio);
++		if (got == 0) {
++			break;
++		}
++		off = uio_offset(uio);
++		for (char *q = buf; q + __offsetof(struct dirent, d_name) < buf + got;) {
++			struct dirent *d = (struct dirent *)q;
++			if (d->d_reclen == 0) {
++				break;
++			}
++			q += d->d_reclen;
++			if (d->d_ino == 0 || d->d_name[0] == '.') {
++				continue;
++			}
++			if (d->d_type == DT_DIR) {
++				if (subs != NULL && nsub < 64 && d->d_namlen < 64) {
++					strlcpy(subs[nsub++], d->d_name, 64);
++				}
++			} else if (d->d_type == DT_REG && d->d_namlen >= pl + sl && d->d_namlen < 96 &&
++			    strncmp(d->d_name, prefix, pl) == 0 && strcmp(d->d_name + d->d_namlen - sl, suffix) == 0 && nhit < 8) {
++				strlcpy(hits[nhit++], d->d_name, 96);
++			}
++		}
++	}
++	vnode_put(vp);
++	vp = NULLVP;
++	for (unsigned i = 0; i < nhit; i++) {
++		char f[256];
++		snprintf(f, sizeof(f), "%s/%s", path, hits[i]);
++		int e = unlink1(ctx, NULLVP, CAST_USER_ADDR_T(f), UIO_SYSSPACE, 0);
++		printf("TAIMEN ROOTFIX: findrm %s: %s%d\n", f, e ? "error " : "removed ", e);
++		*found += 1;
++	}
++	for (unsigned i = 0; i < nsub; i++) {
++		char child[256];
++		snprintf(child, sizeof(child), "%s/%s", path, subs[i]);
++		(void)rootfix_findrm(child, depth - 1, prefix, suffix, found, ctx);
++	}
++out:
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	if (uio != NULL) {
++		uio_free(uio);
++	}
++	if (hits != NULL) {
++		kfree_data(hits, 8 * 96);
++	}
++	if (subs != NULL) {
++		kfree_data(subs, 64 * 64);
++	}
++	if (buf != NULL) {
++		kfree_data(buf, bsz);
++	}
++	return err;
++}
++
+ static const uint8_t *rootfix_blob;
+ static uint64_t rootfix_len;
+ static int rootfix_chan;
+ 
+ struct rootfix_count { uint32_t done, skipped, failed; };
+ 
++/* RFX_FINDRM's record: data "prefix\0suffix\0"; EEXIST (counted as already present) if nothing matched */
++static int
++rootfix_findrm_rec(const char *path, uint32_t depth, const uint8_t *data, uint32_t dlen, vfs_context_t ctx)
++{
++	const char *prefix = (const char *)data;
++	size_t pl = strnlen(prefix, dlen);
++	if (dlen < 2 || pl + 1 >= dlen || data[dlen - 1] != 0) {
++		return EINVAL;
++	}
++	unsigned found = 0;
++	int err = rootfix_findrm(path, MIN(depth, 6u), prefix, prefix + pl + 1, &found, ctx);
++	printf("TAIMEN ROOTFIX: findrm %s %s*%s (depth %u): %u removed\n", path, prefix, prefix + pl + 1, depth, found);
++	return err != 0 ? err : found != 0 ? 0 : EEXIST;
++}
++
+ static void
+ rootfix_one(uint32_t op, uint32_t mode, uint32_t uid, uint32_t gid, const char *rawpath, const uint8_t *data,
+     uint32_t dlen, bool quiet, struct rootfix_count *c, vfs_context_t ctx)
+@@ -365,6 +477,7 @@ rootfix_one(uint32_t op, uint32_t mode, uint32_t uid, uint32_t gid, const char *
+ 	int err = op == RFX_MKDIR ? rootfix_mkdir(path, mode, uid, gid, ctx) :
+ 	    op == RFX_RENAME ? rootfix_rename(path, data, dlen, ctx) :
+ 	    op == RFX_LIST ? rootfix_list(path, mode, ctx) :
++	    op == RFX_FINDRM ? rootfix_findrm_rec(path, mode, data, dlen, ctx) :
+ 	    op == RFX_REMOVE ? rootfix_remove(path, ctx) :
+ 	    op == RFX_CREATE_Z ? rootfix_create_z(path, data, dlen, mode, uid, gid, ctx) :
+ 	    (op == RFX_WRITE || op == RFX_CREATE) ?
+@@ -376,7 +489,7 @@ rootfix_one(uint32_t op, uint32_t mode, uint32_t uid, uint32_t gid, const char *
+ 	} else {
+ 		c->failed++;
+ 	}
+-	if (err != EEXIST && op != RFX_LIST && (!quiet || err != 0)) {
++	if (err != EEXIST && op != RFX_LIST && op != RFX_FINDRM && (!quiet || err != 0)) {
+ 		printf("TAIMEN ROOTFIX: %s %s (%u bytes, %o %u:%u): %s%d\n",
+ 		    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" :
+ 		    op == RFX_CREATE_Z ? "create (zlib)" : op == RFX_RENAME ? "rename" : "write",
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index a4d3fe1..da24a3d 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -3147,6 +3147,9 @@ static void
+ modem_thread(void *arg, wait_result_t wr __unused)
+ {
+ 	int level = (int)(intptr_t)arg;
++	m5_on = level >= 6;
++	m6_on = level >= 7;
++	m7_on = level >= 8;
+ 	IOSleep(5000);
+ 	LOG("taimenwifi=%d", level);
+ 	if (level >= 1) {
+@@ -3167,9 +3170,6 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 		LOG("M3 failed: stop (the modem may hold the MBA carve-out until a reset)");
+ 		return;
+ 	}
+-	m5_on = level >= 6;
+-	m6_on = level >= 7;
+-	m7_on = level >= 8;
+ 	if (level >= 5 && !m4(m7_on ? 200 : 120)) {
+ 		LOG("M4 failed: stop (the carve-outs stay assigned until a reset)");
+ 		return;

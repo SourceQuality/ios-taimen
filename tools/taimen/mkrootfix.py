@@ -26,8 +26,8 @@ migration registers them (the Pixel 1 port did the same move on the Mac before f
 Records: "RFX1", count, then {op, mode, uid, gid, path length, data length, path, data}
 (op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present, 5 as 2 with the data a
 u32 size and a zlib stream, 6 rename path to the NUL-terminated path in data, 7 list the directory
-into the log, mode its depth, 8 apply the RFX1 blob on the raw partition named by the path; 4-byte
-padding).
+into the log, mode its depth, 8 apply the RFX1 blob on the raw partition named by the path, 9 remove
+the files below the path whose names match data "prefix\0suffix\0" (mode the depth); 4-byte padding).
 
 --apps-archive OUT writes the 32 staged apps as their own blob (mkdir + create_z records into
 /Applications, ~490 MB of files): too big for the payload (ABL starts none over ~35 MiB), it goes on
@@ -38,7 +38,7 @@ import argparse, os, plistlib, struct, subprocess, sys, tempfile, zlib
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
-WRITE, CREATE, MKDIR, REMOVE, CREATE_Z, RENAME, LIST, PART = 1, 2, 3, 4, 5, 6, 7, 8
+WRITE, CREATE, MKDIR, REMOVE, CREATE_Z, RENAME, LIST, PART, FINDRM = 1, 2, 3, 4, 5, 6, 7, 8, 9
 STAGED = 'private/var/staged_system_apps'
 SEVENZIP = os.environ.get('SEVENZIP', '/mnt/c/Program Files/7-Zip/7z.exe')
 
@@ -164,6 +164,8 @@ def main():
                     help='log the directory (and with depth 2 its subdirectories) at boot (xnu 0271)')
     ap.add_argument('--apps-archive', metavar='OUT', help='write the staged apps blob to OUT and stop')
     ap.add_argument('--apps-part', metavar='PARTITION', help='apply the blob on PARTITION at boot (op 8)')
+    ap.add_argument('--findrm', action='append', default=[], metavar='/DIR:DEPTH:PREFIX*SUFFIX',
+                    help='remove matching files below DIR at boot, first thing (op 9, xnu 0280)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     a = ap.parse_args()
@@ -171,6 +173,10 @@ def main():
         apps_archive(a.image, a.apps_archive)
         return
     b = Blob()
+    for spec in a.findrm:
+        d, depth, pat = spec.split(':', 2)
+        pre, suf = pat.split('*', 1)
+        b.add(FINDRM, d, pre.encode() + b'\0' + suf.encode() + b'\0', int(depth), 0, 0)
     srv = ['System/Library/Frameworks/MediaToolbox.framework/%s/SubServerConfiguration.plist' % d
            for d in ('D22', 'D221', 'Default')]
     with tempfile.TemporaryDirectory() as tmp:
