@@ -1301,7 +1301,7 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
  * per-surface fences in the swap path would let the GPU run ahead.
  */
 /*
- * SWEETGL_FINISH=0: a plain flush instead. The kernel copies the swapped surface
+ * SWEETGL_FINISH=0: a fenced flush without the wait. The kernel copies the swapped surface
  * to the scan buffer with the GPU (taimengpucopy), on the same ring after the
  * frame, so CA's thread need not wait for the GPU (2-4 ms a frame in boots
  * 79-82); the CPU copy (no taimengpucopy) could show a frame half drawn.
@@ -1445,7 +1445,7 @@ sgl_Flush(void *rctx)
 	if (flush_waits) {
 		glFinish();
 	} else {
-		glFlush();
+		sweetgl_flush_nowait();
 	}
 	uint64_t t1 = mach_absolute_time();
 	flush_stats(t0, t1);

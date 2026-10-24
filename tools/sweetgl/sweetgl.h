@@ -24,6 +24,7 @@ SWEETGL_API bool sweetgl_selftest(void);
 
 /* internal (eagl.c) */
 struct pipe_screen *sweetgl_screen(void);
+void sweetgl_flush_nowait(void);
 struct pipe_frontend_screen;
 void sweetgl_image_hooks(struct pipe_frontend_screen *fscreen);
 void sweetgl_eagl_install(void);

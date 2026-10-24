@@ -23,6 +23,7 @@
 #include "pipe/p_context.h"
 #include "frontend/api.h"
 #include "state_tracker/st_context.h"
+#include "state_tracker/st_cb_flush.h"
 #include "util/driconf.h"
 #include "util/xmlconfig.h"
 #include "freedreno/drm/freedreno_drm_public.h"
@@ -154,6 +155,24 @@ sweetgl_create(int api, struct sweetgl_ctx *share)
 	c->api = attribs.major;
 	st->frontend_context = c;
 	return c;
+}
+
+/*
+ * The current context's work submitted with a fence, as glFinish does, without waiting for it.
+ * glFlush (no fence) crashed backboardd in fd_submit_append_bo on the next frame (boot 84).
+ */
+void
+sweetgl_flush_nowait(void)
+{
+	struct st_context *st = st_api_get_current();
+	if (st == NULL || fscreen == NULL) {
+		return;
+	}
+	struct pipe_fence_handle *fence = NULL;
+	st_flush(st, &fence, 0);
+	if (fence != NULL) {
+		fscreen->screen->fence_reference(fscreen->screen, &fence, NULL);
+	}
 }
 
 bool
