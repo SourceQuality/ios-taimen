@@ -69,7 +69,10 @@ TAIMEN_NCPU=$([ "${SHIM_WATCH:-0}" = 1 ] && echo 7) TAIMEN_BASE=${TAIMEN_BASE:-}
 # PS_HOLD and the log reader.
 # The Pixel 1 keys/touch/usb/perf/battery/backlight drivers are compiled out on TAIMEN
 # (xnu 0187) and their boot-args are set to 0 as well (docs/taimen-boot-audit.md).
-safe="sweetkeys=0 sweettouch=0 sweetusb=0 sweetperf=0 sweetbattery=0 sweetcharge=0 sweetbl=0"
+# sweettouch, sweetusb, sweetcharge and sweetbl are left out: on taimen the Pixel 1 touch and USB drivers
+# never start (sweet_ufs.c), SweetBattery never writes the charger and the backlight defaults off (0260);
+# 46 bytes the boot-args need (boot 103 came to 615 of 607 with them).
+safe="sweetkeys=0 sweetperf=0 sweetbattery=0"
 # taimenepoch: the PC clock for the calendar (xnu 0217; no RTC driver yet)
 cmdline="debug=0x10000c serial=3 cpus=1 keepsyms=1 -noprogress taimenepoch=$(date +%s) ${safe} ${args}"
 # XNU's PE_parse_boot_argn takes the last occurrence: drop the earlier ones (cpus=1, sweetkeys=0, ...)
