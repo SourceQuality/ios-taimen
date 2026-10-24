@@ -1792,7 +1792,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 static bool
 gpu_ready(void)
 {
-	static _Atomic int waited;
+	static int waited;
 	if (sweetgl_init()) {
 		return true;
 	}
