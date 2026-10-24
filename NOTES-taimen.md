@@ -854,3 +854,21 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Music next to the old six. So: apps written by op 8 (boot 111) + the database removed once. Later boots must
   not remove it again. Wi-Fi: the rails voted with 100 mA each (all acked), DYNAMIC_FEATURE_MASK ok (previous 0),
   VBATT ok, and still no FW_READY in 260 s; M8/M9 never started. 0283 (MSA 1 MB aligned, PDR listener) next.
+- 2026-10-24 boot 115 (r103 = +0263-0283, a plain ROOTFIX + taimenwifi=10, 420 s): the PDR listener works like
+  Android's: servreg-notif 0x42:0xb401 at +142 ms, REGISTER_LISTENER for msm/modem/wlan_pd ok (state 0x7fffffff
+  = uninit), at +1302 ms wlan_pd UP (0x1fffffff, transaction 1) ACKed, then WLFW appears; the MSA is now 1 MB
+  aligned (0x89300000: 16 KB secure + 0xfc000). Still no FW_READY in 260 s. Next: 0284, the board data download
+  + CAL_REPORT (cnss-daemon's job on Android, the mainline ath10k order).
+- 2026-10-24 boot 116 (r104 = +0263-0284, a plain ROOTFIX + taimenwifi=10, 420 s): **WLAN mission mode, HTC and
+  WMI READY.** The board data was the missing step (cnss-daemon's job on Android): after VBATT, bdwlan.bin
+  (19152 bytes, board_id 0xff) in 4 BDF_DOWNLOAD segments, CAL_REPORT ok; +3.3 s later the pin-connect result
+  (power 0x1, phy io 0, rf 0x1002b), FW_READY at 4.69 s, WLAN_CFG ok, WLAN_MODE mission ok. M8: the anoc2 SMMU
+  (sCR0 0x00200626, 14 SMRs, 10 CBs, 4 KB pages x32) took the identity bank for 0x1900/1 (CB4, SMR0, read back
+  as written); CE host memory 0x89402000+0xa5000, 12 rings; HTC READY (credits 2 x 2184, 22 endpoints), HTT eid
+  1, WMI eid 2, SETUP_COMPLETE_EX; WMI SERVICE_READY (fw 0x224a00a1, 2 rf chains), INIT with no host memory
+  chunks, WMI READY (no fw MAC). M9: chan list (37), vdev, passive scan started and completed after 2.6 s with
+  0 beacons. Then the modem went FATAL at +14.3 s; crash reason now readable (item 421 is in the cached list):
+  "dog_hb.c:266:[dog_hb]:DOG_HB detects starvation of task 0xf9ac5b10, triage wit[h ...]". Topaz: without the
+  HTT host rx ring the radio receives but nothing reaches the firmware's rx path (no beacons) — and a starved rx
+  task fits the watchdog too. 0285 ports topaz 0125 (HTT version, frag bank, 64-bit rx ring, aggr) before the
+  scan. The modem never raised an IPA power query (no "ipa" entry in its SMP2P item).
