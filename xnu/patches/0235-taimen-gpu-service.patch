@@ -1,0 +1,153 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 68926b0..aeeb795 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -124,13 +124,13 @@ void sweet_gpu_init(void);
+ /*
+  * Taimen (Adreno 540, docs/taimen-gpu-plan.md; 0230): the GPU, its SMMU (SMMUv2, CB0 at +0x8000
+  * as on the Pixel 1) and the GPU clock controller. Power-up is taimen_power_up() below. Level 3
+- * (zap shader, secure-mode exit, 2D blits) has its taimen addresses since 0232; levels above it
+- * still use the MSM8996 GPU clock code, so sweetgpu is capped at 3 here.
++ * (zap shader, secure-mode exit, 2D blits) has its taimen addresses since 0232, the GPU clock
++ * since 0234, and levels 4-8 (compute, service) their A540 values and 4K fixes since 0235.
+  */
+ #define GPU_PA          0x05000000u
+ #define SMMU_PA         0x05040000u
+ #define GPUCC_PA        0x05065000u
+-#define TAIMEN_GPU_MAX_LEVEL 3
++#define TAIMEN_GPU_MAX_LEVEL 8
+ #else
+ #define GPU_PA          0x00b00000u
+ #define SMMU_PA         0x00b40000u
+@@ -1124,10 +1124,19 @@ compute_run(vm_offset_t gpu, const struct sweet_kernel *k, uint64_t shader_pa,
+ 	emit(pkt4(R_RB_DBG_ECO_CNTL, 1)); emit(0x00100000);
+ 	emit(pkt4(R_PC_MODE_CNTL, 1)); emit(0x1f);
+ 	emit(pkt4(R_SP_MODE_CNTL, 1)); emit(0x1e);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	emit(pkt4(R_SP_DBG_ECO_CNTL, 1)); emit(0x800);          /* A540 (Mesa fd5_emit.c) */
++	emit(pkt4(0x0e04, 1)); emit(0);                         /* HLSQ_DBG_ECO_CNTL */
++#else
+ 	emit(pkt4(R_SP_DBG_ECO_CNTL, 1)); emit(0x40000800);     /* not A540 */
++#endif
+ 	emit(pkt4(R_TPL1_MODE_CNTL, 1)); emit(0x544);
+ 	emit(pkt4(R_HLSQ_TIMEOUT_THRESHOLD_0, 2)); emit(0x80); emit(0);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	emit(pkt4(R_VPC_DBG_ECO_CNTL, 1)); emit(0x800400);      /* A540 */
++#else
+ 	emit(pkt4(R_VPC_DBG_ECO_CNTL, 1)); emit(0x400);
++#endif
+ 	emit(pkt4(R_HLSQ_MODE_CNTL, 1)); emit(1);
+ 	emit(pkt4(R_VPC_MODE_CNTL, 1)); emit(0);
+ 	/* cs_program_emit */
+@@ -1261,6 +1270,18 @@ blend_cpu(const uint32_t *src, uint32_t *dst, uint32_t n)
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++static bool taimen_gfx_set(vm_offset_t gpu, unsigned mhz);
++static vm_offset_t g_tgpu;      /* the A540's registers (gpu_thread), for the clock measurement */
++
++/* The Pixel 1's fields (GPLL0 600 MHz / 1, 1.5, 2, 3) onto taimen's corners (0235). */
++static bool
++gfx_clock(uint32_t field)
++{
++	unsigned mhz = field == 1 ? 596 : field == 2 ? 414 : field == 3 ? 342 : 257;
++	return g_tgpu != 0 && taimen_gfx_set(g_tgpu, mhz);
++}
++#else
+ /* gfx3d RCG = GPLL0 (600 MHz) / div, div in half steps (field 2*div - 1). */
+ static bool
+ gfx_clock(uint32_t field)
+@@ -1269,6 +1290,7 @@ gfx_clock(uint32_t field)
+ 	wr(mmcc, 0x4000, rd(mmcc, 0x4000) | 1u);
+ 	return poll(mmcc, 0x4000, 1u, 0, 10);
+ }
++#endif
+ 
+ /*
+  * Full-frame benchmark: 1024x1024 pixels (4 MB per buffer, about one
+@@ -1391,7 +1413,7 @@ sample_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t
+ 		src = vm_buffer(&sva, SW * SH * 4);
+ 		dst = vm_buffer(&dva, W * H * 4);
+ 	} else {
+-		src = gpu_page(&sva);
++		src = gpu_alloc(&sva, SW * SH * 4);     /* 16 KB: four pages on 4K */
+ 		dst = gpu_alloc(&dva, W * H * 4);
+ 	}
+ 	if (src == 0 || dst == 0 || ks == 0) {
+@@ -1776,7 +1798,11 @@ void
+ sweet_gpu_get_info(struct sweet_gpu_info *info)
+ {
+ 	*info = (struct sweet_gpu_info){
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		.chip_id = 0x05040001u,         /* A540 v1 (MSM8998, live.dts qcom,chipid) */
++#else
+ 		.chip_id = 0x05030002u,         /* A530 v2 (MSM8996 Pro) */
++#endif
+ 		.gmem_size = 0x100000u,
+ 		.gmem_base = 0x100000u,
+ 		.max_freq = (uint64_t)g_max_mhz * 1000000u,
+@@ -1796,6 +1822,13 @@ sweet_gpu_get_info(struct sweet_gpu_info *info)
+  */
+ extern bool sweet_rpm_mx_corner(uint32_t corner);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++static bool
++gfx_raise(int mhz)
++{
++	return gfx_clock(mhz == 600 ? 1 : 2);      /* 596 or 414 MHz, rail and MX first */
++}
++#else
+ static bool
+ gfx_raise(int mhz)
+ {
+@@ -1818,6 +1851,7 @@ gfx_raise(int mhz)
+ 	}
+ 	return gfx_clock(mhz == 600 ? 1 : 2);
+ }
++#endif
+ 
+ 
+ /* Full-screen (750x1334, pitch 3072) source-over quads: average us of 5. */
+@@ -1828,14 +1862,20 @@ quad_bench(void)
+ 	static uint64_t gva[2];
+ 	const uint32_t pitch = 3072, h = 1334, bytes = (pitch * h + PAGE_MASK) & ~PAGE_MASK;
+ 	for (int b = 0; b < 2 && gva[1] == 0; b++) {
+-		uint64_t pa = gpu_alloc(&va[b], bytes), pages[(3072 * 1334 + PAGE_MASK) / PAGE_SIZE];
+-		if (pa == 0) {
++		/* the page list on the heap: 1001 entries (8 KB) on 4K, too much kernel stack */
++		uint32_t np = bytes / PAGE_SIZE;
++		uint64_t pa = gpu_alloc(&va[b], bytes), *pages = kalloc_data(np * sizeof(uint64_t), Z_WAITOK);
++		if (pa == 0 || pages == NULL) {
++			if (pages != NULL) {
++				kfree_data(pages, np * sizeof(uint64_t));
++			}
+ 			return 0;
+ 		}
+-		for (uint32_t i = 0; i < bytes / PAGE_SIZE; i++) {
++		for (uint32_t i = 0; i < np; i++) {
+ 			pages[i] = pa + (uint64_t)i * PAGE_SIZE;
+ 		}
+-		gva[b] = sweet_gpu_vm_map(pages, bytes / PAGE_SIZE, false);
++		gva[b] = sweet_gpu_vm_map(pages, np, false);    /* copies the list */
++		kfree_data(pages, np * sizeof(uint64_t));
+ 		uint32_t *p = (uint32_t *)va[b];
+ 		for (uint32_t i = 0; i < pitch / 4 * h; i++) {
+ 			p[i] = b ? 0xff000000u | (i * 0x10305u) : src_px(i % 768, i / 768);
+@@ -2438,6 +2478,7 @@ gpu_thread(void *arg, wait_result_t result)
+ 	g_level = (int)(uintptr_t)arg;
+ 	gpu_sleep(10);
+ 	vm_offset_t gpu = taimen_power_up();
++	g_tgpu = gpu;
+ 	if (gpu != 0 && g_level >= 2) {
+ 		gpu_wait(11);
+ 		cp_test(gpu, g_level);
+@@ -2579,7 +2620,7 @@ sweet_gpu_init(void)
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 	if (on > TAIMEN_GPU_MAX_LEVEL) {
+-		printf("SWEET GPU: sweetgpu=%d capped at %d on taimen (GPU clocks not ported yet)\n", on,
++		printf("SWEET GPU: sweetgpu=%d capped at %d on taimen\n", on,
+ 		    TAIMEN_GPU_MAX_LEVEL);
+ 		on = TAIMEN_GPU_MAX_LEVEL;
+ 	}

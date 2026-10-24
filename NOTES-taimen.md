@@ -498,3 +498,6 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (MODE 0xd0000005, USER 0x7), gfx3d RCG 0x103 (out_even / 2), **measured 256 MHz** (CP_PERFCTR_CP_0 always-count
   against the always-on counter); S1 left at 752 mV, MX not voted; the RGBA8 blit again 0 mismatches. 78 s fastboot to
   fastboot.
+- 2026-10-23 **boot 56 (r55, taimengpuclk=596): gfx3d at 596 MHz.** rwmx vlvl 256 ok; PM8005 S1 752 -> 970 mV
+  (FTS426 0x40/0x41, LSB then MSB, read back 970: the first PMIC write from XNU on taimen); GPUPLL0 L 0x3e FRAC 0x1555
+  locked (MODE 0xd0000005); **measured 596 MHz**; the RGBA8 blit 0 mismatches. 82 s fastboot to fastboot.
