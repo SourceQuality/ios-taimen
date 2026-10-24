@@ -660,3 +660,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-24 boot 83 (r70, taimenamp=1, 25 gesture cycles, 620 s): all 25 cycles done, no panic, no GPU hang,
   wired ~65k pages, free 7-15k; swap gaps through it as in boot 82 (Control Center windows 97-114 under 20 ms
   of ~130-160). taimenamp=1 is now in boot-xnu.sh's ROOT=1 defaults.
+- 2026-10-24 boot 84 (sweetgl dea23e0 with SWEETGL_FINISH=0: CA's end-of-frame flush without glFinish; r70,
+  taimenamp=1, gestures): the new dylib went in through the zlib ROOTFIX record ("create (zlib)
+  /usr/lib/sweetgl-d307593f.dylib (4376940 bytes): ok"), so new sweetgl builds install again. **Worse
+  pacing, and backboardd crashed** once (relaunched): EXC_BAD_ACCESS far 0x30 in
+  _mesa_hash_table_search_pre_hashed <- fd_submit_append_bo <- fd_batch_resource_read_slowpath <-
+  batch_draw_tracking <- fd_draw_vbo <- ... <- sgl_DrawElements: freedreno's deferred submit racing the next
+  frame's draws once the render thread no longer waits. glFinish stays (the default); the switch is off.
