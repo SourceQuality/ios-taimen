@@ -460,3 +460,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   0x20485699; GX_DOMAIN_MISC 0x1 (clamped); CX and GX GDSCR 0x222001 (collapsed), GDS_HW_CTRL 0x5ff4; CXO CBCR 0x1;
   gfx3d and rbbmtimer RCGs 0x80000000 (ROOT_OFF), CFG 0; gfx3d CBCR 0x80000620. mem-acc 0x1fcf004 = 0. PM8005 S1
   (GFX) FTS426 at 752 mV, on: enough for XO and 257 MHz (ceiling 724 mV), so the first power-up needs no rail write.
+- 2026-10-23 boot 49 (r49 = +0228 GPU E1 at XO): bimc_gfx on, CX GDSC on (GDSCR 0xa0222000, GDS_HW_CTRL
+  0x80001fe0), both RCG updates done; the rbbmtimer branch then stayed CLK_OFF (0x80000001): it needs GX on (kgsl
+  enables the GPU clocks after both GDSCs). 0229 moves it after the GX GDSC.
+- 2026-10-23 **boot 50 (r50 = +0229): the Adreno 540 is powered and answers.** GX: BCR and GMEM-reset pulses, clamp
+  off (GX_DOMAIN_MISC 0), GX GDSC on (0xa0222000); gfx3d CBCR 0x6621 and rbbmtimer CBCR 0x1 running on XO;
+  **VBIF_VERSION 0x200a0000, RBBM_STATUS 0x1, RBBM_ALWAYSON_COUNTER 0xac9 -> 0x1547 across a 100 us delay**. iOS ran
+  normally around it. Next: E2, the command processor (SMMU identity map, a530 PM4/PFP microcode, ring, ME_INIT,
+  CP_MEM_WRITE), from sweet_gpu.c's cp_test with the A540 values (docs/taimen-gpu-plan.md 2.6, 3.1).
