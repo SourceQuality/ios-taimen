@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/vm_page_size.h>
 #include <mach/mach_time.h>
@@ -1782,10 +1783,40 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 
 /* ---- EAGLContext ---- */
 
+/*
+ * The GPU service comes up 10-20 s into boot, often after backboardd's
+ * first contexts; refused ones leave CA on its software renderer for good
+ * (boot 65: 17 refused, CA::OGL::SW drew every frame). The first context
+ * waits for it, SWEETGL_WAIT seconds at most (default 60); later ones do not.
+ */
+static bool
+gpu_ready(void)
+{
+	static _Atomic int waited;
+	if (sweetgl_init()) {
+		return true;
+	}
+	if (__atomic_exchange_n(&waited, 1, __ATOMIC_RELAXED)) {
+		return false;
+	}
+	const char *w = getenv("SWEETGL_WAIT");
+	int secs = w ? atoi(w) : 60;
+	uint64_t t0 = mach_absolute_time();
+	for (int i = 0; i < secs * 4; i++) {
+		usleep(250000);
+		if (sweetgl_init()) {
+			sweet_drm_log("sweetgl: GPU service up after %llu ms of waiting", ticks_us(mach_absolute_time() - t0) / 1000);
+			return true;
+		}
+	}
+	sweet_drm_log("sweetgl: no GPU service after %d s", secs);
+	return false;
+}
+
 static id
 m_init(id self, SEL cmd, NSUInteger api, id props)
 {
-	struct sweetgl_ctx *ctx = api >= 2 && sweetgl_init() ? sweetgl_create((int)api, NULL) : NULL;
+	struct sweetgl_ctx *ctx = api >= 2 && gpu_ready() ? sweetgl_create((int)api, NULL) : NULL;
 	struct sgl_context *c = ctx ? calloc(1, sizeof(*c)) : NULL;
 	int slot = -1;
 	pthread_mutex_lock(&ctx_lock);
