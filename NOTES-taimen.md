@@ -427,3 +427,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   hurt. SWEET TOP while iOS settles: 300-580 % in all, kernel_task 50-110 %, SpringBoard up to 118 %, backboardd up to
   58 %, locationd/identityservicesd/healthd 30-55 %; idle after ~200 s. boot-xnu.sh ROOT=1 now defaults to cpus=4
   taimenhwscale=2. Next: gold/silver/DDR clocks (docs/taimen-clocks-plan.md) and the GPU (docs/taimen-gpu-plan.md).
+- 2026-10-23 boot 42 (r44, cpus=4, taimenhwscale=3 = E4 double-buffered, sweetperf=1, 600 s): mode 3 ran the whole
+  600 s (SRC0 alternating SCAN0/SCAN1, 0 timeouts, 0 DSI resets); no touches, so only idle numbers. The display stayed
+  on for 10 minutes untouched: boot 36's display-off was a gesture, not the idle timer.
+- 2026-10-23 boot 43 (r44, 90 s): the log reader now also copies `/vendor/firmware/a5*` from vendor_a (mounted
+  read-only): 14 files (a530_pm4/pfp, a540_gpmu.fw2, a540_zap.mdt/.b00-.b02/.elf, ...), moved to
+  `../research/taimen/firmware/` (not for git). docs/taimen-gpu-plan.md and docs/taimen-clocks-plan.md written.
+- 2026-10-23 **boot 44 (r45 = +0224 clock stages; taimenclkdump=2 taimenclkmeasure=1 taimenddr=1804): the DDR vote
+  works.** RPM clock handoff 0 failures, scaling on, bimc 1804000 kHz ok; debug mux bimc (sel 0x14e) 648 -> 902 MHz
+  (sel 0xa9 reads 0), snoc 200 -> 239, cnoc 73; cached memcpy ~0.8 -> 1.09 GB/s on every silver core (cpu0 241 ->
+  1089 MB/s across the vote while iOS was starting). Display and UFS unaffected. Every C0a and C0b region read
+  cleanly: OSM ENABLE 0 on both clusters (nothing runs it), CPRh unprogrammed, SAW4 PMIC_STS 0 (no voltage there),
+  APM and MEM-ACC 0, ACD 0x10000000. GFMUX cfg silver 0x301, **gold 0x403 (on GPLL0 / 2)**; silver PLL L 0x51
+  (1555.2 MHz), **gold PLL running at L 0x20 = 614.4 MHz (mode 0x7) but not selected**. TSENS 35-39 C. boot-xnu.sh
+  ROOT=1 now adds sweetperf=1 taimenddr=1804. Next: V1 (SPMI read of the S10/S13 rail voltages), then gold onto its PLL.
