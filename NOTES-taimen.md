@@ -452,3 +452,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   7.9 GB/s**. Volume-up GPIO 126 now cfg 0x3 in 1; no false key events. Lock screen at ~20 s (35 s with gold at
   299 MHz, 15 s with 4 silver cores; 5 s resolution, and this boot also ran the ramp and the per-core benchmarks).
   boot-xnu.sh ROOT=1 defaults: cpus=8 taimengold=1728 sweetkeys=1 (+ full screen, DDR 1804).
+- 2026-10-23 boot 47 (r47, the new defaults, 900 s): gold 1727 MHz for the whole 15 minutes, no TSENS park, 41 frames
+  (nobody used it), 0 timeouts, 0 DSI resets, geometry 3.
+- 2026-10-23 boot 48 (r48 = +0227 GPU census E0): everything reads without a stall. GCC: cfg_ahb 0x20008001,
+  gpu_bimc_gfx 0x1 and iref 0x1 on, bimc_gfx 0x80000000 off, GPU_MISC 0x10000, GPLL0 vote 0x2. GPU CC 0x5065000:
+  GPUPLL0 MODE 0 (off) but L/CAL_L 0x1a, FRAC 0xc555 (514 MHz VCO = the 257 MHz corner), USER 0x107, CONFIG
+  0x20485699; GX_DOMAIN_MISC 0x1 (clamped); CX and GX GDSCR 0x222001 (collapsed), GDS_HW_CTRL 0x5ff4; CXO CBCR 0x1;
+  gfx3d and rbbmtimer RCGs 0x80000000 (ROOT_OFF), CFG 0; gfx3d CBCR 0x80000620. mem-acc 0x1fcf004 = 0. PM8005 S1
+  (GFX) FTS426 at 752 mV, on: enough for XO and 257 MHz (ceiling 724 mV), so the first power-up needs no rail write.
