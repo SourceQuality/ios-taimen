@@ -1,0 +1,279 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5486f31..1696030 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@ extern void sweet_gpu_init(void);
+ extern void sweet_touch_init(void);
+ extern void taimen_touch_init(void);
+ extern void sailfish_wlan_init(void);
++extern void taimen_modem_init(void);    /* iokit/Kernel/arm/TaimenModem.cpp */
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -678,6 +679,8 @@ sweet_ufs_init(void)
+ 	sweet_perf_init();
+ 	/* the Adreno 540 bring-up with sweetgpu=N (0230: power-up and the CP, N <= 2) */
+ 	sweet_gpu_init();
++	/* Wi-Fi through the modem DSP with taimenwifi=N (0263, docs/taimen-wifi-plan.md) */
++	taimen_modem_init();
+ #else
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+new file mode 100644
+index 0000000..0c36cc0
+--- /dev/null
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -0,0 +1,240 @@
++/*
++ * taimen (MSM8998) Wi-Fi through the modem DSP, docs/taimen-wifi-plan.md. Boot-arg taimenwifi=N
++ * runs the milestones up to N (section 4).
++ *
++ * M0 (this file so far): a read-only look at what the modem path needs, nothing written.
++ *   SMEM      0x86000000, 2 MB. Downstream smem.c expects version 11: global items in the
++ *             header's TOC (the "global heap"), host-pair items in the $TOC private partitions
++ *             in the last 4 KB.
++ *   hwlock    TCSR mutex 0x1F40000, lock 3 (0: free).
++ *   items     428 SMP2P out (apps -> modem), 435 SMP2P in, 478 GLINK: absent before the modem
++ *             boots; 421 the modem's crash reason (global heap).
++ *   TrustZone is hyp_assign (SCM svc 0x0C cmd 0x16) available; does TZ offer PAS for the modem
++ *             (PAS id 4: Linux on this phone boots it through the MBA, "No pas_id found").
++ * SMEM structures and lookups from ios-topaz TopazModem.cpp (0113), plus the v11 global heap.
++ * SMEM is mapped write-combined (Normal NC): no cache upkeep, unaligned reads are fine.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void taimen_modem_init(void);
++
++#define LOG(fmt, ...)           IOLog("TAIMEN MODEM: " fmt "\n", ##__VA_ARGS__)
++
++#define SMEM_PA                 0x86000000ull
++#define SMEM_SIZE               0x00200000u
++#define TCSR_MUTEX_PA           0x01F40000ull   /* qcom,tcsr-mutex, 8 locks, stride 0x1000 */
++#define SMEM_HWLOCK             3
++#define HOST_APPS               0
++#define HOST_MPSS               1
++#define SMEM_SBL_VERSION_INDEX  7               /* smem.c SMEM_MASTER_SBL_VERSION_INDEX */
++#define SMEM_TOC_ITEMS          512
++
++#define ITEM_MSS_CRASH          421
++#define ITEM_SMP2P_OUT          428
++#define ITEM_SMP2P_IN           435
++#define ITEM_GLINK              478
++
++#define SCM_FN(svc, cmd)        (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++#define SCM_SIP_FNID(svc, cmd)  (0x02000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++
++struct smem_global_entry { uint32_t allocated, offset, size, aux_base; } __attribute__((packed));
++struct smem_header {
++	uint32_t proc_comm[16];
++	uint32_t version[32];
++	uint32_t initialized, free_offset, available, reserved;
++	struct smem_global_entry toc[SMEM_TOC_ITEMS];
++} __attribute__((packed));
++struct smem_pt_entry { uint32_t offset, size, flags; uint16_t host0, host1; uint32_t cacheline, rsvd[7]; } __attribute__((packed));
++struct smem_pt { uint8_t magic[4]; uint32_t version, num_entries, rsvd[5]; } __attribute__((packed));
++struct smem_part_hdr { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, free_uncached, free_cached, rsvd[3]; } __attribute__((packed));
++struct smem_priv_entry { uint16_t canary, item; uint32_t size; uint16_t pad_data, pad_hdr; uint32_t rsvd; } __attribute__((packed));
++
++static uint8_t *smem;
++
++/* ---------------------------------------------------------------- TrustZone */
++
++static uint64_t
++smc(uint64_t a[8])
++{
++	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1], x2 __asm__("x2") = a[2],
++	    x3 __asm__("x3") = a[3], x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5], x6 __asm__("x6") = a[6],
++	    x7 __asm__("x7") = a[7];
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++            :
++            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
++	return x0;
++}
++
++/* A standard SCM call; long calls return INTERRUPTED (1): resume with x0 = 1 and x6. */
++static uint64_t
++scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++{
++	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
++
++	smc(args);
++	for (unsigned n = 0; args[0] == 1 && n < 100000; n++) {
++		uint64_t again[8] = { 1, arginfo, a, b, c, 0, args[6], 0 };
++		memcpy(args, again, sizeof(args));
++		smc(args);
++	}
++	if (res1 != NULL) {
++		*res1 = args[1];
++	}
++	return args[0];
++}
++
++/* ---------------------------------------------------------------- SMEM */
++
++static struct smem_part_hdr *
++smem_partition(uint16_t a, uint16_t b)
++{
++	struct smem_pt *pt = (struct smem_pt *)(smem + SMEM_SIZE - 0x1000);
++	struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
++
++	if (memcmp(pt->magic, "$TOC", 4) != 0 || pt->num_entries > 64) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i < pt->num_entries; i++) {
++		if (e[i].offset != 0 && e[i].size != 0 && e[i].offset < SMEM_SIZE &&
++		    ((e[i].host0 == a && e[i].host1 == b) || (e[i].host0 == b && e[i].host1 == a))) {
++			return (struct smem_part_hdr *)(smem + e[i].offset);
++		}
++	}
++	return NULL;
++}
++
++static void *
++smem_part_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
++{
++	uint8_t *e, *end;
++
++	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size) {
++		return NULL;
++	}
++	e = (uint8_t *)p + sizeof(*p);
++	end = (uint8_t *)p + p->free_uncached;
++	while (e + sizeof(struct smem_priv_entry) <= end) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5) {
++			return NULL;
++		}
++		if (h->item == item) {
++			if (size != NULL) {
++				*size = h->size - h->pad_data;
++			}
++			return e + sizeof(*h) + h->pad_hdr;
++		}
++		e += sizeof(*h) + h->pad_hdr + h->size;
++	}
++	return NULL;
++}
++
++/* v11 global heap: the header's TOC (smem.c qcom_smem_get_global). */
++static void *
++smem_global_get(uint16_t item, uint32_t *size)
++{
++	struct smem_header *h = (struct smem_header *)smem;
++	if (item >= SMEM_TOC_ITEMS || !h->toc[item].allocated || h->toc[item].offset >= SMEM_SIZE) {
++		return NULL;
++	}
++	if (size != NULL) {
++		*size = h->toc[item].size;
++	}
++	return smem + h->toc[item].offset;
++}
++
++/* ---------------------------------------------------------------- milestones */
++
++static void
++m0(void)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SMEM_PA, SMEM_SIZE, kIODirectionIn);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	volatile uint32_t *mutex = (volatile uint32_t *)ml_io_map(TCSR_MUTEX_PA + SMEM_HWLOCK * 0x1000, 0x1000);
++	if (map == NULL || mutex == NULL) {
++		LOG("M0: map failed (smem %p, tcsr mutex %p)", map, mutex);
++		OSSafeReleaseNULL(map);
++		return;
++	}
++	smem = (uint8_t *)map->getVirtualAddress();
++
++	struct smem_header *h = (struct smem_header *)smem;
++	uint32_t ver = h->version[SMEM_SBL_VERSION_INDEX];
++	struct smem_pt *pt = (struct smem_pt *)(smem + SMEM_SIZE - 0x1000);
++	char magic[5] = {0};
++	memcpy(magic, pt->magic, 4);
++	LOG("M0: SMEM at %#llx: version word %#x (v%u), initialized %u, free %#x, available %#x; ptable '%s' "
++	    "v%u, %u partitions; hwlock %u holds %u", SMEM_PA, ver, ver >> 16, h->initialized, h->free_offset,
++	    h->available, magic, pt->version, pt->num_entries, SMEM_HWLOCK, *mutex);
++	if (memcmp(pt->magic, "$TOC", 4) == 0 && pt->num_entries <= 64) {
++		struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
++		for (uint32_t i = 0; i < pt->num_entries; i++) {
++			struct smem_part_hdr *p = e[i].offset < SMEM_SIZE ? (struct smem_part_hdr *)(smem + e[i].offset) : NULL;
++			char pm[5] = "????";
++			if (p != NULL) {
++				memcpy(pm, p->magic, 4);
++			}
++			LOG("M0:   partition %u: hosts %u<->%u at %#x, %#x bytes, flags %#x, cacheline %u; '%s' "
++			    "free_uncached %#x free_cached %#x", i, e[i].host0, e[i].host1, e[i].offset, e[i].size,
++			    e[i].flags, e[i].cacheline, pm, p != NULL ? p->free_uncached : 0, p != NULL ? p->free_cached : 0);
++		}
++	}
++	struct smem_part_hdr *mpss = smem_partition(HOST_APPS, HOST_MPSS);
++	static const uint16_t items[] = {ITEM_MSS_CRASH, ITEM_SMP2P_OUT, ITEM_SMP2P_IN, ITEM_GLINK};
++	for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
++		uint32_t gs = 0, ps = 0;
++		void *g = smem_global_get(items[i], &gs), *p = smem_part_get(mpss, items[i], &ps);
++		LOG("M0:   item %u: global %s (%u bytes), apps<->mpss partition %s (%u bytes)", items[i],
++		    g != NULL ? "present" : "absent", gs, p != NULL ? "present" : "absent", ps);
++	}
++	uint32_t globals = 0;
++	for (unsigned i = 0; i < SMEM_TOC_ITEMS; i++) {
++		globals += h->toc[i].allocated != 0;
++	}
++	LOG("M0: %u global items allocated; apps<->mpss partition %s", globals, mpss != NULL ? "found" : "MISSING");
++
++	uint64_t r1 = 0;
++	uint64_t r0 = scm(SCM_FN(6, 1), 1, SCM_SIP_FNID(0x0c, 0x16), 0, 0, &r1);
++	LOG("M0: SCM is_call_available(hyp_assign 0x0c/0x16) -> %lld/%llu", (int64_t)r0, r1);
++	uint64_t s1 = 0;
++	uint64_t s0 = scm(SCM_FN(2, 7), 1, 4, 0, 0, &s1);
++	LOG("M0: SCM PAS_IS_SUPPORTED(4, modem) -> %lld/%llu", (int64_t)s0, s1);
++	OSSafeReleaseNULL(map);
++	smem = NULL;
++}
++
++static void
++modem_thread(void *arg, wait_result_t wr __unused)
++{
++	int level = (int)(intptr_t)arg;
++	IOSleep(5000);
++	LOG("taimenwifi=%d", level);
++	if (level >= 1) {
++		m0();
++	}
++}
++
++void
++taimen_modem_init(void)
++{
++	int level = 0;
++	thread_t t;
++	(void)PE_parse_boot_argn("taimenwifi", &level, sizeof(level));
++	if (level <= 0) {
++		return;
++	}
++	if (kernel_thread_start(modem_thread, (void *)(intptr_t)level, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 5518e6b..3e09eff 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/TaimenModem.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
