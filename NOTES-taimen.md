@@ -712,3 +712,16 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   ("needs cpus=8"). xnu 0250: compressor VA 4 x max_mem on taimen, the page accounting printed.
   Linux's System RAM runs unbroken from 0xb1000000 through the 4 GB line to 0x17e4bffff (~3.2 GiB):
   xnu 0251 + mkadt TAIMEN_BASE=0xb1000000 put XNU's one range there.
+- 2026-10-24 hand-off boot 2 (r71, two scan buffers by default, 40 min deadline): nobody touched the phone
+  (0 touch moves), so no flicker verdict yet.
+- 2026-10-24 boots 94-95 (r73 = +0250 compressor VA, +0251 RAM from the low bank; the shim watcher, gestures):
+  **94 (1.5 GiB at 0x100000000) runs iOS normally**: kmem_range_init passes, gestures, presents = swaps at
+  7-12 ms. The "quarter of the pages" of boots 63 and 92 is not a loss: above 1 GB stock XNU picks 16 KB VM
+  pages over taimen's 4 KB tables (arm_init.c, `args->memSize > 1 GB`), so 95951 pages x 16 KB is all of it
+  ("SWEET VM: max_mem 0x60000000", lopage/secluded 0). Memory under the gesture script: free 23-75 MB,
+  compressed ~290 MB. **95 (TAIMEN_BASE=0xb1000000, 2.96 GiB)**: start.s and the bootstrap tables held,
+  191053 x 16 KB pages, kmem claims fit, then "write_pte_fast: PTE write is unaligned" from
+  pmap_create_commpages: the PFZ text page takes a random 4 KB leaf index (138), and a 16 KB page needs
+  4 PTEs from a 4-aligned one. Any boot above 1 GB had a 1 in 4 chance of an aligned draw (94 got one).
+  xnu 0254 rounds the index down. xnu 0252-0253: gold through CPRh and the OSM (taimenosm=ROW,
+  docs/taimen-osm-cprh.md), not booted yet.
