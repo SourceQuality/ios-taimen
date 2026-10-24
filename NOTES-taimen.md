@@ -777,3 +777,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   huge improvement from the first boot. The brightness works as well."** Also: "why is this iOS so stripped
   down? It only has 6 apps": the 32 staged stock apps were never moved into /Applications on taimen (xnu 0262,
   mkrootfix --stage-apps; boot 107 with the data migration once).
+- 2026-10-24 boot 106 (r83 build = +0261-0262, the defaults + sweetgpuclk=710, gestures, 300 s): **the A540 at
+  710 MHz** (corner 8): S1 775 -> 1024 mV read back, MX turbo, GPUPLL0 L 0x49 frac 0xf555, measured 710 MHz,
+  API self-test ok; full-screen quad 10.7 ms (14.8 at 300 MHz), the per-frame GPU copy 3.3 ms (3.9-4.0 at
+  596). Ran to its deadline, hottest 70.8 C. sweetgpuclk=710 is the default. Hand-off 5 (ended early by
+  the user): brightness 79/1/28 from the slider, the battery 98 -> 96 % and the charger restarted on its own
+  (chgr 0x46 inhibit -> 0x03 full-on). The user: two hours of hand-off is wasted time; hand-offs stay short.

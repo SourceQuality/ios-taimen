@@ -36,7 +36,7 @@ fi
 # GPU (ROOT=1 boots once tools/taimen/sweetgl-install.sh has run; GPU=0: CoreAnimation's CPU
 # renderer): CA draws with Mesa on the A540, sweetgl injected into backboardd (boots 60-75: ~60
 # frames/s in the swipe animations). 2.96 GiB of RAM from 0xb1000000 (xnu 0250-0251, 0254, boot 96:
-# the low bank's top runs on into the upper bank); the GPU service at 596 MHz (sweetgpu=8, the CP
+# the low bank's top runs on into the upper bank); the GPU service at 710 MHz (sweetgpu=8, the CP
 # microcode and zap shader from GPUFW); the A540 copies each frame to the scan buffer
 # (taimengpucopy, E5); Mesa's buffers write-combined from a 256 MB heap above XNU's RAM (xnu 0240,
 # XNU's RAM ends at 0x16e400000). The dylib comes with the sweetgl ROOTFIX, whatever ROOTFIX says:
@@ -56,7 +56,7 @@ if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 		fi
 		ROOTFIX=$SWEETGL_ROOTFIX
 	fi
-	args="sweetgpu=8 sweetgpuclk=600 taimengpucopy=1 taimengpuheap=256 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB sweetnull=backboardd ${args}"
+	args="sweetgpu=8 sweetgpuclk=710 taimengpucopy=1 taimengpuheap=256 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB sweetnull=backboardd ${args}"
 	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), RAM ${TAIMEN_BASE:-0x100000000} + $TAIMEN_MEM"
 fi
 # SHIM_WATCH=1: CPU 7 stays in the shim as a watcher (shim/taimen.c WATCH): XNU gets 7 cores, and
