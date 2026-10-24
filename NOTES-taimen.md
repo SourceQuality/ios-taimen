@@ -569,3 +569,21 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   tools/sweetgl/dsc-dis.py disassembles shared-cache functions (binutils objdump) with call targets named.
 - 2026-10-24 boot 67 (sweetgl 57ebaea, the GPU wait): "GPU service up after 7125 ms of waiting", no context
   refused, Mesa from the first frame; otherwise as boot 66 (0.6-1.2 flushes/s).
+- 2026-10-24 **boot 68 (sweetgl 260b63a: time inside every GLI slot): Mesa's frames are CPU-bound in
+  glDrawElements**, ~1.4 ms per draw (e.g. 1134 ms for 744 draws in one swipe's 10 s); ~70 draws per frame make
+  the ~100 ms frame build. glFinish (sgl_Flush) 9-10 ms per frame, shader compile/link 0.1-0.2 s once, texture
+  uploads and IOSurface binds small; glTestObjectAPPLE not among the top 8. sweetgl issues
+  _mesa_TextureBarrierNV before every draw whose program samples its own render target (CA's destination reads,
+  feedback_barrier) and every fbfetch draw, and Mesa 26.3's freedreno implements texture_barrier as a whole
+  batch flush (fd_context_flush): a GPU submit per such draw, each listing the 13.9 MB display surface for the
+  kernel's per-page cache check. sweetgl 0c843a9 adds an A5xx barrier inside the batch for GMEM bypass to
+  mesa.patch (CCU color/depth flush with timestamps, WFI, UCHE invalidate, CCU color invalidate); 5544c49 counts
+  submits and their kernel time in the 10 s report.
+- 2026-10-24 boot 69 (sweetgl 5544c49: GPU submits counted): **the draw cost is GPU submits**: one swipe window
+  had 742 draws, 194 submits and 1380 ms inside the kernel submit call against 1353 ms in glDrawElements, ~7 ms
+  of kernel time per submit; 361 submits / 1855 ms in the busiest window.
+- 2026-10-24 boot 70 (sweetgl 0c843a9: the A5xx in-batch texture barrier): submits per swipe window down to
+  89-131 (221 in the busiest), 1.1-3.6 flushes/s, some windows 2.7-3.2 swaps/s with 18-19 swap gaps under 20 or
+  54 ms; still ~7 ms of kernel time per submit. The rest are batch flushes freedreno makes when a pass samples
+  what an earlier pass rendered (CA's blur and backdrop passes). Mesa's App Library at the end is the same as in
+  boot 69 (shots/end-surface*.png): the barrier draws correctly. Next: the kernel's ~7 ms per submit (profile).
