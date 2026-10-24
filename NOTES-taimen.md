@@ -740,3 +740,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   read gold at 1677-1996 MHz under load and came back (the OSM's own FSMs, cause unknown). No panic,
   no crash. TSENS only printed above 90 C (none); xnu 0255 logs the hottest sensor every tick.
   boot-xnu.sh ROOT=1 defaults: TAIMEN_BASE=0xb1000000 TAIMEN_MEM=0xbd400000, taimenosm=33 (G1 fallback).
+- 2026-10-24 hand-off boot 3 (boot 99, r76 = the new ROOT=1 defaults: 2.96 GiB from 0xb1000000, gold OSM row
+  33, two scan buffers; 45 min): no panic; nobody touched it (0 touch windows). Gold settled at 2342 MHz /
+  1052 mV as in boot 98. **Temperatures (0255): hottest 61.1 C (boot), 42-44 C idle at 2342 MHz.** Free
+  memory 160-220 MB after settling, never a compressed page. Userland: driverkitd sig 9 and PosterBoard
+  sig 5, both already in r70's 1 GiB hand-off (not new). Boot 98's swipes: backboardd in GL 3.3 s of 10 s,
+  Flush (GPU wait) 1.0-1.6 s of that: CA's CPU side still the larger part at 45 frames/s. xnu 0256:
+  silver through its OSM (taimenosmsilver=ROW).
