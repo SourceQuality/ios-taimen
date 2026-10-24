@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 5de89bf..16f296c 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -926,6 +926,58 @@ taimen_swipe_thread(void *arg, wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * Synthetic app and Control Center use (0243): taimengest=T, T s after the perf thread starts,
++ * unlocks (swipe up), then taimengestn=N times (default 6): tap Settings on the first home screen
++ * page (panel 870,1034: shot 138,175 x 5 into the 1125x2436 surface, x 1.182 + 55 onto the panel),
++ * swipe up from the bottom edge (home), swipe down from the top-right corner (Control Center),
++ * swipe up (close it); taimengestint=P s (default 5) after each step.
++ */
++extern void sweet_fb_screenshot(const char *tag);     /* SweetFramebuffer.cpp: SHOT lines */
++
++static void
++taimen_tap(int x, int y)
++{
++	sweet_hid_touch(9, 1, x, y);
++	delay(80000);
++	sweet_hid_touch(9, 0, x, y);
++}
++
++static void
++taimen_gest_thread(void *arg, wait_result_t wr)
++{
++	(void)wr;
++	int t = (int)(uintptr_t)arg, p = 5, n = 6;
++	(void)PE_parse_boot_argn("taimengestint", &p, sizeof(p));
++	(void)PE_parse_boot_argn("taimengestn", &n, sizeof(n));
++	unsigned w = (unsigned)(p > 1 ? p : 1);
++	perf_wait((unsigned)t);
++	printf("TAIMEN GEST: unlock\n");
++	taimen_swipe(720, 2870, 720, 1300);
++	perf_wait(w);
++	for (int i = 0; i < n; i++) {
++		printf("TAIMEN GEST %d: open Settings\n", i);
++		taimen_tap(870, 1034);
++		perf_wait(w);
++		if (i == 0) {
++			sweet_fb_screenshot("settings");
++		}
++		printf("TAIMEN GEST %d: home\n", i);
++		taimen_swipe(720, 2870, 720, 1300);
++		perf_wait(w);
++		printf("TAIMEN GEST %d: Control Center\n", i);
++		taimen_swipe(1300, 10, 1300, 1400);
++		perf_wait(w);
++		if (i == 0) {
++			sweet_fb_screenshot("cc");
++		}
++		printf("TAIMEN GEST %d: close Control Center\n", i);
++		taimen_swipe(720, 2870, 720, 1300);
++		perf_wait(w);
++	}
++	printf("TAIMEN GEST: done\n");
++}
++
+ /* Every perf tick while gold runs off GPLL0: any TSENS sensor above 90.0 C parks it. */
+ static void
+ taimen_gold_watch(void)
+@@ -1003,6 +1055,11 @@ taimen_clocks(void)
+ 	    kernel_thread_start(taimen_swipe_thread, (void *)(uintptr_t)swipe, &st) == KERN_SUCCESS) {
+ 		thread_deallocate(st);
+ 	}
++	int gest = 0;
++	if (PE_parse_boot_argn("taimengest", &gest, sizeof(gest)) && gest > 0 &&
++	    kernel_thread_start(taimen_gest_thread, (void *)(uintptr_t)gest, &st) == KERN_SUCCESS) {
++		thread_deallocate(st);
++	}
+ 	int gpucensus = 0;
+ 	if (PE_parse_boot_argn("taimengpucensus", &gpucensus, sizeof(gpucensus)) && gpucensus > 0) {
+ 		taimen_gpu_census();
