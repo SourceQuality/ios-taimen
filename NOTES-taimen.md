@@ -726,3 +726,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   xnu 0254 rounds the index down. xnu 0252-0253: gold through CPRh and the OSM (taimenosm=ROW,
   docs/taimen-osm-cprh.md), not booted yet.
 - 2026-10-24 ~09:43, the user on boot 96 (r75: 0249 + two scan buffers, RAM from 0xb1000000): **"I don't see any flickering"**. The flicker of the first hand-off boot is gone.
+- 2026-10-24 **boots 96-98 (r75 = +0252-0254): 2.96 GiB of RAM and gold at 2342 MHz.** 96 (RAM from
+  0xb1000000 to the GPU heap, the shim watcher, gestures, 300 s): ran to its deadline; free 125-900 MB and
+  **no compressed page at all** (1 GiB: 13-18k compressed pages, 1.5 GiB: ~18k); gold 299 MHz only because
+  the watcher's cpus=7 refuses G1. 97 (taimenosm=19, 2.96 GiB): the OSM path at G1's clock: SCM probe 0/1,
+  fuses combo 19, CPRh apc1 readback as the spec (CTL 0x80a00b5, CORNER(19) 0x3661656d), 10 sequencer
+  writes through TZ accepted, enable at row 0: S13 896 -> 652 mV (SAW 0x4028c), GFMUX 0x400; row 19: PLL L
+  0x5a, S13 796 mV (100 mV under XBL's 896 at the same clock), all four gold cores 1727 MHz and the
+  self-test. 98 (taimenosm=33): every all-core row checked on all four gold cores; the APM went to APC (3)
+  at row 20 (1804.8, 824 mV), MEM-ACC to level 3 (0x1370 = 1) at row 21 (1881.6, 860 mV), as the spec
+  said. Row 33 (2361.6) settles on row 31's 2342.4 MHz / 1052 mV (CPRh corner 28); not chased (<1 %).
+  The swipes: **44-46 swaps/s, every one presented** (r71 at 1728: ~17), present 9-14 ms. One window
+  read gold at 1677-1996 MHz under load and came back (the OSM's own FSMs, cause unknown). No panic,
+  no crash. TSENS only printed above 90 C (none); xnu 0255 logs the hottest sensor every tick.
+  boot-xnu.sh ROOT=1 defaults: TAIMEN_BASE=0xb1000000 TAIMEN_MEM=0xbd400000, taimenosm=33 (G1 fallback).
