@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b858590..4914dc3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -210,7 +210,16 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+  * loop (a DCS write waits for the frame being sent). It is what fades the
+  * screen out before display sleep. Boot-arg sweetbl=0 leaves it out.
+  */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * LG SW43402 (taimen): bl_ctrl_dcs, qcom,mdss-dsi-bl-max-level 0xe1 (live DT), one-byte DCS 0x51 as
++ * Linux 4.4 sends it (mdss_dsi_panel_bklt_dcs) through the same CMD_DMA_TPG FIFO as sweet_fbcon_dcs
++ * (mdss_dsi_cmd_dma_tpg_tx: 0x15c, 0x17c, 0x04c, 0x090, 0x1ec).
++ */
++#define SWEET_BL_MAX            225
++#else
+ #define SWEET_BL_MAX            255
++#endif
+ #define SWEET_BL_STEP_MS        16
+ 
+ class AppleARMBacklight : public IOService {
+@@ -535,7 +544,7 @@ AppleCLCD::start(IOService *provider)
+ 	OSSafeReleaseNULL(es);
+ 	int bl_on = 1;
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-	bl_on = 0;      /* the DCS 0x51 sequence is the Pixel 1 panel's; unverified on taimen (audit 2026-10-23) */
++	bl_on = 0;      /* sweetbl=1: DCS 0x51 up to 225 (xnu 0260); off until boots show the writes land */
+ #endif
+ 	PE_parse_boot_argn("sweetbl", &bl_on, sizeof(bl_on));
+ 	AppleARMBacklight *bl = bl_on ? OSTypeAlloc(AppleARMBacklight) : NULL;
