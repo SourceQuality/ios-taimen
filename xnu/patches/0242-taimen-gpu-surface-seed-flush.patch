@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index fa25784..77f6257 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -218,6 +218,7 @@ struct sweet_gpu_bo {
+ 	uint32_t last_seq;              /* last submit listing it */
+ 	bool used;                      /* listed in a submit at least once */
+ 	bool wc;                        /* heap memory, write-combined: no cache maintenance */
++	uint32_t seed;                  /* imports: the surface seed at the last full flush */
+ 	uint32_t heap_first;            /* wc: its first heap page */
+ };
+ 
+@@ -602,7 +603,8 @@ SweetGPUUserClient::boImport(uint32_t id, uint64_t *out)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	md->retain();
+-	*b = (struct sweet_gpu_bo){ .iova = gva, .size = size, .md = md, .surface = s, .pa = pa, .npages = npages };
++	*b = (struct sweet_gpu_bo){ .iova = gva, .size = size, .md = md, .surface = s, .pa = pa, .npages = npages,
++		                    .seed = sweet_surface_seed_value(s) };
+ 	out[0] = handle;
+ 	out[1] = gva;
+ 	out[2] = size;
+@@ -667,6 +669,24 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 		 * page of every listed bo was ~1/4 of backboardd's CPU (0182g).
+ 		 * Heap bos (write-combined) need none.
+ 		 */
++		if (b->surface != NULL && !b->surface->clientMemory) {
++			/*
++			 * Surface buffers have a writable kernel mapping: their modified
++			 * bit never clears, every page looked written (boot 74: all ~3400
++			 * pages of each display surface flushed at every submit, ~4 ms).
++			 * CPU writers lock them; the seed moves at each write unlock.
++			 */
++			uint32_t seed = sweet_surface_seed_value(b->surface);
++			if (seed != b->seed) {
++				for (uint32_t p = 0; p < b->npages; p++) {
++					flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
++				}
++				b->seed = seed;
++				flushed += b->npages;
++			}
++			checked += b->npages;
++			continue;
++		}
+ 		for (uint32_t p = 0; !b->wc && p < b->npages; p++) {
+ 			flushed += flush_if_written(b->pa[p]);
+ 		}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0715ee4..1553ab1 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -71,7 +71,6 @@ enum {
+ #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+-#define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 41be9ea..311014a 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -49,6 +49,15 @@ public:
+ 	uintptr_t kernelAddress();
+ };
+ 
++#define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++
++/* The seed: bumped by each unlock that was not read-only (CPU writes), never by users directly. */
++static inline uint32_t
++sweet_surface_seed_value(SweetSurface *s)
++{
++	return *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
++}
++
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
