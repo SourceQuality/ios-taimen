@@ -678,3 +678,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-24 **boot 87 (r70, the plain ROOT=1 default, 3700 s, taimengestn=175)**: ran to the deadline (WDT pet
   at 3695 s); 155 gesture cycles in what the 4 MB ring kept (it wrapped), no panic, no crash, no GPU hang;
   wired flat at 65-68k pages for the hour, free 7-17k, compressed 29-46k.
+- 2026-10-24 boot 88 (r70, TAIMEN_MEM=0x60000000 = 1.5 GiB, GPU setup): like boot 71's 2 GiB, watchdog reset ~44 s
+  after the fastboot boot, empty pstore, no XNU log at all; the shim log ends at "saved (before loader)" as it
+  always does. Above 1 GiB XNU now dies before its console (boot 63 at 2 GiB once reached kmem_range_init).
+  1 GiB stays.
