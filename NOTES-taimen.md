@@ -671,3 +671,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Settings launch / home / Control Center cycles until the deadline, no panic, no crash of any process, no GPU
   hang, gold never parked; wired 64-70k pages, free 9-25k, compressed 31-62k; swap gaps the same through the
   half hour (Control Center windows 90-112 under 20 ms, 40-57 under 37).
+- 2026-10-24 boot 86 (sweetgl d94f72e, SWEETGL_FINISH=0 now a fenced st_flush without the wait; r70, gestures):
+  no crash, but **worse pacing** than glFinish: Control Center windows 13-32 swap gaps over 54 ms each (boot 82:
+  0-1). The CPU running ahead only moves the wait elsewhere (buffer reuse, the kernel's synchronous GPU copy of
+  the frame). glFinish at CA's flush stays; SWEETGL_FINISH stays off.
