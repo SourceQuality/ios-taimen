@@ -769,3 +769,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   floor-to-ceiling range Linux allows. Every row checked, ran to its deadline, 41-43 C idle. In the ROOT=1
   defaults. The first try did not boot: boot-args 615 of 607 bytes; the safe list lost sweettouch, sweetusb,
   sweetcharge and sweetbl (dead on taimen), 46 bytes.
+- 2026-10-24 boot 104 (r81 = +0260, the defaults (now closed loop) + sweetbl=1, gestures, 300 s): backboardd
+  set brightness 113 of 225 and the DCS 0x51 write completed (CMD_DMA_DONE) through the CMD_DMA_TPG FIFO;
+  0 DSI resets, 0 kick timeouts, frames as before; closed loop again (gold 1016, silver 892 mV, 44 C).
+  Whether the panel visibly dims is for a person to see. sweetbl=1 is in the ROOT=1 defaults.
