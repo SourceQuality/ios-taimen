@@ -667,3 +667,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   _mesa_hash_table_search_pre_hashed <- fd_submit_append_bo <- fd_batch_resource_read_slowpath <-
   batch_draw_tracking <- fd_draw_vbo <- ... <- sgl_DrawElements: freedreno's deferred submit racing the next
   frame's draws once the render thread no longer waits. glFinish stays (the default); the switch is off.
+- 2026-10-24 **boot 85 (r70, the plain ROOT=1 default: GPU path + taimenamp=1; 1900 s, taimengestn=90)**: 88
+  Settings launch / home / Control Center cycles until the deadline, no panic, no crash of any process, no GPU
+  hang, gold never parked; wired 64-70k pages, free 9-25k, compressed 31-62k; swap gaps the same through the
+  half hour (Control Center windows 90-112 under 20 ms, 40-57 under 37).
