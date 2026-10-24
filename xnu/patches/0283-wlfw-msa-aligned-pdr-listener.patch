@@ -1,0 +1,177 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 7a2a3ae..1a92f6b 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -166,6 +166,17 @@ pool_alloc(uint64_t size, uint64_t *pa)
+ 	return va;
+ }
+ 
++/* size bytes at an align-aligned physical address (align a power of two, >= 4 KB) */
++static void *
++pool_alloc_aligned(uint64_t size, uint64_t align, uint64_t *pa)
++{
++	uint64_t pad = (align - ((POOL_PA + pool_used) & (align - 1))) & (align - 1), skip = 0;
++	if (pad != 0 && pool_alloc(pad, &skip) == NULL) {
++		return NULL;
++	}
++	return pool_alloc(size, pa);
++}
++
+ /* ---------------------------------------------------------------- TrustZone */
+ 
+ static uint64_t
+@@ -1209,6 +1220,8 @@ static void radio_poll(unsigned ms);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
+ static void wlfw_rx(const uint8_t *d, uint32_t len);
+ static void wlfw_summary(void);
++static void servreg_arrive(uint32_t node, uint32_t port, uint32_t inst);
++static void servreg_rx(const uint8_t *d, uint32_t len);
+ static bool svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len);
+ static void svc_announce(void);
+ static void svc_summary(void);
+@@ -1499,6 +1512,9 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 		if (m7_on && c.a == QMI_SVC_WLFW) {
+ 			wlfw_arrive(c.c, c.d);
+ 		}
++		if (m7_on && c.a == 0x42) {
++			servreg_arrive(c.c, c.d, c.b);
++		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+ 		if (confirm) {
+@@ -1796,6 +1812,7 @@ glink_summary(void)
+ #define PORT_TFTP               0x4002
+ #define PORT_RMTFS              0x4003
+ #define PORT_WLFWC              0x4004          /* our QMI client port towards WLFW (M7) */
++#define PORT_SRNC               0x4005          /* our client port towards servreg-notif (M7) */
+ #define PORT_SESS               0x4100
+ #define QMI_REQ                 0
+ #define QMI_RESP                2
+@@ -2458,6 +2475,12 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		}
+ 		return m7_on;
+ 	}
++	if (dst_port == PORT_SRNC) {
++		if (m7_on) {
++			servreg_rx(data, len);
++		}
++		return m7_on;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
+@@ -2744,7 +2767,8 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		if (!ok) {
+ 			break;
+ 		}
+-		if (w_msa_pa == 0 && pool_alloc(WLFW_MSA_SIZE, &w_msa_pa) == NULL) {
++		/* 1 MB aligned, as icnss's CMA allocation of it is (boot 114 had it at 0x8920c000) */
++		if (w_msa_pa == 0 && pool_alloc_aligned(WLFW_MSA_SIZE, WLFW_MSA_SIZE, &w_msa_pa) == NULL) {
+ 			LOG("M7: no pool space for the MSA");
+ 			break;
+ 		}
+@@ -2839,6 +2863,104 @@ wlfw_summary(void)
+ 	LOG("M7: WLFW %s%s", w_step, w_fw_ready ? " (firmware ready)" : "");
+ }
+ 
++/*
++ * 0283: icnss registers a PDR listener before WLFW connects (Android's "QMI Server Connected: state
++ * 0x981" has ICNSS_PDR_REGISTERED, and the wlan_pd UP indication is ACKed just before it,
++ * dmesg:3540-3542): servreg-notif (QMI 0x42, instance 180 = the wlan_pd domain's) REGISTER_LISTENER
++ * for msm/modem/wlan_pd, then every STATE_UPDATED indication answered with SET_ACK (mainline
++ * pdr_internal.h layouts: strings without a NUL, u16 transaction ids).
++ */
++#define SRN_REGISTER_LISTENER   0x20
++#define SRN_STATE_UPDATED_IND   0x22
++#define SRN_SET_ACK             0x23
++#define SRN_WLAN_PD             "msm/modem/wlan_pd"
++
++static uint32_t sr_node, sr_port;
++static uint16_t sr_txn = 1;
++static unsigned sr_inds;
++
++static void
++sr_send(uint16_t msg, const struct wmsg *m0)
++{
++	(void)msg;
++	struct wmsg m = *m0;
++	uint16_t l = (uint16_t)(m.n - 7);
++	memcpy(m.b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, PORT_SRNC, sr_node, sr_port, m.b, m.n);
++}
++
++static void
++sr_new(struct wmsg *m, uint16_t msg)
++{
++	bzero(m->b, sizeof(m->b));
++	m->b[0] = QMI_REQ;
++	uint16_t t = sr_txn++;
++	memcpy(m->b + 1, &t, 2);
++	memcpy(m->b + 3, &msg, 2);
++	m->n = 7;
++}
++
++static void
++servreg_arrive(uint32_t node, uint32_t port, uint32_t inst)
++{
++	if (sr_port != 0 || (inst >> 8) != 180) {
++		return;
++	}
++	sr_node = node;
++	sr_port = port;
++	struct wmsg m;
++	sr_new(&m, SRN_REGISTER_LISTENER);
++	wm_u8(&m, 0x01, 1);
++	wm_tlv(&m, 0x02, SRN_WLAN_PD, (uint16_t)strlen(SRN_WLAN_PD));
++	sr_send(SRN_REGISTER_LISTENER, &m);
++	LOG("M7: t=%u ms: servreg-notif at %u:%#x (instance %#x): listener for %s sent", g_ms, node, port, inst, SRN_WLAN_PD);
++}
++
++static void
++servreg_rx(const uint8_t *d, uint32_t len)
++{
++	uint16_t msg, l = 0;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&msg, d + 3, 2);
++	if (d[0] == QMI_RESP && msg == SRN_REGISTER_LISTENER) {
++		uint16_t err = 0;
++		bool ok = w_result(d, len, &err);
++		const uint8_t *v = qm_find(d, len, 0x10, &l);
++		uint32_t st = 0;
++		if (v != NULL && l >= 4) {
++			memcpy(&st, v, 4);
++		}
++		LOG("M7: t=%u ms: servreg listener %s err %u, wlan_pd state %#x", g_ms, ok ? "ok" : "FAILED", err, st);
++	} else if (d[0] == QMI_IND && msg == SRN_STATE_UPDATED_IND) {
++		const uint8_t *v = qm_find(d, len, 0x01, &l);
++		uint32_t st = 0;
++		uint16_t txn = 0;
++		if (v != NULL && l >= 4) {
++			memcpy(&st, v, 4);
++		}
++		char name[80] = {};
++		qm_string(d, len, 0x02, name, sizeof(name));
++		if ((v = qm_find(d, len, 0x03, &l)) != NULL && l >= 2) {
++			memcpy(&txn, v, 2);
++		}
++		sr_inds++;
++		struct wmsg m;
++		sr_new(&m, SRN_SET_ACK);
++		wm_tlv(&m, 0x01, name, (uint16_t)strlen(name));
++		wm_tlv(&m, 0x02, &txn, 2);
++		sr_send(SRN_SET_ACK, &m);
++		LOG("M7: t=%u ms: servreg: %s state %#x, transaction %u: ACKed", g_ms, name, st, txn);
++	} else if (d[0] == QMI_RESP && msg == SRN_SET_ACK) {
++		uint16_t err = 0;
++		bool ok = w_result(d, len, &err);
++		LOG("M7: t=%u ms: servreg ack %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++	} else {
++		LOG("M7: t=%u ms: servreg-notif message type %u id %#x", g_ms, d[0], msg);
++	}
++}
++
+ /*
+  * The WLAN rails (icnss_hw_power_on; plan stage 1), before the modem boots. Android drives L7, L17
+  * and L25 through their pin-ctrl twins (enable and high-power mode follow the WCN3990's HW_EN2) and
