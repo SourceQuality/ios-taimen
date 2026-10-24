@@ -1,0 +1,120 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 1a92f6b..dbb17b2 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2535,6 +2535,9 @@ extern "C" bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
+ #define WLFW_MSA_INFO           0x2D
+ #define WLFW_MSA_READY          0x2E
+ #define WLFW_VBATT              0x32
++#define WLFW_BDF_DOWNLOAD       0x25
++#define WLFW_CAL_REPORT         0x26
++#define WLFW_SEG                6144            /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+ #define WLFW_FEATURE_MASK       0x3B
+ #define WLFW_MSA_SIZE           0x00100000u     /* icnss msa_mem_size */
+ #define WLFW_CLIENT_ID          0x4b4e454c      /* icnss WLFW_CLIENT_ID */
+@@ -2544,6 +2547,8 @@ extern "C" bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
+ static uint32_t w_node, w_port, w_board = 0xFF;
+ static uint16_t w_txn = 1;
+ static uint64_t w_msa_pa;
++static const uint8_t *w_bdf;
++static uint32_t w_bdf_len, w_bdf_off, w_bdf_seg;
+ static bool w_fw_ready, w_mission;
+ static const char *w_step = "not started";
+ 
+@@ -2696,6 +2701,65 @@ w_on_msa_info(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++/*
++ * 0284: the board data. Android's icnss never sends it: the userspace cnss-daemon does (its first
++ * QMI send fails on IPC router permissions just before "QMI Server Connected", dmesg:3538), and the
++ * firmware asks for no bdwlan over TFTP. Mainline ath10k downloads it after MSA_READY and then
++ * sends CAL_REPORT; FW_READY follows. BDF_DOWNLOAD: valid, file_id, total_size, seg_id, data (u16
++ * length + bytes), end; segments of 6144 bytes. board_id 0xff -> bdwlan.bin (payload blob WLAN-BDF).
++ */
++static void
++w_bdf_segment(void)
++{
++	uint32_t chunk = MIN(w_bdf_len - w_bdf_off, (uint32_t)WLFW_SEG);
++	bool end = w_bdf_off + chunk >= w_bdf_len;
++	uint32_t cap = WLFW_SEG + 64, n = 7;
++	uint8_t *b = (uint8_t *)IOMalloc(cap);
++	if (b == NULL) {
++		return;
++	}
++	bzero(b, cap);
++	b[0] = QMI_REQ;
++	uint16_t t = w_txn++, msg = WLFW_BDF_DOWNLOAD;
++	memcpy(b + 1, &t, 2);
++	memcpy(b + 3, &msg, 2);
++	uint32_t u;
++	uint16_t l;
++	b[n] = 0x01; l = 1; memcpy(b + n + 1, &l, 2); b[n + 3] = 1; n += 4;                  /* valid */
++	b[n] = 0x10; l = 4; memcpy(b + n + 1, &l, 2); u = 0; memcpy(b + n + 3, &u, 4); n += 7;  /* file_id */
++	b[n] = 0x11; memcpy(b + n + 1, &l, 2); memcpy(b + n + 3, &w_bdf_len, 4); n += 7;     /* total_size */
++	b[n] = 0x12; memcpy(b + n + 1, &l, 2); memcpy(b + n + 3, &w_bdf_seg, 4); n += 7;     /* seg_id */
++	uint16_t tl = (uint16_t)(2 + chunk), dl = (uint16_t)chunk;
++	b[n] = 0x13; memcpy(b + n + 1, &tl, 2); memcpy(b + n + 3, &dl, 2);                   /* data */
++	memcpy(b + n + 5, w_bdf + w_bdf_off, chunk);
++	n += 5 + chunk;
++	b[n] = 0x14; l = 1; memcpy(b + n + 1, &l, 2); b[n + 3] = end ? 1 : 0; n += 4;         /* end */
++	uint16_t ml = (uint16_t)(n - 7);
++	memcpy(b + 5, &ml, 2);
++	qrtr_send(QRTR_TYPE_DATA, PORT_WLFWC, w_node, w_port, b, n);
++	IOFree(b, cap);
++	w_bdf_off += chunk;
++	w_bdf_seg++;
++	w_step = "bdf download";
++}
++
++static void
++w_start_bdf(void)
++{
++	uint64_t sz = 0;
++	w_bdf = tftp_blob("bdwlan.bin", &sz);
++	if (w_bdf == NULL || sz == 0 || sz > 0x100000) {
++		LOG("M7: no board data (WLAN-BDF blob): waiting for FW_READY without it");
++		w_step = "waiting for FW_READY (no BDF)";
++		return;
++	}
++	w_bdf_len = (uint32_t)sz;
++	w_bdf_off = 0;
++	w_bdf_seg = 0;
++	LOG("M7: t=%u ms: board data bdwlan.bin (board_id %#x), %u bytes: downloading", g_ms, w_board, w_bdf_len);
++	w_bdf_segment();
++}
++
+ static void
+ wlfw_arrive(uint32_t node, uint32_t port)
+ {
+@@ -2824,6 +2888,30 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 	}
+ 	case WLFW_VBATT:
+ 		LOG("M7: t=%u ms: vbatt %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (!w_fw_ready) {
++			w_start_bdf();
++		}
++		break;
++	case WLFW_BDF_DOWNLOAD:
++		if (!ok) {
++			LOG("M7: t=%u ms: bdf segment %u FAILED err %u", g_ms, w_bdf_seg - 1, err);
++			w_step = "bdf download FAILED";
++			break;
++		}
++		if (w_bdf_off < w_bdf_len) {
++			w_bdf_segment();
++			break;
++		}
++		LOG("M7: t=%u ms: board data sent in %u segment(s)", g_ms, w_bdf_seg);
++		wm_new(&m, WLFW_CAL_REPORT);
++		{
++			uint8_t none = 0;
++			wm_tlv(&m, 0x01, &none, 1);         /* meta_data_len 0 */
++		}
++		wm_send(&m, "cal_report sent");
++		break;
++	case WLFW_CAL_REPORT:
++		LOG("M7: t=%u ms: cal_report %s err %u", g_ms, ok ? "ok" : "FAILED", err);
+ 		w_step = "waiting for FW_READY";
+ 		break;
+ 	case WLFW_WLAN_CFG:
