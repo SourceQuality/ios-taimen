@@ -698,3 +698,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   91 (taimenhwscale=3, two scan buffers, no panel wait before the copy): present 8-15 ms, presents =
   swaps (99 %+), reuse 0, the GPU copy ~4 ms; screenshots of Control Center and Settings correct.
   taimenhwscale=3 is the ROOT=1 default from here.
+- 2026-10-24 boots 92-93 (r71, the shim watcher, SHIM_WATCH=1: CPU 7 stays in the shim, XNU on 7
+  cores): **more than 1 GiB fails in kmem_range_init, not before the console.** 92 (1.5 GiB): the
+  watcher saw the XNU log stop 10.6 s after the jump and saved it: the same panic as boot 63, now
+  with 0239's claims dump. The compressor asks for 0x600268000 (24 GiB: macOS sizing, 16 x max_mem,
+  which TAIMEN inherits) next to the 24 GiB zone map; the free hole is 0xb67d60000 (45.6 GiB), so
+  the remaining ranges' sizes underflow (kmem_data_range 0xffff7fff405ac000). The panic's MACH
+  Reboot then hangs (no PE_halt_restart before IOKit) and the watchdog reset of boots 71 and 88
+  came back with no pstore; the watcher's PS_HOLD kept the zone (console-ramoops 105917 bytes).
+  Also: vm_page_bootstrap counted 95954 free + 2350 wired = exactly a quarter of 1.5 GiB (boot 63
+  at 2 GiB: a quarter too; 1 GiB: all of it). 93 (1 GiB control): the watcher stood down (XNU's UFS
+  driver took the controller), the boot ran its 200 s; with cpus=7 the gold clock stays at 300 MHz
+  ("needs cpus=8"). xnu 0250: compressor VA 4 x max_mem on taimen, the page accounting printed.
+  Linux's System RAM runs unbroken from 0xb1000000 through the 4 GB line to 0x17e4bffff (~3.2 GiB):
+  xnu 0251 + mkadt TAIMEN_BASE=0xb1000000 put XNU's one range there.
