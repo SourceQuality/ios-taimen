@@ -12,6 +12,13 @@ E6: boots 60-75 in NOTES-taimen.md; the steps that took it from ~1 to ~60 frames
 | Mesa's buffers write-combined from a 256 MB heap above XNU's RAM | xnu 0240 (`taimengpuheap`) | no cache clean and write-protect of Mesa's pages per submit (boot 72 profile) |
 | Imported surfaces flushed only when their seed moved | xnu 0242 | the display surfaces (~3400 pages) no longer cleaned at every submit (boot 74: ~4 ms each) |
 | Imported-surface cache bounded to 96 MB | sweetgl `eagl.c` (`SURF_RES_BYTES`) | SpringBoard's per-swipe snapshot surfaces no longer stay wired |
+| Gold-first idle placement above utility priority | xnu 0248 (`taimenamp=1`, a ROOT=1 default) | Control Center frames under 20 ms 41 -> 69 %, app launches 33 -> 45 % (boots 79, 82) |
+
+Heavier scenes (Settings launch, Control Center) run at ~35-55 frames/s, CPU-bound in CA and Mesa
+(boot 80 profile). Keeping it running: ABL starts no payload over ~35 MiB, so the sweetgl dylib goes into
+the ROOTFIX zlib-compressed (xnu 0245, `mkrootfix.py --zfile`, 19 -> 4.4 MB); a missing dylib leaves
+backboardd on the CPU renderer instead of not starting (xnu 0244); the GFX rail is switched on if ABL left
+it off (xnu 0246). Next for speed: the gold clock above 1728 MHz (CPRh + OSM, docs/taimen-clocks-plan.md).
 
 The rest of this file is the plan as written before any of it ran.
 
