@@ -68,11 +68,13 @@ jobs:
           path: research/mesa-dl
           key: mesa-dl-${{ hashFiles('tools/sweetgl/env.sh') }}
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      # restore + save (always) instead of actions/cache: a failed build still
+      # leaves its objects for the next run
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: sweetgl-ccache-${{ env.CACHE_SALT }}-${{ env.XCODE_VER }}-${{ hashFiles('tools/sweetgl/env.sh', 'tools/sweetgl/mesa.patch') }}-${{ github.run_id }}
+          key: sweetgl-ccache-${{ env.CACHE_SALT }}-${{ env.XCODE_VER }}-${{ hashFiles('tools/sweetgl/env.sh', 'tools/sweetgl/mesa.patch') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sweetgl-ccache-${{ env.CACHE_SALT }}-${{ env.XCODE_VER }}-${{ hashFiles('tools/sweetgl/env.sh', 'tools/sweetgl/mesa.patch') }}-
             sweetgl-ccache-${{ env.CACHE_SALT }}-${{ env.XCODE_VER }}-
@@ -99,6 +101,13 @@ jobs:
       - name: ccache stats
         if: always()
         run: ccache -s
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: sweetgl-ccache-${{ env.CACHE_SALT }}-${{ env.XCODE_VER }}-${{ hashFiles('tools/sweetgl/env.sh', 'tools/sweetgl/mesa.patch') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Inspect
         run: |
