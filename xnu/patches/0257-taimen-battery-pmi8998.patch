@@ -1,0 +1,161 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 21eb201..af4ce9b 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,18 @@
+  * still lowers the input limit if the source sags.
+  * Until the PMIC is readable (sweet_keys_init runs later): 100%, AC.
+  * Boot-arg sweetbattery=0: static fallback only.
++ *
++ * Taimen: PMI8998 (SID 2), read only (Linux qpnp-fg-gen3.c, smb-lib.c,
++ * smb-reg.h):
++ *   percent   FG BATT_SOC 0x4009 MONOTONIC_SOC (0x400a copy must match),
++ *             x 100 / 255 rounded, as fg_get_msoc
++ *   voltage   BATT_INFO 0x41a0/a1 x 122.07 uV
++ *   current   BATT_INFO 0x41a2/a3, signed, x 488.281 uA (positive: discharge)
++ *   temp      BATT_INFO 0x4150/51 [10:0] / 4 = K
++ *   plugged   USBIN 0x1310 USBIN_PLUGIN_RT_STS (bit 4)
++ *   charging  CHGR 0x1006 BATTERY_CHARGER_STATUS_1 [2:0]: 0-4 charging,
++ *             5-6 (terminate, inhibit) full, 7 disabled
++ * No writes: the charger runs as ABL left it.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -28,7 +40,11 @@
+ extern "C" bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ extern "C" bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#define SWEET_BATTERY_MAH       3520    /* Pixel 2 XL */
++#else
+ #define SWEET_BATTERY_MAH       2770    /* Pixel 1 */
++#endif
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -42,6 +58,9 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	int fTemp;                      /* centidegrees C */
++	bool fTempValid;
++	unsigned fPolls;
+ 	uint8_t fLastRegs[6];
+ 	bool fWasExternal;
+ 	unsigned fChargeMA;
+@@ -52,6 +71,7 @@ private:
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	void pollPMI8998(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool reg(uint16_t address, uint8_t *value);
+@@ -91,6 +111,9 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLastMode = -1;
+ 	fLastRegs[5] = 0xff;
++	fTemp = 2500;
++	fTempValid = false;
++	fPolls = 0;
+ 	return true;
+ }
+ 
+@@ -141,12 +164,12 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putNumber("AppleRawMaxCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("DesignCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; 25 C unless the gauge measured it. */
++	putNumber("Temperature", (UInt32)fTemp);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !fTempValid);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -173,7 +196,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PMI8994 fuel gauge" : "static fallback",
++		    measured ? "PMIC fuel gauge" : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -226,9 +249,61 @@ SweetBattery::setupCharger(void)
+ 	    ok ? "ok" : "FAILED", ma[icl], ma[fcc], cmd, il, fc, s1, s2);
+ }
+ 
++void
++SweetBattery::pollPMI8998(void)
++{
++	uint8_t soc = 0, cp = 0, v0 = 0, v1 = 0, i0 = 0, i1 = 0, t0 = 0, t1 = 0, usb = 0, chg = 0;
++	bool valid = fReal;
++	/* Linux fg_get_msoc_raw: the two copies must match. */
++	for (int i = 0; valid && i < 5; i++) {
++		valid = reg(0x4009, &soc) && reg(0x400a, &cp);
++		if (valid && soc == cp) {
++			break;
++		}
++		valid = valid && i < 4;
++	}
++	int step = !valid ? 1 : !(reg(0x41a0, &v0) && reg(0x41a1, &v1)) ? 2 :
++	    !(reg(0x41a2, &i0) && reg(0x41a3, &i1)) ? 3 : !(reg(0x4150, &t0) && reg(0x4151, &t1)) ? 4 :
++	    !reg(0x1310, &usb) ? 5 : !reg(0x1006, &chg) ? 6 : 0;
++	static int logged;
++	if (fReal && step != 0 && logged < 10) {
++		logged++;
++		IOLog("SWEET BATTERY: PMI8998 read failed at step %d\n", step);
++	}
++	if (step != 0) {
++		fTempValid = false;
++		fTemp = 2500;
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned percent = ((unsigned)soc * 100u + 127u) / 255u;
++	unsigned mv = (unsigned)((((uint64_t)v1 << 8 | v0) * 122070u) / 1000000u);
++	int ua = (int)((int64_t)(int16_t)((uint16_t)i1 << 8 | i0) * 488281 / 1000);
++	int ma = -ua / 1000;                            /* iOS: negative while discharging */
++	int kelvin = (((t1 & 7) << 8 | t0) + 2) / 4;
++	fTemp = (kelvin - 273) * 100;
++	fTempValid = true;
++	bool external = (usb & 0x10u) != 0;
++	unsigned st = chg & 7u;
++	bool full = st == 5 || st == 6;
++	bool charging = external && st <= 4;
++	uint8_t regs[6] = {soc, usb, chg, 0, 0, 0};
++	if (memcmp(regs, fLastRegs, sizeof(regs)) != 0 || fPolls % 12 == 0) {
++		IOLog("SWEET BATTERY: soc 0x%02x = %u%% %u mV %d mA %d C usb rt 0x%02x chgr 0x%02x -> external %d "
++		    "charging %d full %d\n", soc, percent, mv, ma, kelvin - 273, usb, chg, external, charging, full);
++		memcpy(fLastRegs, regs, sizeof(regs));
++	}
++	fPolls++;
++	publish(percent, mv, ma, external, external, charging, full, true, true);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	pollPMI8998();
++	return;
++#endif
+ 	uint8_t soc, shadow, usb, input, chgr_rt, chgr;
+ 	bool valid = fReal;
+ 	/* Linux get_monotonic_soc_raw: the two copies must match. */
+@@ -305,9 +380,7 @@ SweetBattery::start(IOService *provider)
+ 	fChargeMA = 1500;
+ 	(void)PE_parse_boot_argn("sweetcharge", &fChargeMA, sizeof(fChargeMA));
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-	/* PMI8994 fuel gauge / charger registers through the Pixel 1 SPMI path: not on taimen (PMI8998). */
+-	fReal = false;
+-	fChargeMA = 0;
++	fChargeMA = 0;                                  /* PMI8998: read only (pollPMI8998) */
+ #endif
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
