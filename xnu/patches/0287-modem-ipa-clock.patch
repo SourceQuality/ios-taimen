@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 60c508f..6099fbd 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2513,6 +2513,7 @@ svc_summary(void)
+ }
+ 
+ extern "C" bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
++extern "C" bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
+ 
+ /* ---------------------------------------------------------------- M7: WLFW (QMI 0x45) */
+ 
+@@ -3061,6 +3062,14 @@ w_rails(void)
+ {
+ 	bool l5 = sweet_rpm_ldoa_load(5, 800000, 100), l7 = sweet_rpm_ldoa_load(7, 1800000, 100);
+ 	bool l17 = sweet_rpm_ldoa_load(17, 1304000, 100), l25 = sweet_rpm_ldoa_load(25, 3312000, 100);
++	/*
++	 * 0287: the IPA core clock (RPM "ipa" 0, clk_ipa_clk, the qcom,ipa node's core_clk). Boots 116-118:
++	 * 9.5 s after mission the modem dies on DOG_HB task starvation, with or without our CE/HTC/WMI;
++	 * Android has IPA up (ipa3, WDI2 for the WLAN) long before; a modem task stalled on an unclocked
++	 * IPA would look like this. 150 MHz is ipa3's nominal rate.
++	 */
++	bool ipa = sweet_rpm_clk(0x617069u, 0, 150000);
++	LOG("M7: IPA core clock 150 MHz %s", ipa ? "ok" : "FAILED");
+ 	LOG("M7: WLAN rails (100 mA each) L5 0.8 V %s, L7 1.8 V %s, L17 1.304 V %s, L25 3.312 V %s", l5 ? "ok" : "FAILED",
+ 	    l7 ? "ok" : "FAILED", l17 ? "ok" : "FAILED", l25 ? "ok" : "FAILED");
+ }

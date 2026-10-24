@@ -880,3 +880,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   scan but is not the crash. From 0286 the scan logs each network by channel and RSSI only: no SSIDs or BSSIDs
   of other people's networks in the logs (boot 117's own log in out/ is local and never shared). Boot 118:
   M0-M7 only, to see whether mission mode alone (no CE/HTC/WMI) brings the starvation.
+- 2026-10-24 boot 118 (r106 = +0263-0286, a plain ROOTFIX + taimenwifi=8: to mission mode and no further, 420 s):
+  the modem still went FATAL at +14.3 s, 9.5 s after mission: DOG_HB starvation (task 0x84cc5ad0). So mission
+  mode itself brings it, not our CE/HTC/WMI/scan traffic. Nothing is asked of APPS in those 9.5 s (no QRTR
+  lookups, no data to ports we do not serve, no new GLINK opens; mcfg tftp at +9.1 s as in the boots that
+  lived). The modem's SMP2P item has smp2p=0, slave-kernel=7, wlan=0 (no "ipa" query). Android has IPA up
+  (ipa3 + WDI2 for the WLAN: qcom,ipa-wdi2, an ipa_smmu_wlan stream) long before FW_READY; here IPA is never
+  clocked, and a modem task stalled on an unclocked IPA would show as starvation. 0287: the RPM IPA clock
+  ("ipa" 0) at 150 MHz before the modem boots.
