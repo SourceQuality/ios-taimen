@@ -747,3 +747,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   sig 5, both already in r70's 1 GiB hand-off (not new). Boot 98's swipes: backboardd in GL 3.3 s of 10 s,
   Flush (GPU wait) 1.0-1.6 s of that: CA's CPU side still the larger part at 45 frames/s. xnu 0256:
   silver through its OSM (taimenosmsilver=ROW).
+- 2026-10-24 **boot 100 (r77 = +0256, the defaults + taimenosmsilver=21, gestures, 300 s): silver at 1900.8
+  MHz.** Gold through the refactored A1 exactly as boot 98 (row 33 -> 2342 MHz, 1052 mV). Silver: fuse row 67
+  0x...a288edbbbb as expected for combo 19, entered on its PLL (GFMUX 0x301, L 0x51), S10 828 -> 644 mV at
+  row 0, then rows 17 (1555.2, 796 mV), 18 (1670.4, 840 mV, APM to APC: status 0xff000303), 19 (1747.2,
+  868 mV, MEM-ACC level 3), 20, 21 (1900.8, 928 mV), each checked on CPUs 0-3 (1897-1900 MHz, self-test
+  ok). Ran to its deadline; hottest 72.8 C during the ramps, then 44-55 C. taimenosmsilver=21 is in the
+  ROOT=1 defaults (boot-args with the test args now ~602 of 607 bytes).

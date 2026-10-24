@@ -23,10 +23,11 @@ args=${*:-}
 # placement gold first above utility priority, silver for utility and background (xnu 0248, boots
 # 82-83: Control Center frames under 20 ms 41 -> 69 %); taimenosm=33: gold through CPRh and the
 # OSM as Linux runs it (xnu 0252, boot 98: 2342 MHz at 1052 mV, ~45 frames/s in the swipes against
-# ~17 at 1728), G1's taimengold=1728 if it refuses. Later extra args override all of these
+# ~17 at 1728), G1's taimengold=1728 if it refuses; taimenosmsilver=21: silver the same way to
+# 1900.8 MHz at 928 mV (xnu 0256, boot 100). Later extra args override all of these
 # (the last occurrence wins).
 if [ "${ROOT:-0}" = 1 ]; then
-	args="cpus=8 taimenosm=33 taimengold=1728 taimenamp=1 sweetkeys=1 taimenhwscale=3 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
+	args="cpus=8 taimenosm=33 taimenosmsilver=21 taimengold=1728 taimenamp=1 sweetkeys=1 taimenhwscale=3 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
 fi
 # GPU (ROOT=1 boots once tools/taimen/sweetgl-install.sh has run; GPU=0: CoreAnimation's CPU
 # renderer): CA draws with Mesa on the A540, sweetgl injected into backboardd (boots 60-75: ~60
