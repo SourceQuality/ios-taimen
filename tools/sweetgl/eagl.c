@@ -1300,6 +1300,13 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
  * (IOMFB swap, copied by the kernel at once) without waiting for the GPU;
  * per-surface fences in the swap path would let the GPU run ahead.
  */
+/*
+ * SWEETGL_FINISH=0: a plain flush instead. The kernel copies the swapped surface
+ * to the scan buffer with the GPU (taimengpucopy), on the same ring after the
+ * frame, so CA's thread need not wait for the GPU (2-4 ms a frame in boots
+ * 79-82); the CPU copy (no taimengpucopy) could show a frame half drawn.
+ */
+static int flush_waits = 1;
 uint64_t sgl_gap_ticks;
 static int gap_left = 400;
 static __thread uint64_t gap_last, gap_frame_start;
@@ -1435,7 +1442,11 @@ sgl_Flush(void *rctx)
 {
 	SGL_CUR(rctx);
 	uint64_t t0 = mach_absolute_time();
-	glFinish();
+	if (flush_waits) {
+		glFinish();
+	} else {
+		glFlush();
+	}
 	uint64_t t1 = mach_absolute_time();
 	flush_stats(t0, t1);
 	gap_last = t1;
@@ -2442,6 +2453,8 @@ sweetgl_eagl_install(void)
 	const char *t = getenv("SWEETGL_TRACE");
 	trace_left = t && t[0] == '1' ? 20000 : 0;
 	dump_shaders = trace_left > 0;
+	const char *f = getenv("SWEETGL_FINISH");
+	flush_waits = !(f && f[0] == '0');
 	const char *g = getenv("SWEETGL_GAPS");
 	uint64_t gap_ms = g ? strtoull(g, NULL, 10) : 50;
 	mach_timebase_info_data_t tb;
@@ -2449,7 +2462,8 @@ sweetgl_eagl_install(void)
 	sgl_gap_ticks = gap_ms * 1000000ull * tb.denom / tb.numer;
 	Dl_info di;
 	if (dladdr((void *)sgl_gap, &di)) {
-		sweet_drm_log("sweetgl: loaded at %p, gaps over %llu ms logged", di.dli_fbase, gap_ms);
+		sweet_drm_log("sweetgl: loaded at %p, gaps over %llu ms logged%s", di.dli_fbase, gap_ms,
+		    flush_waits ? "" : ", flush without finish");
 	}
 	sgl_install_texfns();
 	if (trace_left > 0) {
