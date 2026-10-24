@@ -1,0 +1,241 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 9ed09e2..aef9399 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -16,6 +16,13 @@
+  *   of it goes HLOS -> {HLOS, MSS_MSA} -> HLOS through hyp_assign and is read and written after
+  *   each step (plan stage 3; argument layout from ios-topaz 0121 scm_assign_to_modem). Rails and
+  *   clocks wait for the boot itself.
++ * M3 (0266): the MBA runs (plan stages 1 and 5; downstream pil-msa.c pil_mss_reset_load_mba and
++ *   pil_mss_reset, pil-q6v5.c __pil_q6v55_reset for qcom,qdsp6v62-1-2). Proxy votes (CX and MX at
++ *   turbo over the RPM, the boot ROM AHB), mba.mbn from modem_a into its carve-out (0x94900000,
++ *   2 MB), unmapped, then assigned HLOS -> MSS_MSA; MSS restart released; the active clocks; RMB
++ *   image address, no debug policy; the Q6 powered up; then PBL status 1 and MBA status 1 or 2
++ *   (XPU unlocked), 1 s each. All RMB registers are logged either way. From here on the modem owns
++ *   the carve-out: nothing in XNU touches it again before a reset.
+  * SMEM structures and lookups from ios-topaz TopazModem.cpp (0113), plus the v11 global heap.
+  * SMEM is mapped write-combined (Normal NC): no cache upkeep, unaligned reads are fine.
+  */
+@@ -53,6 +60,47 @@ extern "C" void taimen_modem_init(void);
+ #define PERM_RWX                7
+ #define PERM_RW                 6
+ 
++#define MBA_PA                  0x94900000ull   /* qcom,mba-mem, 2 MB */
++#define MBA_SIZE                0x00200000ull
++#define QDSP6SS_PA              0x04080000ull
++#define RMB_PA                  0x04180000ull
++#define MSS_RESTART_PA          0x00179000ull   /* GCC_MSS_RESTART */
++#define GCC_PA                  0x00100000ull
++#define GCC_BRANCH_VOTE         0x52004         /* bit 10: boot ROM AHB */
++#define GCC_BRANCH_VOTE_1       0x5200C         /* bit 2: gpll0_out_msscc */
++#define GCC_MSS_CFG_AHB_CBCR    0x8A000
++#define GCC_MSS_MNOC_BIMC_AXI_CBCR 0x8A004
++#define GCC_MSS_SNOC_AXI_CBCR   0x8A03C
++#define GCC_MSS_Q6_BIMC_AXI_CBCR 0x8A040
++
++/* QDSP6SS (pil-q6v5.c) */
++#define Q6_RESET                0x014
++#define Q6_GFMUX_CTL            0x020
++#define Q6_PWR_CTL              0x030
++#define Q6V6_MEM_PWR_CTL        0x034
++#define Q6_XO_CBCR              0x038
++#define Q6V62_BHS_STATUS        0x0C4
++#define Q6SS_STOP_CORE          (1u << 0)
++#define Q6SS_CORE_ARES          (1u << 1)
++#define Q6SS_BUS_ARES_ENA       (1u << 2)
++#define Q6SS_CLK_ENA            (1u << 1)
++#define Q6SS_L2DATA_STBY_N      (1u << 18)
++#define Q6SS_SLP_RET_N          (1u << 19)
++#define Q6SS_CLAMP_IO           (1u << 20)
++#define Q6V55_CLAMP_WL          (1u << 21)
++#define Q6V55_CLAMP_QMC_MEM     (1u << 22)
++#define Q6V55_BHS_ON            (1u << 24)
++#define Q6V55_LDO_BYP           (1u << 25)
++
++/* RMB (pil-msa.c) */
++#define RMB_MBA_IMAGE           0x00
++#define RMB_PBL_STATUS          0x04
++#define RMB_MBA_COMMAND         0x08
++#define RMB_MBA_STATUS          0x0C
++#define RMB_PMI_META_DATA       0x10
++#define RMB_PMI_CODE_START      0x14
++#define RMB_PMI_CODE_LENGTH     0x18
++
+ #define SCM_FN(svc, cmd)        (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+ #define SCM_SIP_FNID(svc, cmd)  (0x02000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+ 
+@@ -603,6 +651,163 @@ m2(void)
+ 	return have_mba && have_mdt && loads > 0 && efs_ok == 4;
+ }
+ 
++/* M3: the MBA runs. */
++extern "C" bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
++static volatile uint32_t *q6, *rmb;
++
++static inline uint32_t rd32(volatile uint32_t *b, uint32_t off) { return b[off / 4]; }
++static inline void wr32(volatile uint32_t *b, uint32_t off, uint32_t v) { b[off / 4] = v; mb(); }
++
++static bool
++poll32(volatile uint32_t *b, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i <= us; i++) {
++		if ((b[off / 4] & mask) == want) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static void
++rmb_log(const char *why)
++{
++	LOG("M3: %s: RMB image %#x pbl %#x cmd %#x status %#x meta %#x code %#x/%#x proto %#x dbg %#x", why,
++	    rmb[0], rmb[1], rmb[2], rmb[3], rmb[4], rmb[5], rmb[6], rmb[7], rmb[8]);
++}
++
++/* A branch clock on (CBCR bit 0), until its CLK_OFF (bit 31) clears. */
++static bool
++cbcr_on(volatile uint32_t *gcc, uint32_t off)
++{
++	wr32(gcc, off, rd32(gcc, off) | 1u);
++	return poll32(gcc, off, 1u << 31, 0, 200);
++}
++
++static bool
++m3(void)
++{
++	volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(GCC_PA, 0x90000);
++	volatile uint32_t *restart = (volatile uint32_t *)ml_io_map(MSS_RESTART_PA, 0x1000);
++	q6 = (volatile uint32_t *)ml_io_map(QDSP6SS_PA, 0x1000);
++	rmb = (volatile uint32_t *)ml_io_map(RMB_PA, 0x1000);
++	if (gcc == NULL || restart == NULL || q6 == NULL || rmb == NULL) {
++		LOG("M3: map failed");
++		return false;
++	}
++	/* the image first: nothing has changed yet if it is missing */
++	struct fat_file img = {}, mba = {};
++	if (!fat_lookup(&modem_fs, NULL, "image", &img) || !fat_lookup(&modem_fs, &img, "mba.mbn", &mba) ||
++	    mba.size == 0 || mba.size > 0x100000) {
++		LOG("M3: no usable mba.mbn (%u bytes)", mba.size);
++		return false;
++	}
++	/* proxy votes (pil_q6v5_make_proxy_votes): CX, MX at turbo; XO and QDSS are already voted */
++	bool cx = sweet_rpm_rail_level(0x78637772u, 0x180);    /* "rwcx" */
++	bool mx = sweet_rpm_rail_level(0x786d7772u, 0x180);    /* "rwmx" */
++	wr32(gcc, GCC_BRANCH_VOTE, rd32(gcc, GCC_BRANCH_VOTE) | (1u << 10));       /* boot ROM AHB */
++	LOG("M3: votes cx %s mx %s, boot ROM AHB vote %#x", cx ? "ok" : "FAILED", mx ? "ok" : "FAILED",
++	    rd32(gcc, GCC_BRANCH_VOTE));
++	if (!cx || !mx) {
++		return false;
++	}
++	/* mba.mbn into the carve-out, unmapped, then the carve-out to MSS_MSA */
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(MBA_PA, MBA_SIZE, kIODirectionInOut);
++	IOMemoryMap *mm = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	if (mm == NULL) {
++		LOG("M3: MBA carve-out map failed");
++		return false;
++	}
++	uint8_t *mv = (uint8_t *)mm->getVirtualAddress();
++	bzero(mv, MBA_SIZE);
++	int rerr = fat_read(&modem_fs, &mba, 0, mv, mba.size);
++	mb();
++	uint32_t head = mv[0] | mv[1] << 8 | mv[2] << 16 | (uint32_t)mv[3] << 24;
++	mm->unmap();
++	OSSafeReleaseNULL(mm);
++	if (rerr != 0) {
++		LOG("M3: mba.mbn read error %d", rerr);
++		return false;
++	}
++	static const uint32_t hlos[] = {VMID_HLOS}, msa[] = {VMID_MSS_MSA}, rw[] = {PERM_RW};
++	uint64_t ar = scm_assign(MBA_PA, MBA_SIZE, hlos, 1, msa, rw, 1);
++	LOG("M3: mba.mbn %u bytes (starts %#x) at %#llx, carve-out to MSS_MSA -> %#llx", mba.size, head, MBA_PA, ar);
++	if (ar != 0) {
++		return false;
++	}
++	/* pil_mss_reset: restart released, active clocks */
++	wr32(restart, 0, 0);
++	IODelay(2);
++	wr32(gcc, GCC_BRANCH_VOTE_1, rd32(gcc, GCC_BRANCH_VOTE_1) | (1u << 2));   /* gpll0_out_msscc */
++	IODelay(1);
++	bool clk = cbcr_on(gcc, GCC_MSS_CFG_AHB_CBCR) && cbcr_on(gcc, GCC_MSS_Q6_BIMC_AXI_CBCR) &&
++	    cbcr_on(gcc, GCC_MSS_SNOC_AXI_CBCR) && cbcr_on(gcc, GCC_MSS_MNOC_BIMC_AXI_CBCR);
++	LOG("M3: MSS restart released, clocks %s: ahb %#x q6 axi %#x snoc %#x mnoc %#x", clk ? "on" : "FAILED",
++	    rd32(gcc, GCC_MSS_CFG_AHB_CBCR), rd32(gcc, GCC_MSS_Q6_BIMC_AXI_CBCR), rd32(gcc, GCC_MSS_SNOC_AXI_CBCR),
++	    rd32(gcc, GCC_MSS_MNOC_BIMC_AXI_CBCR));
++	if (!clk) {
++		return false;
++	}
++	/* RMB: the MBA image, no debug policy */
++	wr32(rmb, RMB_MBA_IMAGE, (uint32_t)MBA_PA);
++	wr32(rmb, RMB_PMI_CODE_START, 0);
++	wr32(rmb, RMB_PMI_CODE_LENGTH, 0);
++	/* __pil_q6v55_reset, qdsp6v62-1-2 */
++	wr32(q6, Q6_RESET, rd32(q6, Q6_RESET) | Q6SS_CORE_ARES | Q6SS_BUS_ARES_ENA | Q6SS_STOP_CORE);
++	if (!(wr32(q6, Q6_XO_CBCR, rd32(q6, Q6_XO_CBCR) | 1u), poll32(q6, Q6_XO_CBCR, 1u << 31, 0, 200))) {
++		LOG("M3: Q6 XO branch did not turn on (%#x)", rd32(q6, Q6_XO_CBCR));
++		rmb_log("XO");
++		return false;
++	}
++	uint32_t val = rd32(q6, Q6_PWR_CTL) | Q6V55_BHS_ON;
++	wr32(q6, Q6_PWR_CTL, val);
++	IODelay(1);
++	if (!poll32(q6, Q6V62_BHS_STATUS, 1u, 1u, 200)) {
++		LOG("M3: BHS_EN_REST_ACK not set (%#x)", rd32(q6, Q6V62_BHS_STATUS));
++		rmb_log("BHS");
++		return false;
++	}
++	val |= Q6V55_LDO_BYP;
++	wr32(q6, Q6_PWR_CTL, val);
++	val = rd32(q6, Q6_PWR_CTL) & ~Q6V55_CLAMP_QMC_MEM;
++	wr32(q6, Q6_PWR_CTL, val);
++	val |= Q6SS_L2DATA_STBY_N | Q6SS_SLP_RET_N;
++	wr32(q6, Q6_PWR_CTL, val);
++	uint32_t mem = rd32(q6, Q6V6_MEM_PWR_CTL);
++	for (int i = 28; i >= 0; i--) {
++		mem |= 1u << i;
++		wr32(q6, Q6V6_MEM_PWR_CTL, mem);
++		mem = rd32(q6, Q6V6_MEM_PWR_CTL);
++		IODelay(1);
++	}
++	val = rd32(q6, Q6_PWR_CTL) & ~Q6V55_CLAMP_WL;
++	wr32(q6, Q6_PWR_CTL, val);
++	val &= ~Q6SS_CLAMP_IO;
++	wr32(q6, Q6_PWR_CTL, val);
++	wr32(q6, Q6_RESET, rd32(q6, Q6_RESET) & ~(Q6SS_CORE_ARES | Q6SS_STOP_CORE));
++	wr32(q6, Q6_GFMUX_CTL, rd32(q6, Q6_GFMUX_CTL) | Q6SS_CLK_ENA);
++	LOG("M3: Q6 out of reset: pwr %#x mem %#x reset %#x gfmux %#x", rd32(q6, Q6_PWR_CTL),
++	    rd32(q6, Q6V6_MEM_PWR_CTL), rd32(q6, Q6_RESET), rd32(q6, Q6_GFMUX_CTL));
++	/* pil_msa_wait_for_mba_ready */
++	uint32_t ps = 0, ms = 0;
++	for (unsigned i = 0; i < 1000000 && (ps = rd32(rmb, RMB_PBL_STATUS)) == 0; i++) {
++		IODelay(1);
++	}
++	bool pbl = ps != 0, mba_ok = false;
++	if (ps == 1) {
++		for (unsigned i = 0; i < 1000000 && (ms = rd32(rmb, RMB_MBA_STATUS)) == 0; i++) {
++			IODelay(1);
++		}
++		mba_ok = ms == 1 || ms == 2;
++	}
++	LOG("M3: PBL status %#x%s, MBA status %#x%s", ps, pbl ? "" : " (timeout)", ms,
++	    mba_ok ? " (XPU unlocked: the MBA runs)" : "");
++	rmb_log(mba_ok ? "MBA up" : "MBA FAILED");
++	return mba_ok;
++}
++
+ static void
+ modem_thread(void *arg, wait_result_t wr __unused)
+ {
+@@ -620,6 +825,10 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 		LOG("M2 failed: stop");
+ 		return;
+ 	}
++	if (level >= 4 && !m3()) {
++		LOG("M3 failed: stop (the modem may hold the MBA carve-out until a reset)");
++		return;
++	}
+ }
+ 
+ void
