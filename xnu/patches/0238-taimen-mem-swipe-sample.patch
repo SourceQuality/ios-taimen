@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
-index 4a8e3ed..4ac763a 100644
+index 4a8e3ed..5de89bf 100644
 --- a/bsd/dev/sweet_perf.c
 +++ b/bsd/dev/sweet_perf.c
-@@ -872,6 +872,63 @@ taimen_gpu_census(void)
+@@ -872,6 +872,60 @@ taimen_gpu_census(void)
  	printf("TAIMEN GPU: census done\n");
  }
  
@@ -16,8 +16,7 @@ index 4a8e3ed..4ac763a 100644
 +static void
 +taimen_mem_line(void)
 +{
-+	printf("TAIMEN MEM: free %u active %u inactive %u wired %u compressed %u pages (%u KB each)
-+",
++	printf("TAIMEN MEM: free %u active %u inactive %u wired %u compressed %u pages (%u KB each)\n",
 +	    vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_wire_count,
 +	    c_segment_pages_compressed, (unsigned)(PAGE_SIZE / 1024));
 +}
@@ -51,12 +50,10 @@ index 4a8e3ed..4ac763a 100644
 +	perf_wait((unsigned)t);
 +	for (int i = 0; i < n; i++) {
 +		if (i == 0) {
-+			printf("TAIMEN SWIPE %d: up from the bottom edge
-+", i);
++			printf("TAIMEN SWIPE %d: up from the bottom edge\n", i);
 +			taimen_swipe(720, 2870, 720, 1300);
 +		} else {
-+			printf("TAIMEN SWIPE %d: %s
-+", i, i & 1 ? "right to left" : "left to right");
++			printf("TAIMEN SWIPE %d: %s\n", i, i & 1 ? "right to left" : "left to right");
 +			taimen_swipe(i & 1 ? 1200 : 240, 1500, i & 1 ? 240 : 1200, 1500);
 +		}
 +		perf_wait((unsigned)(p > 1 ? p : 1));
@@ -66,7 +63,7 @@ index 4a8e3ed..4ac763a 100644
  /* Every perf tick while gold runs off GPLL0: any TSENS sensor above 90.0 C parks it. */
  static void
  taimen_gold_watch(void)
-@@ -943,6 +1000,12 @@ taimen_clocks(void)
+@@ -943,6 +997,12 @@ taimen_clocks(void)
  	if (gold > 0) {
  		taimen_gold((unsigned)gold);
  	}
@@ -79,7 +76,7 @@ index 4a8e3ed..4ac763a 100644
  	int gpucensus = 0;
  	if (PE_parse_boot_argn("taimengpucensus", &gpucensus, sizeof(gpucensus)) && gpucensus > 0) {
  		taimen_gpu_census();
-@@ -1018,6 +1081,7 @@ perf_thread(void *arg, wait_result_t result)
+@@ -1018,6 +1078,7 @@ perf_thread(void *arg, wait_result_t result)
  		perf_top(perf_ns(now - t));
  #if defined(ARM64_BOARD_CONFIG_TAIMEN)
  		taimen_gold_watch();
