@@ -725,3 +725,4 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   4 PTEs from a 4-aligned one. Any boot above 1 GB had a 1 in 4 chance of an aligned draw (94 got one).
   xnu 0254 rounds the index down. xnu 0252-0253: gold through CPRh and the OSM (taimenosm=ROW,
   docs/taimen-osm-cprh.md), not booted yet.
+- 2026-10-24 ~09:43, the user on boot 96 (r75: 0249 + two scan buffers, RAM from 0xb1000000): **"I don't see any flickering"**. The flicker of the first hand-off boot is gone.
