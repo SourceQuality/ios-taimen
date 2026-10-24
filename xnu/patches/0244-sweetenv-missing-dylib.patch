@@ -1,0 +1,33 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index ece474b..848e6ac 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -527,9 +527,28 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ 		while (p[len] && p[len] != ',' && p[len] != ';') {
+ 			len++;
+ 		}
++		vnode_t lib = NULLVP;
++		bool skip = false;
+ 		if (len > 0 && len < sizeof(var)) {
+ 			memcpy(var, p, len);
+ 			var[len] = '\0';
++		}
++		/*
++		 * A library that is not there makes dyld refuse to start the process (backboardd:
++		 * no display at all): leave it out instead. The sweetgl dylib comes with a ROOTFIX
++		 * that is left out once the payload would pass what ABL loads (boot 78).
++		 */
++		static const char dyld_insert[] = "DYLD_INSERT_LIBRARIES=";
++		if (len > sizeof(dyld_insert) - 1 && len < sizeof(var) &&
++		    strncmp(var, dyld_insert, sizeof(dyld_insert) - 1) == 0) {
++			if (vnode_lookup(var + sizeof(dyld_insert) - 1, 0, &lib, vfs_context_kernel()) != 0) {
++				printf("SWEET ENV: %s: %s missing, not inserted\n", base, var + sizeof(dyld_insert) - 1);
++				skip = true;
++			} else {
++				vnode_put(lib);
++			}
++		}
++		if (!skip && len > 0 && len < sizeof(var)) {
+ 			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
+ 			if (error) {
+ 				return error;
