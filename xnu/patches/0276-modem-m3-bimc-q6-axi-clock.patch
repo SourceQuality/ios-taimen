@@ -1,0 +1,68 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index a625a3d..d9fed08 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -16,7 +16,7 @@
+  *   of it goes HLOS -> {HLOS, MSS_MSA} -> HLOS through hyp_assign and is read and written after
+  *   each step (plan stage 3; argument layout from ios-topaz 0121 scm_assign_to_modem). Rails and
+  *   clocks wait for the boot itself.
+- * M3 (0266): the MBA runs (plan stages 1 and 5; downstream pil-msa.c pil_mss_reset_load_mba and
++ * M3 (0266, 0276: the Q6 BIMC AXI clock is GCC 0x4401C): the MBA runs (plan stages 1 and 5; downstream pil-msa.c pil_mss_reset_load_mba and
+  *   pil_mss_reset, pil-q6v5.c __pil_q6v55_reset for qcom,qdsp6v62-1-2). Proxy votes (CX and MX at
+  *   turbo over the RPM, the boot ROM AHB), mba.mbn from modem_a into its carve-out (0x94900000,
+  *   2 MB), unmapped, then assigned HLOS -> MSS_MSA; MSS restart released; the active clocks; RMB
+@@ -78,6 +78,11 @@ extern "C" void taimen_modem_init(void);
+ #define GCC_MSS_MNOC_BIMC_AXI_CBCR 0x8A004
+ #define GCC_MSS_SNOC_AXI_CBCR   0x8A03C
+ #define GCC_MSS_Q6_BIMC_AXI_CBCR 0x8A040
++#define GCC_BIMC_MSS_Q6_AXI_CBCR 0x4401C        /* the DTS "bus_clk": the Q6's path to DDR (boot 110) */
++#define GCC_BOOT_ROM_AHB_CBCR   0x38004
++#define MSS_HALT_Q6_PA          0x01F63000ull
++#define MSS_HALT_MODEM_PA       0x01F65000ull
++#define MSS_HALT_NC_PA          0x01F64000ull
+ 
+ /* QDSP6SS (pil-q6v5.c) */
+ #define Q6_RESET                0x014
+@@ -819,8 +824,22 @@ m3(void)
+ 	bool cx = sweet_rpm_rail_level(0x78637772u, 0x180);    /* "rwcx" */
+ 	bool mx = sweet_rpm_rail_level(0x786d7772u, 0x180);    /* "rwmx" */
+ 	wr32(gcc, GCC_BRANCH_VOTE, rd32(gcc, GCC_BRANCH_VOTE) | (1u << 10));       /* boot ROM AHB */
+-	LOG("M3: votes cx %s mx %s, boot ROM AHB vote %#x", cx ? "ok" : "FAILED", mx ? "ok" : "FAILED",
+-	    rd32(gcc, GCC_BRANCH_VOTE));
++	bool rom = poll32(gcc, GCC_BOOT_ROM_AHB_CBCR, 1u << 31, 0, 200);
++	LOG("M3: votes cx %s mx %s, boot ROM AHB vote %#x cbcr %#x%s", cx ? "ok" : "FAILED", mx ? "ok" : "FAILED",
++	    rd32(gcc, GCC_BRANCH_VOTE), rd32(gcc, GCC_BOOT_ROM_AHB_CBCR), rom ? "" : " (still off)");
++	/* the AXI halt ports (pil_q6v5_halt_axi_port): a port halted since the last reset stays halted */
++	static const uint64_t halt_pa[3] = { MSS_HALT_Q6_PA, MSS_HALT_MODEM_PA, MSS_HALT_NC_PA };
++	uint32_t halt[3][3] = {};
++	for (unsigned i = 0; i < 3; i++) {
++		volatile uint32_t *h = (volatile uint32_t *)ml_io_map(halt_pa[i], 0x1000);
++		if (h != NULL) {
++			halt[i][0] = h[0];
++			halt[i][1] = h[1];
++			halt[i][2] = h[2];
++		}
++	}
++	LOG("M3: AXI halt req/ack/idle: q6 %u/%u/%u modem %u/%u/%u nc %u/%u/%u", halt[0][0], halt[0][1], halt[0][2],
++	    halt[1][0], halt[1][1], halt[1][2], halt[2][0], halt[2][1], halt[2][2]);
+ 	if (!cx || !mx) {
+ 		return false;
+ 	}
+@@ -854,11 +873,12 @@ m3(void)
+ 	IODelay(2);
+ 	wr32(gcc, GCC_BRANCH_VOTE_1, rd32(gcc, GCC_BRANCH_VOTE_1) | (1u << 2));   /* gpll0_out_msscc */
+ 	IODelay(1);
+-	bool clk = cbcr_on(gcc, GCC_MSS_CFG_AHB_CBCR) && cbcr_on(gcc, GCC_MSS_Q6_BIMC_AXI_CBCR) &&
+-	    cbcr_on(gcc, GCC_MSS_SNOC_AXI_CBCR) && cbcr_on(gcc, GCC_MSS_MNOC_BIMC_AXI_CBCR);
+-	LOG("M3: MSS restart released, clocks %s: ahb %#x q6 axi %#x snoc %#x mnoc %#x", clk ? "on" : "FAILED",
+-	    rd32(gcc, GCC_MSS_CFG_AHB_CBCR), rd32(gcc, GCC_MSS_Q6_BIMC_AXI_CBCR), rd32(gcc, GCC_MSS_SNOC_AXI_CBCR),
+-	    rd32(gcc, GCC_MSS_MNOC_BIMC_AXI_CBCR));
++	bool clk = cbcr_on(gcc, GCC_MSS_CFG_AHB_CBCR) && cbcr_on(gcc, GCC_BIMC_MSS_Q6_AXI_CBCR) &&
++	    cbcr_on(gcc, GCC_MSS_Q6_BIMC_AXI_CBCR) && cbcr_on(gcc, GCC_MSS_SNOC_AXI_CBCR) &&
++	    cbcr_on(gcc, GCC_MSS_MNOC_BIMC_AXI_CBCR);
++	LOG("M3: MSS restart released, clocks %s: ahb %#x bimc q6 axi %#x mss q6 axi %#x snoc %#x mnoc %#x",
++	    clk ? "on" : "FAILED", rd32(gcc, GCC_MSS_CFG_AHB_CBCR), rd32(gcc, GCC_BIMC_MSS_Q6_AXI_CBCR),
++	    rd32(gcc, GCC_MSS_Q6_BIMC_AXI_CBCR), rd32(gcc, GCC_MSS_SNOC_AXI_CBCR), rd32(gcc, GCC_MSS_MNOC_BIMC_AXI_CBCR));
+ 	if (!clk) {
+ 		return false;
+ 	}
