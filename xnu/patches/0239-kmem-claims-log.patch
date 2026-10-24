@@ -1,0 +1,26 @@
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 54edb01..9e6c1ef 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3641,6 +3641,21 @@ kmem_scramble_ranges(void)
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+ 		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
++#if defined(SWEET)
++			/* boot 63 (taimen, ~2 GiB of RAM) ended here: the layout, for the next try */
++			vm_map_size_t free_sz = 0, largest = 0;
++			vm_map_sizes(kernel_map, NULL, &free_sz, &largest);
++			printf("SWEET KMEM: claim %u/%u %s %#llx failed from %#llx; map %#llx-%#llx free %#llx largest %#llx "
++			    "sane_size %#llx\n", i, kmem_claim_count, sp.kc_name, (uint64_t)sp.kc_size, (uint64_t)start,
++			    (uint64_t)kernel_map->min_offset, (uint64_t)kernel_map->max_offset, (uint64_t)free_sz,
++			    (uint64_t)largest, (uint64_t)sane_size);
++			for (uint32_t k = 0; k < kmem_claim_count; k++) {
++				printf("SWEET KMEM:  %2u %-24s %#14llx %s %#llx-%#llx\n", k, kmem_claims[k].kc_name,
++				    (uint64_t)kmem_claims[k].kc_size, k < i ? "at" : "  ",
++				    k < i ? (uint64_t)kmem_claims[k].kc_range->min_address : 0ull,
++				    k < i ? (uint64_t)kmem_claims[k].kc_range->max_address : 0ull);
++			}
++#endif
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+ 			    sp.kc_name);
+ 		}
