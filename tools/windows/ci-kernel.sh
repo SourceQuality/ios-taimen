@@ -8,9 +8,13 @@ P=$(cd "$(dirname "$0")/../.." && pwd)
 n=$1 R=SourceQuality/ios-taimen
 gh=${GH_EXE:-/mnt/c/Program Files/GitHub CLI/gh.exe}
 sha=$(git -C "$P" log -1 --format=%H -- xnu/patches)
+# GitHub builds the head of each push: a later commit pushed together with the patch has the run
 id=
 for i in $(seq 1 30); do
-	id=$("$gh" run list -R $R -w xnu.yml -c "$sha" -L 1 --json databaseId -q '.[0].databaseId' 2>/dev/null | tr -d '\r')
+	for c in $(git -C "$P" rev-list "$sha^..HEAD"); do
+		id=$("$gh" run list -R $R -w xnu.yml -c "$c" -L 1 --json databaseId -q '.[0].databaseId' 2>/dev/null | tr -d '\r')
+		[ -n "$id" ] && { sha=$c; break; }
+	done
 	[ -n "$id" ] && break
 	sleep 10
 done
