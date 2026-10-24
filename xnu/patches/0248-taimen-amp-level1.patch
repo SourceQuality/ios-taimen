@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index c12b192..85c59cf 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -47,6 +47,7 @@
+ #include <kern/kalloc.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <os/atomic_private.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -699,9 +700,12 @@ taimen_gold_mux(uint32_t src_div)
+ 	return tg_poll(tg_mux, 0x50, 1u, 0u, 500);
+ }
+ 
++extern uint64_t taimen_fast_map;      /* osfmk/kern/sched_prim.c: taimenamp placement (0248) */
++
+ static void
+ taimen_gold_park(const char *why)
+ {
++	os_atomic_store(&taimen_fast_map, 0, relaxed);     /* parked gold is slower than silver */
+ 	bool ok = taimen_gold_mux(TG_CFG_GPLL0);
+ 	tg_mhz = 0;
+ 	printf("TAIMEN CLK: gold back on GPLL0 (%s): %s\n", why, ok ? "ok" : "mux update timeout");
+@@ -1049,6 +1053,10 @@ taimen_clocks(void)
+ 	if (gold > 0) {
+ 		taimen_gold((unsigned)gold);
+ 	}
++	if (tg_mhz > 0) {
++		os_atomic_store(&taimen_fast_map, 0xf0ull, relaxed);    /* gold: cpu 4-7 (MPIDR Aff1 1) */
++		printf("TAIMEN SCHED: gold cpus 4-7 at %u MHz, preferred with taimenamp\n", (unsigned)tg_mhz);
++	}
+ 	/*
+ 	 * taimenslow=0 (0247; docs/taimen-amp-plan.md 2.B on the amp-plan branch): silver CPUs 1-3 leave
+ 	 * the scheduler's recommended set, so everything but CPU0 runs on gold. One scheduler pset puts
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..d0f5223 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -249,6 +249,30 @@ rt_runq_is_low_latency(processor_set_t pset)
+ 
+ TUNABLE(bool, cpulimit_affects_quantum, "cpulimit_affects_quantum", true);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * taimenamp=1 (0248; docs/taimen-amp-plan.md 2.C level 1 on the amp-plan branch): one pset
++ * spans silver (cpu 0-3) and gold (4-7), and the idle search takes the lowest idle CPU, a silver
++ * one. Level 1 narrows the idle choice: gold for threads above utility priority (UI, the CA
++ * render server, kernel threads), silver for utility and background, any idle CPU when the
++ * preferred cluster has none. taimen_fast_map: the gold CPUs while gold runs at full clock
++ * (bsd/dev/sweet_perf.c sets it after the ramp and clears it when gold is parked).
++ */
++uint64_t taimen_fast_map;
++static TUNABLE(int, taimen_amp_level, "taimenamp", 0);
++
++static inline uint64_t
++taimen_amp_prefer(uint64_t map, int pri)
++{
++	uint64_t fast = os_atomic_load(&taimen_fast_map, relaxed);
++	if (taimen_amp_level == 0 || fast == 0) {
++		return map;
++	}
++	uint64_t want = pri <= BASEPRI_UTILITY ? (map & ~fast) : (map & fast);
++	return want ? want : map;
++}
++#endif
++
+ #define         DEFAULT_PREEMPTION_RATE         100             /* (1/s) */
+ TUNABLE(int, default_preemption_rate, "preempt", DEFAULT_PREEMPTION_RATE);
+ 
+@@ -5083,6 +5107,15 @@ choose_processor(
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++				/* not of the preferred cluster while one of those is idle: search instead */
++				if (thread->sched_pri < BASEPRI_RTQUEUES && taimen_amp_level > 0 &&
++				    !((taimen_amp_prefer(pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map &
++				    pset->recommended_bitmask, thread->sched_pri) >> processor->cpu_id) & 1)) {
++					processor = PROCESSOR_NULL;
++					break;
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					return processor;
+ 				}
+@@ -5245,6 +5278,9 @@ no_available_cpus:
+ 
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		idle_primary_map = taimen_amp_prefer(idle_primary_map, thread->sched_pri);
++#endif
+ 
+ 		int cpuid = lsb_first(idle_primary_map);
+ 		if (cpuid >= 0) {
