@@ -68,10 +68,10 @@ for i in range(n):
         decl = ', '.join(['void *rctx'] + params)
         call = '%s(%s)' % (special[name], ', '.join(['rctx'] + [split(p)[1] for p in params]))
         if ret == 'void':
-            stmt = '%s; sgl_t1(%d, t);' % (call, i)
+            stmt = '%s; sgl_t1(%d, t0_);' % (call, i)
         else:
-            stmt = '%s r = %s; sgl_t1(%d, t); return r;' % (ret, call, i)
-        body.append('static %s w_%d(%s) { uint64_t t = sgl_t0(); %s }' % (ret, i, decl, stmt))
+            stmt = '%s r = %s; sgl_t1(%d, t0_); return r;' % (ret, call, i)
+        body.append('static %s w_%d(%s) { uint64_t t0_ = sgl_t0(); %s }' % (ret, i, decl, stmt))
         table.append('(void *)w_%d' % i)
         continue
     target = None
@@ -98,10 +98,10 @@ for i in range(n):
     call = '%s(%s)' % (target, args)
     decl = ', '.join(['void *rctx'] + params)
     if ret == 'void':
-        stmt = '%s; SGL_POST(%d); sgl_t1(%d, t);' % (call, i, i)
+        stmt = '%s; SGL_POST(%d); sgl_t1(%d, t0_);' % (call, i, i)
     else:
-        stmt = '%s r = %s; SGL_POST(%d); sgl_t1(%d, t); return r;' % (ret, conv(call, tret, ret), i, i)
-    body.append('static %s w_%d(%s) { uint64_t t = sgl_t0(); SGL_CUR(rctx); %s }' % (ret, i, decl, stmt))
+        stmt = '%s r = %s; SGL_POST(%d); sgl_t1(%d, t0_); return r;' % (ret, conv(call, tret, ret), i, i)
+    body.append('static %s w_%d(%s) { uint64_t t0_ = sgl_t0(); SGL_CUR(rctx); %s }' % (ret, i, decl, stmt))
     table.append('(void *)w_%d' % i)
 
 with open(out, 'w') as f:
