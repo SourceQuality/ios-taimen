@@ -1,0 +1,526 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index d41a6f9..6a8e2f2 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -23,6 +23,7 @@
+  *   image address, no debug policy; the Q6 powered up; then PBL status 1 and MBA status 1 or 2
+  *   (XPU unlocked), 1 s each. All RMB registers are logged either way. From here on the modem owns
+  *   the carve-out: nothing in XNU touches it again before a reset.
++ * M4 (0269): MPSS authenticated and running, the modem's SMP2P err-ready (see m4()).
+  * SMEM structures and lookups from ios-topaz TopazModem.cpp (0113), plus the v11 global heap.
+  * SMEM is mapped write-combined (Normal NC): no cache upkeep, unaligned reads are fine.
+  */
+@@ -31,6 +32,7 @@
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/errno.h>
+@@ -398,8 +400,14 @@ fat_read(struct fat *f, const struct fat_file *ff, uint64_t off, void *dst, uint
+ 		if (clus < 2 || FAT_EOC(f, clus)) {
+ 			return EIO;
+ 		}
+-		uint32_t n = MIN(f->cluster_bytes - in, len - done);
+-		int err = part_read(&f->p, f->data_off + (uint64_t)(clus - 2) * f->cluster_bytes + in,
++		uint32_t first = clus;
++		uint64_t run = f->cluster_bytes - in;
++		while (done + run < len && run < 0x40000 && fat_next(f, clus) == clus + 1) {
++			clus++;
++			run += f->cluster_bytes;
++		}
++		uint32_t n = (uint32_t)MIN(run, (uint64_t)(len - done));
++		int err = part_read(&f->p, f->data_off + (uint64_t)(first - 2) * f->cluster_bytes + in,
+ 		    (uint8_t *)dst + done, n);
+ 		if (err != 0) {
+ 			return err;
+@@ -675,7 +683,7 @@ poll32(volatile uint32_t *b, uint32_t off, uint32_t mask, uint32_t want, unsigne
+ static void
+ rmb_log(const char *why)
+ {
+-	LOG("M3: %s: RMB image %#x pbl %#x cmd %#x status %#x meta %#x code %#x/%#x proto %#x dbg %#x", why,
++	LOG("RMB (%s): image %#x pbl %#x cmd %#x status %#x meta %#x code %#x/%#x proto %#x dbg %#x", why,
+ 	    rmb[0], rmb[1], rmb[2], rmb[3], rmb[4], rmb[5], rmb[6], rmb[7], rmb[8]);
+ }
+ 
+@@ -810,6 +818,468 @@ m3(void)
+ 	return mba_ok;
+ }
+ 
++/* ---------------------------------------------------------------- M4: MPSS through the MBA */
++
++/*
++ * SMEM again, writable: the hwlock (TCSR mutex 3: write the APPS id 1, it is ours if it reads
++ * back), private allocation (qcom_smem_alloc_private, ios-topaz 0113) and SMP2P out (item 428,
++ * "master-kernel" and "ipa"; plan section 8). The modem's err-ready is bit 1 of "slave-kernel"
++ * in its item 435.
++ */
++static IOMemoryMap *smem_map;
++static volatile uint32_t *smem_mutex, *apcs;
++
++static bool
++smem_lock(void)
++{
++	for (unsigned i = 0; i < 100000; i++) {
++		*smem_mutex = 1;
++		mb();
++		if (*smem_mutex == 1) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static void
++smem_unlock(void)
++{
++	mb();
++	*smem_mutex = 0;
++	mb();
++}
++
++static void *
++smem_alloc(struct smem_part_hdr *p, uint16_t item, uint32_t size)
++{
++	uint32_t aligned = (size + 7) & ~7u, need = sizeof(struct smem_priv_entry) + aligned;
++	void *v = smem_part_get(p, item, NULL);
++	if (v != NULL || p == NULL || !smem_lock()) {
++		return v;
++	}
++	v = smem_part_get(p, item, NULL);
++	if (v == NULL && p->free_uncached + need <= p->free_cached) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)((uint8_t *)p + p->free_uncached);
++		h->canary = 0xA5A5;
++		h->item = item;
++		h->size = aligned;
++		h->pad_data = (uint16_t)(aligned - size);
++		h->pad_hdr = 0;
++		h->rsvd = 0;
++		v = h + 1;
++		bzero(v, aligned);
++		mb();
++		p->free_uncached += need;
++		mb();
++	} else if (v == NULL) {
++		LOG("M4: SMEM partition full: %#x..%#x, need %#x", p->free_uncached, p->free_cached, need);
++	}
++	smem_unlock();
++	return v;
++}
++
++#define APCS_GLB_PA             0x17911000ull
++#define APCS_IPC                0x008
++#define MPSS_SMP2P_BIT          14
++#define SMP2P_MAGIC             0x504D5324u     /* "$SMP" */
++#define SMP2P_MAX_ENTRY         16
++
++struct smp2p_hdr { uint32_t magic; uint8_t version, features[3]; uint16_t local_pid, remote_pid, total, valid; uint32_t flags; } __attribute__((packed));
++struct smp2p_entry { char name[16]; uint32_t value; } __attribute__((packed));
++
++static void
++smp2p_kick(void)
++{
++	mb();
++	apcs[APCS_IPC / 4] = 1u << MPSS_SMP2P_BIT;
++	mb();
++}
++
++static volatile uint32_t *
++smp2p_find(struct smp2p_hdr *h, const char *name)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(h + 1);
++	char want[16] = {};
++	memcpy(want, name, strlen(name) < 16 ? strlen(name) : 15);
++	for (uint32_t i = 0; i < h->valid && i < SMP2P_MAX_ENTRY; i++) {
++		if (memcmp(e[i].name, want, 16) == 0) {
++			return &e[i].value;
++		}
++	}
++	return NULL;
++}
++
++static volatile uint32_t *
++smp2p_add(struct smp2p_hdr *o, const char *name, uint32_t value)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(o + 1);
++	volatile uint32_t *v = smp2p_find(o, name);
++	if (v != NULL || o->valid >= o->total || o->valid >= SMP2P_MAX_ENTRY) {
++		return v;
++	}
++	bzero(e[o->valid].name, sizeof(e[o->valid].name));
++	memcpy(e[o->valid].name, name, strlen(name) < 16 ? strlen(name) : 15);
++	e[o->valid].value = value;
++	mb();
++	o->valid++;
++	smp2p_kick();
++	return &e[o->valid - 1].value;
++}
++
++static struct smp2p_hdr *
++smp2p_create_out(struct smem_part_hdr *p)
++{
++	struct smp2p_hdr *o = (struct smp2p_hdr *)smem_alloc(p, ITEM_SMP2P_OUT,
++	    sizeof(struct smp2p_hdr) + SMP2P_MAX_ENTRY * sizeof(struct smp2p_entry));
++	if (o == NULL || o->version != 0) {
++		return o;
++	}
++	o->magic = SMP2P_MAGIC;
++	o->local_pid = HOST_APPS;
++	o->remote_pid = HOST_MPSS;
++	o->total = SMP2P_MAX_ENTRY;
++	o->valid = 0;
++	o->features[0] = 1;                         /* SSR_ACK */
++	mb();
++	o->version = 1;                             /* validates the item */
++	smp2p_kick();
++	return o;
++}
++
++/* The crash reason (item 421): the global heap on v11, else the apps<->mpss partition. */
++static void
++mss_crash_reason(struct smem_part_hdr *part)
++{
++	uint32_t sz = 0;
++	const char *why = (const char *)smem_global_get(ITEM_MSS_CRASH, &sz);
++	if (why == NULL) {
++		why = (const char *)smem_part_get(part, ITEM_MSS_CRASH, &sz);
++	}
++	char buf[160] = {};
++	if (why != NULL) {
++		memcpy(buf, why, MIN(sz, (uint32_t)sizeof(buf) - 1));
++		for (unsigned i = 0; i < sizeof(buf) - 1 && buf[i] != 0; i++) {
++			if (buf[i] < 0x20 || buf[i] > 0x7e) {
++				buf[i] = '.';
++			}
++		}
++	}
++	LOG("M4: modem crash reason (item %u, %u bytes): %s", ITEM_MSS_CRASH, sz, why != NULL ? buf : "(none)");
++}
++
++#define MPSS_PA                 0x8CC00000ull   /* modem_mem, 120 MB */
++#define MPSS_SIZE               0x07800000ull
++#define MDT_RELOCATABLE         (1u << 27)
++#define RMB_CMD_META_DATA_READY 1
++#define RMB_CMD_LOAD_READY      2
++#define RMB_META_AUTH_SUCCESS   3
++#define RMB_AUTH_COMPLETE       4
++#define MDT_MAX                 0x100000u
++
++static bool
++loadable(const struct elf32_phdr *p)
++{
++	return p->p_type == PT_LOAD && p->p_memsz != 0 && (p->p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH;
++}
++
++/*
++ * Segment i's file bytes: inside modem.mdt when the image is not split, else modem.bNN
++ * (qcom_mdt_load, mdt_load_split_segment).
++ */
++static int
++mdt_seg_read(const struct fat_file *img, const struct fat_file *mdt, unsigned i, const struct elf32_phdr *ph,
++    void *dst, uint32_t len)
++{
++	if ((uint64_t)ph->p_offset + len <= mdt->size) {
++		return fat_read(&modem_fs, mdt, ph->p_offset, dst, len);
++	}
++	char name[16];
++	struct fat_file b = {};
++	snprintf(name, sizeof(name), "modem.b%02u", i);
++	if (!fat_lookup(&modem_fs, img, name, &b) || b.size < len) {
++		LOG("M4: %s: missing or short (%u of %u bytes)", name, b.size, len);
++		return ENOENT;
++	}
++	return fat_read(&modem_fs, &b, 0, dst, len);
++}
++
++/* RMB status until it is want or negative (an MBA error code), ms milliseconds at most. */
++static int32_t
++rmb_wait(uint32_t want, unsigned ms)
++{
++	int32_t st = 0;
++	for (unsigned i = 0; i <= ms * 20; i++) {
++		st = (int32_t)rd32(rmb, RMB_MBA_STATUS);
++		if (st == (int32_t)want || st < 0) {
++			break;
++		}
++		IODelay(50);
++	}
++	return st;
++}
++
++/*
++ * M4 (0269): the modem itself (plan stage 5 steps 5-7; downstream peripheral-loader.c
++ * pil_load_image with pil-msa.c pil_msa_auth_modem_mdt, pil_msa_mba_verify_blob and
++ * pil_msa_mba_auth; metadata as mainline qcom_mdt_read_metadata). The MPSS carve-out goes HLOS ->
++ * {HLOS, MSS_MSA}; the metadata (ELF header + phdrs + hash segment) is authenticated from a pool
++ * buffer lent to MSS_MSA; every loadable segment is copied (modem.bNN), zero-filled to memsz and
++ * announced to the MBA; the carve-out goes to MSS_MSA alone; then AUTH_COMPLETE, and the modem's
++ * SMP2P "slave-kernel" is watched for READY (bit 1) or FATAL (bit 0: the crash reason). SMP2P out
++ * (item 428) is made first and the IPA power query answered, as ios-topaz 0113 does.
++ */
++static bool
++m4(unsigned watch_s)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SMEM_PA, SMEM_SIZE, kIODirectionInOut);
++	smem_map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	smem_mutex = (volatile uint32_t *)ml_io_map(TCSR_MUTEX_PA + SMEM_HWLOCK * 0x1000, 0x1000);
++	apcs = (volatile uint32_t *)ml_io_map(APCS_GLB_PA, 0x1000);
++	if (smem_map == NULL || smem_mutex == NULL || apcs == NULL) {
++		LOG("M4: map failed");
++		return false;
++	}
++	smem = (uint8_t *)smem_map->getVirtualAddress();
++	struct smem_part_hdr *part = smem_partition(HOST_APPS, HOST_MPSS);
++	if (part == NULL) {
++		LOG("M4: no apps<->mpss SMEM partition");
++		return false;
++	}
++	if (smem_part_get(part, ITEM_SMP2P_IN, NULL) != NULL) {
++		LOG("M4: modem SMP2P item %u already there: the modem is not cold", ITEM_SMP2P_IN);
++		return false;
++	}
++	struct smp2p_hdr *out = smp2p_create_out(part);
++	volatile uint32_t *mk = out != NULL ? smp2p_add(out, "master-kernel", 0) : NULL;
++	volatile uint32_t *ipa_out = out != NULL ? smp2p_add(out, "ipa", 0) : NULL;
++	LOG("M4: SMP2P out item %u %s (v%u, %u entries: master-kernel %s, ipa %s)", ITEM_SMP2P_OUT,
++	    out != NULL ? "made" : "FAILED", out != NULL ? out->version : 0, out != NULL ? out->valid : 0,
++	    mk != NULL ? "ok" : "-", ipa_out != NULL ? "ok" : "-");
++	if (out == NULL) {
++		return false;
++	}
++
++	/* modem.mdt: the header, the phdrs and the layout */
++	struct fat_file img = {}, mdt = {};
++	if (!fat_lookup(&modem_fs, NULL, "image", &img) || !fat_lookup(&modem_fs, &img, "modem.mdt", &mdt) ||
++	    mdt.size < sizeof(struct elf32_ehdr)) {
++		LOG("M4: no modem.mdt");
++		return false;
++	}
++	uint32_t hlen = MIN(mdt.size, MDT_MAX);
++	uint8_t *hdr = (uint8_t *)IOMalloc(hlen);
++	if (hdr == NULL || fat_read(&modem_fs, &mdt, 0, hdr, hlen) != 0) {
++		LOG("M4: modem.mdt read failed");
++		if (hdr != NULL) {
++			IOFree(hdr, hlen);
++		}
++		return false;
++	}
++	bool ok = false;
++	const struct elf32_ehdr *eh = (const struct elf32_ehdr *)hdr;
++	const struct elf32_phdr *ph = (const struct elf32_phdr *)(hdr + eh->e_phoff);
++	uint32_t hash = 0, min_a = ~0u, max_a = 0, nload = 0;
++	uint64_t file_bytes = 0;
++	bool relocate = false;
++	if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 || eh->e_phnum == 0 ||
++	    eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr) > hlen || ph[0].p_type == PT_LOAD ||
++	    ph[0].p_filesz > hlen) {
++		LOG("M4: modem.mdt: bad ELF header (phoff %#x, %u phdrs)", eh->e_phoff, eh->e_phnum);
++		goto out;
++	}
++	for (uint32_t i = 1; i < eh->e_phnum; i++) {
++		if (hash == 0 && (ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++			hash = i;
++		}
++	}
++	for (uint32_t i = 0; i < eh->e_phnum; i++) {
++		if (!loadable(&ph[i])) {
++			continue;
++		}
++		relocate |= (ph[i].p_flags & MDT_RELOCATABLE) != 0;
++		min_a = MIN(min_a, ph[i].p_paddr);
++		max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
++		nload++;
++		file_bytes += ph[i].p_filesz;
++	}
++	LOG("M4: modem.mdt %u bytes: %u phdrs, hash segment %u (%u bytes), %u loadable, %llu KiB from files, "
++	    "%#x..%#x%s", mdt.size, eh->e_phnum, hash, hash != 0 ? ph[hash].p_filesz : 0, nload, file_bytes >> 10,
++	    min_a, max_a, relocate ? " relocatable" : " fixed");
++	if (hash == 0 || nload == 0 ||
++	    (relocate ? (uint64_t)max_a - min_a > MPSS_SIZE : (min_a < MPSS_PA || max_a > MPSS_PA + MPSS_SIZE))) {
++		LOG("M4: unexpected layout (carve-out %#llx+%#llx)", MPSS_PA, MPSS_SIZE);
++		goto out;
++	}
++	{
++		static const uint32_t hlos[] = {VMID_HLOS}, msa[] = {VMID_MSS_MSA}, both[] = {VMID_HLOS, VMID_MSS_MSA};
++		static const uint32_t rw[] = {PERM_RW}, rwx[] = {PERM_RWX}, both_perm[] = {PERM_RWX, PERM_RW};
++
++		/* pil_assign_mem_to_subsys_and_linux: the carve-out to {HLOS, MSS_MSA} for the load */
++		uint64_t ar = scm_assign(MPSS_PA, MPSS_SIZE, hlos, 1, both, both_perm, 2);
++		LOG("M4: MPSS %#llx+%#llx to HLOS+MSS_MSA -> %#llx", MPSS_PA, MPSS_SIZE, ar);
++		if (ar != 0) {
++			goto out;
++		}
++
++		/* metadata: ELF header and phdrs (phdr 0's bytes), then the hash segment */
++		uint32_t ehs = ph[0].p_filesz, hs = ph[hash].p_filesz;
++		uint64_t meta_pa = 0;
++		uint8_t *meta = (uint8_t *)pool_alloc((uint64_t)ehs + hs, &meta_pa);
++		int merr = meta == NULL ? ENOMEM : 0;
++		if (merr == 0) {
++			memcpy(meta, hdr, ehs);
++			if ((uint64_t)ehs + hs == mdt.size) {
++				merr = fat_read(&modem_fs, &mdt, ehs, meta + ehs, hs);  /* hash packed after the header */
++			} else {
++				merr = mdt_seg_read(&img, &mdt, hash, &ph[hash], meta + ehs, hs);
++			}
++		}
++		mb();
++		if (merr != 0) {
++			LOG("M4: metadata (%u + %u bytes) failed: %d", ehs, hs, merr);
++			goto out;
++		}
++		uint64_t a1 = scm_assign(meta_pa, ((uint64_t)ehs + hs + 0xfff) & ~0xfffull, hlos, 1, msa, rw, 1);
++		wr32(rmb, RMB_PMI_CODE_LENGTH, 0);
++		wr32(rmb, RMB_PMI_META_DATA, (uint32_t)meta_pa);
++		wr32(rmb, RMB_MBA_COMMAND, RMB_CMD_META_DATA_READY);
++		int32_t st = a1 == 0 ? rmb_wait(RMB_META_AUTH_SUCCESS, 10000) : 0;
++		uint64_t a2 = a1 == 0 ? scm_assign(meta_pa, ((uint64_t)ehs + hs + 0xfff) & ~0xfffull, msa, 1, hlos, rwx, 1) : 0;
++		LOG("M4: metadata %u + %u bytes at %#llx (to MSS_MSA -> %#llx, back -> %#llx): MBA status %d%s", ehs, hs,
++		    meta_pa, a1, a2, st, st == RMB_META_AUTH_SUCCESS ? " (META_DATA_AUTH_SUCCESS)" : "");
++		if (st != RMB_META_AUTH_SUCCESS) {
++			rmb_log("metadata FAILED");
++			goto out;
++		}
++
++		/* the segments, each announced as it lands (pil_msa_mba_verify_blob) */
++		md = IOMemoryDescriptor::withPhysicalAddress(MPSS_PA, MPSS_SIZE, kIODirectionInOut);
++		IOMemoryMap *mm = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++		OSSafeReleaseNULL(md);
++		if (mm == NULL) {
++			LOG("M4: MPSS map failed");
++			goto out;
++		}
++		uint8_t *mv = (uint8_t *)mm->getVirtualAddress();
++		uint32_t reloc = relocate ? min_a : (uint32_t)MPSS_PA, length = 0;
++		uint64_t t0 = mach_absolute_time();
++		bool segs = true;
++		for (uint32_t i = 0; i < eh->e_phnum && segs; i++) {
++			if (!loadable(&ph[i])) {
++				continue;
++			}
++			uint64_t off = (uint64_t)ph[i].p_paddr - reloc;
++			if (off + ph[i].p_memsz > MPSS_SIZE) {
++				LOG("M4: segment %u (%#x+%#x) outside the carve-out", i, ph[i].p_paddr, ph[i].p_memsz);
++				segs = false;
++				break;
++			}
++			int err = ph[i].p_filesz != 0 ? mdt_seg_read(&img, &mdt, i, &ph[i], mv + off, ph[i].p_filesz) : 0;
++			if (err == 0 && ph[i].p_memsz > ph[i].p_filesz) {
++				bzero(mv + off + ph[i].p_filesz, ph[i].p_memsz - ph[i].p_filesz);
++			}
++			mb();
++			if (err != 0) {
++				LOG("M4: segment %u: read error %d", i, err);
++				segs = false;
++				break;
++			}
++			if (rd32(rmb, RMB_PMI_CODE_LENGTH) == 0) {
++				wr32(rmb, RMB_PMI_CODE_START, relocate ? (uint32_t)MPSS_PA : min_a);
++				wr32(rmb, RMB_MBA_COMMAND, RMB_CMD_LOAD_READY);
++			}
++			length += ph[i].p_memsz;
++			wr32(rmb, RMB_PMI_CODE_LENGTH, length);
++			st = (int32_t)rd32(rmb, RMB_MBA_STATUS);
++			if (st < 0) {
++				LOG("M4: segment %u: MBA status %d", i, st);
++				segs = false;
++			}
++		}
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		mm->unmap();
++		OSSafeReleaseNULL(mm);
++		LOG("M4: %u segments, %u KiB announced in %llu ms%s", nload, length >> 10, ns / 1000000,
++		    segs ? "" : " (STOPPED)");
++		if (!segs) {
++			rmb_log("segments FAILED");
++			goto out;
++		}
++
++		/* pil_reclaim_mem: the carve-out to MSS_MSA alone, then AUTH_COMPLETE */
++		uint64_t a3 = scm_assign(MPSS_PA, MPSS_SIZE, both, 2, msa, rw, 1);
++		st = rmb_wait(RMB_AUTH_COMPLETE, 10000);
++		LOG("M4: MPSS to MSS_MSA -> %#llx; MBA status %d%s", a3, st, st == RMB_AUTH_COMPLETE ?
++		    " (AUTH_COMPLETE: the modem runs)" : "");
++		rmb_log(st == RMB_AUTH_COMPLETE ? "MPSS up" : "MPSS auth FAILED");
++		if (st != RMB_AUTH_COMPLETE) {
++			goto out;
++		}
++	}
++
++	/* SMP2P: the modem's item, its slave-kernel bits, the IPA query */
++	{
++		struct smp2p_hdr *in = NULL;
++		volatile uint32_t *sk = NULL, *ipa_in = NULL;
++		uint32_t sk_last = ~0u, ipa_last = ~0u;
++		for (unsigned ms = 0; ms < watch_s * 1000; ms += 10) {
++			if (in == NULL) {
++				uint32_t sz = 0;
++				in = (struct smp2p_hdr *)smem_part_get(part, ITEM_SMP2P_IN, &sz);
++				if (in != NULL && in->magic != SMP2P_MAGIC) {
++					in = NULL;
++				}
++				if (in != NULL) {
++					LOG("M4: t=%u ms: modem SMP2P item %u up (v%u, features %#x, %u of %u entries)", ms,
++					    ITEM_SMP2P_IN, in->version, in->features[0], in->valid, in->total);
++				}
++			}
++			if (in != NULL && sk == NULL) {
++				sk = smp2p_find(in, "slave-kernel");
++			}
++			if (in != NULL && ipa_in == NULL) {
++				ipa_in = smp2p_find(in, "ipa");
++			}
++			if (sk != NULL && *sk != sk_last) {
++				sk_last = *sk;
++				LOG("M4: t=%u ms: slave-kernel %08x%s%s%s", ms, sk_last, (sk_last & 1) ? " FATAL" : "",
++				    (sk_last & 2) ? " READY" : "", (sk_last & 4) ? " HANDOVER" : "");
++				if ((sk_last & 2) && !ok) {
++					ok = true;
++					LOG("M4: the modem is up (err-ready)");
++				}
++				if (sk_last & 1) {
++					mss_crash_reason(part);
++					ok = false;
++					break;
++				}
++			}
++			if (ipa_in != NULL && ipa_out != NULL && *ipa_in != ipa_last) {
++				uint32_t v = *ipa_in;
++				if ((v & 1) && !(ipa_last != ~0u && (ipa_last & 1))) {
++					*ipa_out = 1;                   /* valid, AP IPA power off */
++					smp2p_kick();
++					LOG("M4: t=%u ms: answered the IPA power query (%08x)", ms, v);
++				}
++				ipa_last = v;
++			}
++			IOSleep(10);
++		}
++		if (in == NULL) {
++			LOG("M4: no modem SMP2P item after %u s", watch_s);
++			mss_crash_reason(part);
++		}
++		LOG("M4: watch done: slave-kernel %08x, %s", sk_last, ok ? "READY" : "NOT ready");
++	}
++out:
++	IOFree(hdr, hlen);
++	return ok;
++}
++
+ static void
+ modem_thread(void *arg, wait_result_t wr __unused)
+ {
+@@ -831,6 +1301,10 @@ modem_thread(void *arg, wait_result_t wr __unused)
+ 		LOG("M3 failed: stop (the modem may hold the MBA carve-out until a reset)");
+ 		return;
+ 	}
++	if (level >= 5 && !m4(120)) {
++		LOG("M4 failed: stop (the carve-outs stay assigned until a reset)");
++		return;
++	}
+ }
+ 
+ void
