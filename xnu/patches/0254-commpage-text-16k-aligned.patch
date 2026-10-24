@@ -1,0 +1,18 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 4588cce..f933843 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10910,7 +10910,12 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 	vm_map_address_t commpage_text_va = 0;
+ 
+ 	do {
+-		int text_leaf_index = random() % num_ptes;
++		/*
++		 * A 16 KB kernel page on 4 KB tables (more than 1 GB of RAM, PAGE_RATIO 4) takes 4 PTEs
++		 * from a 4-aligned index: write_pte_fast panics otherwise ("PTE write is unaligned",
++		 * taimen boot 95; 3 boots in 4 drew an unaligned slot).
++		 */
++		int text_leaf_index = (random() % num_ptes) & ~(PAGE_RATIO - 1);
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.
