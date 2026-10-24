@@ -758,3 +758,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   touched it. Silver 1900 / gold 2342 MHz the whole hour, 44-46 C idle (73.1 C during the boot ramps),
   no compressed page, free 15.6k -> 12.6k pages (16 KB) over the hour. driverkitd sig 9 and PosterBoard
   sig 5 as on every boot since r70.
+- 2026-10-24 boot 102 (r78 = +0257, the defaults with sweetbattery=1, gestures, 300 s): **the battery
+  reads.** PMI8998 SOC 0xff = 100 %, 4255-4312 mV, -24 mA idle and -115 mA under load (the battery
+  supplies the phone while USB is in and charging is inhibited), 35-37 C; USBIN plugged (0x10), charger
+  status 0x46 (6: inhibit, full). The first poll ran before SPMI was up ("read failed at step 1", the
+  fallback), the next one switched to the gauge. Unplugged and discharging still to be seen on the
+  phone itself. xnu 0258: taimencprcl=1, CPRh closed loop.

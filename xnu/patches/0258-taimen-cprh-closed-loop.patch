@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 256d7b8..3874455 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -971,6 +971,19 @@ static struct to_cl to_silver = {
+ 
+ static vm_offset_t to_gcc, to_apcs, to_apm;
+ static bool to_clocks;                  /* rbcpr, hmss_gpll0 and the OSM clock are set */
++/*
++ * taimencprcl=1: CPRh closed loop, as Linux runs it on this phone ("full HW closed-loop"): the
++ * ring oscillators pull each corner's voltage down from its open-loop ceiling toward its floor.
++ * MARGIN_ADJ_CTL bit 4 set and bit 29 cleared in the functional corners; the two crossover
++ * corners stay open loop ([3.2] option A, the "Linux value" column of [3.3]).
++ */
++static int to_closed = -1;
++
++static uint32_t
++to_corner_val(const struct to_cl *c, uint32_t i)
++{
++	return to_closed > 0 && i + 2 < c->ncorner ? c->corner[i] & ~(1u << 29) : c->corner[i];
++}
+ 
+ /* Before a step that can hang the phone: the UFS log ring flushes every 10 s, so flush it now. */
+ extern void sweet_log_kick(void);
+@@ -1051,13 +1064,13 @@ to_cprh_init(const struct to_cl *c)
+ 	}
+ 	clk_wr(b, 0x808, 0x4202);                       /* THRESH(0) */
+ 	clk_wr(b, 0x80c, 0xffff);                       /* RO_MASK(0) */
+-	to_rmw(b, 0x7f8, 1u << 4, 0);                   /* MARGIN_ADJ_CTL: HW closed loop off */
++	to_rmw(b, 0x7f8, 1u << 4, to_closed > 0 ? 1u << 4 : 0);  /* MARGIN_ADJ_CTL: HW closed loop */
+ 	clk_wr(b, 0x80c, 0xf7ff);                       /* RO 11 only */
+ 	for (uint32_t ro = 0; ro < 16; ro++) {
+ 		clk_wr(b, 0x840 + 4 * ro, ro == 11 ? c->base_quot : 0);  /* TARGET_QUOT */
+ 	}
+ 	for (uint32_t i = 0; i < c->ncorner; i++) {
+-		clk_wr(b, 0x3a00 + 4 * i, c->corner[i]);
++		clk_wr(b, 0x3a00 + 4 * i, to_corner_val(c, i));
+ 	}
+ 	to_rmw(b, 0x7f8, 0x1fu << 12, 4u << 12);        /* PMIC step 4 mV (saw-use-unit-mV) */
+ 	to_rmw(b, 0x7a4, 0x1fu << 5, 1u << 5);          /* SAW_ERROR_STEP_LIMIT down 1 */
+@@ -1072,7 +1085,7 @@ to_cprh_init(const struct to_cl *c)
+ 	uint32_t chk = clk_rd(b, 0x3a00 + 4u * c->chk_corner);
+ 	printf("TAIMEN OSM: %s cprh: CPR_CTL %#x MARGIN_ADJ %#x CTL %#x CORNER(%u) %#x\n", c->name, cc, mc, ctl,
+ 	    c->chk_corner, chk);
+-	return cc == 0x21f && (ctl & 0x1e1fffffu) == 0x080a00b5u && chk == c->corner[c->chk_corner];
++	return cc == 0x21f && (ctl & 0x1e1fffffu) == 0x080a00b5u && chk == to_corner_val(c, c->chk_corner);
+ }
+ 
+ /* The OSM registers, Linux's order without ACD [5.1-5.8]; false if TZ refuses a sequencer write. */
+@@ -1192,6 +1205,10 @@ to_common(void)
+ 		return why;
+ 	}
+ 	done = true;
++	int cl = 0;
++	(void)PE_parse_boot_argn("taimencprcl", &cl, sizeof(cl));
++	to_closed = cl != 0;
++	printf("TAIMEN OSM: CPRh %s loop\n", to_closed ? "closed (taimencprcl=1)" : "open");
+ 	to_gcc = ml_io_map(TO_GCC_PA, 0x1000);
+ 	to_apcs = ml_io_map(TO_APCS_PA, 0x1000);
+ 	to_apm = ml_io_map(TO_APM_PA, 0x1000);
