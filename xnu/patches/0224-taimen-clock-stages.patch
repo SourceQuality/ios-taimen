@@ -1,0 +1,253 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index f04ab9a..0820f83 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -479,8 +479,13 @@ perf_top(uint64_t interval_ns)
+  * Nothing is changed but these debug registers (restored afterwards).
+  * bimc_clk (sel 0xad) is DDR/2: 902 MHz in TWRP's Linux, RPM vote 1.8 GHz.
+  */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#define GCC_DBG_PA      0x00162000u     /* msm8998 (docs/taimen-clocks-plan.md 5.4) */
++#define GCC_XO4_PA      0x00143000u
++#else
+ #define GCC_DBG_PA      0x00362000u
+ #define GCC_XO4_PA      0x00343000u
++#endif
+ 
+ static uint32_t
+ dbg_run(vm_offset_t dbg, uint32_t ticks)
+@@ -494,7 +499,7 @@ dbg_run(vm_offset_t dbg, uint32_t ticks)
+ 	return clk_rd(dbg, 0x8) & 0x1ffffffu;
+ }
+ 
+-static uint64_t __attribute__((unused)) /* not called on taimen */
++static uint64_t
+ clk_measure_mhz(uint32_t sel)
+ {
+ 	static vm_offset_t dbg, xo4;
+@@ -522,6 +527,147 @@ clk_measure_mhz(uint32_t sel)
+ extern bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
+ extern bool sweet_rpm_clk_scaling(void);
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * Clock stages C0, C1 and D1 of docs/taimen-clocks-plan.md (0224), each off unless its boot-arg
++ * is given. Boot 41: the gold cluster runs at 299 MHz (ABL leaves it on GPLL0 / 2, plan 1.5) and
++ * cached memcpy reaches only 0.4-1.5 GB/s (DDR left low, plan 5).
++ *   taimenclkdump=1     C0a: reads Linux also does (fuses, OSM, SAW4, APM, GCC, TSENS; CPRh only
++ *                       with its clock on); =2 adds C0b (GFMUX, PLL, MEM-ACC, ACD, OSM clock),
++ *                       last, as those pages are unproven. Every region is named before it is
++ *                       read, so a reset on a protected page names it in pstore.
++ *   taimenclkmeasure=1  C1: GCC debug-mux counts (only the debug registers change, then restored)
++ *   taimenddr=MHZ       D1: msm8998 RPM clock handoff, scaling on, bimc at MHZ (Linux: 1804);
++ *                       measured and memcpy-timed before and after
++ */
++static void
++taimen_regs(const char *name, uint64_t pa, uint32_t size, const uint16_t *off, unsigned n)
++{
++	printf("TAIMEN CLK: reading %s at %#llx\n", name, pa);
++	vm_offset_t va = ml_io_map(pa, size);
++	if (va == 0) {
++		printf("TAIMEN CLK: %s: map failed\n", name);
++		return;
++	}
++	char line[200];
++	int len = 0;
++	for (unsigned i = 0; i < n; i++) {
++		len += snprintf(line + len, sizeof(line) - (size_t)len, " +%#x=%#x", off[i], clk_rd(va, off[i]));
++		if (i % 6 == 5 || i == n - 1) {
++			printf("TAIMEN CLK: %s%s\n", name, line);
++			len = 0;
++		}
++	}
++}
++
++static uint32_t
++taimen_rd1(uint64_t pa)
++{
++	vm_offset_t va = ml_io_map(pa & ~0xfffULL, 0x1000);
++	return va ? clk_rd(va, (uint32_t)(pa & 0xfff)) : 0xdeadbeef;
++}
++
++static void
++taimen_clk_dump(int level)
++{
++	static const uint16_t fuse[] = {0x130, 0x134, 0x138, 0x13c, 0x218, 0x21c, 0x228, 0x22c, 0x320, 0x324};
++	static const uint16_t osm[] = {0x0, 0x1004, 0x1f10, 0x1c00, 0x1c74, 0x1070, 0x101c, 0x1034};
++	static const uint16_t saw[] = {0xfd0, 0xc04, 0xc0c, 0xc10, 0xc14, 0xc18, 0x900, 0x904, 0x908, 0x0, 0xc};
++	static const uint16_t apm[] = {0x4, 0xc, 0x10, 0x18};
++	static const uint16_t gcc[] = {0x8, 0x44, 0x48, 0x5c, 0x60};
++	static const uint16_t gpll0[] = {0x0};
++	static const uint16_t cprh[] = {0x4, 0x8, 0x7f8, 0x3aa0, 0x3aa4};
++	static const uint16_t tsens0[] = {0x1004, 0x10a0, 0x10a4, 0x10a8, 0x10ac, 0x10b0, 0x10bc, 0x10c0, 0x10c4,
++		                          0x10c8, 0x10cc, 0x10d0, 0x10d4, 0x1060, 0x1064, 0x107c, 0x1080};
++	static const uint16_t tsens1[] = {0x1004, 0x10a0, 0x10a4, 0x10a8, 0x10ac, 0x10b0, 0x10b4, 0x10b8, 0x10bc,
++		                          0x1060, 0x1064};
++	static const uint16_t gfmux[] = {0x50, 0x54};
++	static const uint16_t pll[] = {0x0, 0x4, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x2c};
++	static const uint16_t acd[] = {0x800, 0x83c};   /* ACD at +0x800 of the page */
++	static const uint16_t memacc[] = {0x360, 0x364, 0x368, 0x36c, 0x370};
++	static const uint16_t osmclk[] = {0x12c, 0x130, 0x43c};
++#define TREGS(name, pa, size, o) taimen_regs(name, pa, size, o, sizeof(o) / sizeof(o[0]))
++
++	TREGS("fuse", 0x784000, 0x1000, fuse);
++	TREGS("osm0", 0x179c0000, 0x2000, osm);
++	TREGS("osm1", 0x179c2000, 0x2000, osm);
++	TREGS("saw-silver", 0x17912000, 0x1000, saw);
++	TREGS("saw-gold", 0x17812000, 0x1000, saw);
++	TREGS("apm", 0x179d0000, 0x1000, apm);
++	TREGS("gcc-rbcpr-hmss", 0x148000, 0x1000, gcc);
++	TREGS("gcc-gpll0", 0x100000, 0x1000, gpll0);
++	uint32_t rbcpr = taimen_rd1(0x148008);
++	if (rbcpr & (1u << 31)) {
++		printf("TAIMEN CLK: cprh not read: rbcpr clock off (CBCR %#x)\n", rbcpr);
++	} else {
++		TREGS("cprh-silver", 0x179c8000, 0x4000, cprh);
++		TREGS("cprh-gold", 0x179c4000, 0x4000, cprh);
++	}
++	TREGS("tsens0", 0x10aa000, 0x2000, tsens0);
++	TREGS("tsens1", 0x10ad000, 0x2000, tsens1);
++	if (level < 2) {
++		return;
++	}
++	TREGS("gfmux-silver", 0x17911000, 0x1000, gfmux);
++	TREGS("gfmux-gold", 0x17811000, 0x1000, gfmux);
++	TREGS("acd-silver", 0x17914000, 0x1000, acd);
++	TREGS("acd-gold", 0x17814000, 0x1000, acd);
++	TREGS("memacc", 0x179d1000, 0x1000, memacc);
++	TREGS("osm-clk", 0x179d1000, 0x1000, osmclk);
++	TREGS("pll-silver", 0x17916000, 0x1000, pll);
++	TREGS("pll-gold", 0x17816000, 0x1000, pll);
++#undef TREGS
++	printf("TAIMEN CLK: dump done\n");
++}
++
++static void
++taimen_clk_measure(const char *tag)
++{
++	static const struct {
++		uint32_t sel;
++		const char *name;
++	} m[] = {
++		{0xbc, "rbcpr"}, {0x14e, "bimc(0x14e)"}, {0xa9, "bimc(0xa9)"}, {0xbb, "bimc_hmss_axi"},
++		{0x0, "snoc"}, {0xe, "cnoc"},
++	};
++	char line[200];
++	int len = 0;
++	for (unsigned i = 0; i < sizeof(m) / sizeof(m[0]); i++) {
++		len += snprintf(line + len, sizeof(line) - (size_t)len, " %s %llu", m[i].name, clk_measure_mhz(m[i].sel));
++	}
++	printf("TAIMEN CLK: measure %s (MHz):%s\n", tag, line);
++}
++
++static void
++taimen_clocks(void)
++{
++	int dump = 0, measure = 0, ddr = 0;
++	(void)PE_parse_boot_argn("taimenclkdump", &dump, sizeof(dump));
++	(void)PE_parse_boot_argn("taimenclkmeasure", &measure, sizeof(measure));
++	(void)PE_parse_boot_argn("taimenddr", &ddr, sizeof(ddr));
++	if (dump > 0) {
++		taimen_clk_dump(1);
++	}
++	if (measure || ddr > 0) {
++		taimen_clk_measure("before");
++	}
++	if (ddr > 0) {
++		thread_bind(cpu_to_processor(0));
++		thread_block(THREAD_CONTINUE_NULL);
++		perf_bandwidth(0);
++		bool ok = sweet_rpm_clk_scaling() && sweet_rpm_clk(0x326b6c63u, 0, (uint32_t)ddr * 1000u);
++		delay(10000);
++		printf("TAIMEN CLK: ddr vote %d MHz: %s\n", ddr, ok ? "ok" : "FAILED");
++		taimen_clk_measure("after ddr vote");
++		perf_bandwidth(0);
++		thread_bind(NULL);
++	}
++	if (dump > 1) {
++		taimen_clk_dump(2);
++	}
++}
++#endif
++
+ static void
+ perf_thread(void *arg, wait_result_t result)
+ {
+@@ -544,6 +690,8 @@ perf_thread(void *arg, wait_result_t result)
+ 		printf("SWEET PERF: DDR vote %d MHz %s: %llu -> %llu MHz\n", ddr, ok ? "acked" : "FAILED",
+ 		    before, clk_measure_mhz(0xad) * 2);
+ 	}
++#else
++	taimen_clocks();
+ #endif
+ 	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
+ 		thread_bind(cpu_to_processor(c));
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index 6a88bdf..3e773c2 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -500,6 +500,38 @@ sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz)
+ static const struct {
+ 	uint32_t type, id, key, value;
+ } rpm_handoff[] = {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/*
++	 * msm8998 (downstream clock-gcc-8998.c:63-121, msm-clocks-hwio-8998.h; docs/taimen-clocks-plan.md
++	 * 5.1): the aggre NoCs are rate clocks here, and there is no XO buffer id 8. XO-buffer votes
++	 * (clka) are logged but do not hold back scaling.
++	 */
++	{0x316b6c63u, 0, 0x007a484bu, 0x7fffffffu},     /* clk1 cnoc_periph */
++	{0x316b6c63u, 1, 0x007a484bu, 0x7fffffffu},     /* clk1 snoc */
++	{0x316b6c63u, 2, 0x007a484bu, 0x7fffffffu},     /* clk1 cnoc */
++	{0x326b6c63u, 0, 0x007a484bu, 0x7fffffffu},     /* clk2 bimc (DDR) */
++	{0x69786d6du, 0, 0x007a484bu, 0x7fffffffu},     /* mmxi mmssnoc_axi (display) */
++	{0x00617069u, 0, 0x007a484bu, 0x7fffffffu},     /* ipa */
++	{0x00006563u, 0, 0x007a484bu, 0x7fffffffu},     /* ce1 */
++	{0x72676761u, 1, 0x007a484bu, 0x7fffffffu},     /* aggr aggre1_noc (UFS) */
++	{0x72676761u, 2, 0x007a484bu, 0x7fffffffu},     /* aggr aggre2_noc */
++	{0x306b6c63u, 1, 0x62616e45u, 1},               /* clk0 qdss */
++	{0x616b6c63u, 1, 0x6e657773u, 1},               /* clka ln_bb_clk1 */
++	{0x616b6c63u, 2, 0x6e657773u, 1},               /* clka ln_bb_clk2 */
++	{0x616b6c63u, 3, 0x6e657773u, 1},               /* clka ln_bb_clk3 */
++	{0x616b6c63u, 4, 0x6e657773u, 1},               /* clka rf_clk1 */
++	{0x616b6c63u, 5, 0x6e657773u, 1},               /* clka rf_clk2 */
++	{0x616b6c63u, 6, 0x6e657773u, 1},               /* clka rf_clk3 */
++	{0x616b6c63u, 0xb, 0x6e657773u, 1},             /* clka div_clk1 */
++	{0x616b6c63u, 0xc, 0x6e657773u, 1},             /* clka div_clk2 */
++	{0x616b6c63u, 0xd, 0x6e657773u, 1},             /* clka div_clk3 */
++	{0x616b6c63u, 1, 0x62636370u, 1},               /* clka ln_bb_clk1_pin */
++	{0x616b6c63u, 2, 0x62636370u, 1},               /* clka ln_bb_clk2_pin */
++	{0x616b6c63u, 3, 0x62636370u, 1},               /* clka ln_bb_clk3_pin */
++	{0x616b6c63u, 4, 0x62636370u, 1},               /* clka rf_clk1_pin */
++	{0x616b6c63u, 5, 0x62636370u, 1},               /* clka rf_clk2_pin */
++	{0x616b6c63u, 6, 0x62636370u, 1},               /* clka rf_clk3_pin */
++#else
+ 	{0x316b6c63u, 0, 0x007a484bu, 0x7fffffffu},     /* clk1 pnoc */
+ 	{0x316b6c63u, 1, 0x007a484bu, 0x7fffffffu},     /* clk1 snoc */
+ 	{0x316b6c63u, 2, 0x007a484bu, 0x7fffffffu},     /* clk1 cnoc */
+@@ -522,6 +554,7 @@ static const struct {
+ 	{0x616b6c63u, 2, 0x62636370u, 1},               /* clka bb_clk2_pin */
+ 	{0x616b6c63u, 4, 0x62636370u, 1},               /* clka rf_clk1_pin */
+ 	{0x616b6c63u, 5, 0x62636370u, 1},               /* clka rf_clk2_pin */
++#endif
+ };
+ 
+ bool
+@@ -535,7 +568,16 @@ sweet_rpm_clk_scaling(void)
+ 		char what[24];
+ 		snprintf(what, sizeof(what), "handoff %08x %u", rpm_handoff[i].type, rpm_handoff[i].id);
+ 		for (uint32_t set = 0; set < 2; set++) {
+-			failed += !rpm_request(what, 1 - set, rpm_handoff[i].type, rpm_handoff[i].id, h, 1);
++			bool acked = rpm_request(what, 1 - set, rpm_handoff[i].type, rpm_handoff[i].id, h, 1);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++			if (rpm_handoff[i].type == 0x616b6c63u) {
++				if (!acked) {
++					printf("SWEET RPM: %s set %u: not acked (XO buffer, not counted)\n", what, 1 - set);
++				}
++				continue;
++			}
++#endif
++			failed += !acked;
+ 		}
+ 	}
+ 	bool ok = failed == 0 && rpm_request("scaling sleep", 1, 0x306b6c63u, 2, kv, 1) &&

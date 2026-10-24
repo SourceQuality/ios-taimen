@@ -53,6 +53,32 @@ if [ -n "$ap" ] && [ -b "/dev/$ap" ]; then
 	log "align_parti /dev/$ap: shim log copied"
 fi
 
+# The Adreno 540 firmware (docs/taimen-gpu-plan.md section 6) from the vendor partition, read-only;
+# a few hundred KB, prefixed fw- so the drive stays flat. Not for git: tools/taimen/reader-pull.ps1
+# copies it with the logs and the PC moves it to ../research/taimen/firmware.
+vd=
+for s in vendor_a vendor_b; do
+	for u in /sys/class/block/*/uevent; do
+		grep -q "^PARTNAME=$s\$" "$u" && vd=$(sed -n 's/^DEVNAME=//p' "$u")
+	done
+	[ -n "$vd" ] && break
+done
+if [ -n "$vd" ] && [ -b "/dev/$vd" ]; then
+	mkdir -p /vendor
+	if mount -t ext4 -o ro,noload "/dev/$vd" /vendor 2>> /out/reader.txt; then
+		ls -l /vendor/firmware > /out/fw-list.txt 2>&1
+		for f in /vendor/firmware/a5*; do
+			[ -f "$f" ] && cp "$f" "/out/fw-$(basename "$f")"
+		done
+		umount /vendor
+		log "vendor /dev/$vd: $(ls /out | grep -c '^fw-a5') GPU firmware files copied"
+	else
+		log "vendor /dev/$vd: mount failed"
+	fi
+else
+	log "vendor partition not found"
+fi
+
 dmesg > /out/dmesg.txt
 dd if=/dev/zero of=/tmp/log.img bs=1048576 count=48 2>/dev/null
 mkdosfs -n TAIMENLOG /tmp/log.img > /dev/null
