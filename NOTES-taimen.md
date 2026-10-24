@@ -754,3 +754,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   868 mV, MEM-ACC level 3), 20, 21 (1900.8, 928 mV), each checked on CPUs 0-3 (1897-1900 MHz, self-test
   ok). Ran to its deadline; hottest 72.8 C during the ramps, then 44-55 C. taimenosmsilver=21 is in the
   ROOT=1 defaults (boot-args with the test args now ~602 of 607 bytes).
+- 2026-10-24 hand-off boot 4 (boot 101, r77, all defaults incl. silver 1900.8; 60 min): no panic, nobody
+  touched it. Silver 1900 / gold 2342 MHz the whole hour, 44-46 C idle (73.1 C during the boot ramps),
+  no compressed page, free 15.6k -> 12.6k pages (16 KB) over the hour. driverkitd sig 9 and PosterBoard
+  sig 5 as on every boot since r70.
