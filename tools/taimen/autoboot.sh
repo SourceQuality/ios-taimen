@@ -46,6 +46,12 @@ NO_ALERT=1 BOOT_WAIT=25 "$P/tools/taimen/boot-xnu.sh" "$kernel" "$out" "$@" > "$
 grep -E "warning|fastboot boot at|Booting" "$out/boot.log"
 # refused before the phone was booted (boot-args too long, payload build): nothing to wait for
 grep -q "fastboot boot at" "$out/boot.log" || { tail -3 "$out/boot.log"; say "boot-xnu.sh stopped before booting"; exit 6; }
+# back in fastboot within BOOT_WAIT: ABL never started the image (boot 78: the shim log unchanged,
+# no XNU log). The phone is fine, no reader will come: say so instead of an alert 14 min later.
+if grep -q "back in fastboot" "$out/boot.log"; then
+	say "the phone came back to fastboot right after the fastboot boot: the image did not start"
+	exit 7
+fi
 rm -rf "$out/reader"
 # kernel start ~25 s after the fastboot boot, reset + ABL + reader + USB ~60 s, more under load
 # (boot 30: the drive came ~4 min after the deadline)

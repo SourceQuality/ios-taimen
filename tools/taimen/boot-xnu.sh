@@ -75,6 +75,19 @@ if [ -n "${GPUFW:-}" ]; then
 	[ -f "$GPUFW/a540_zap.mdt" ] && blobs+=(--blob "GPU-ZAP-MDT=$GPUFW/a540_zap.mdt" --blob "GPU-ZAP-SEG=$GPUFW/a540_zap.b02")
 fi
 python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline" "${blobs[@]}"
+# ABL does not start a boot image whose ramdisk (the payload) is over ~35 MiB: boot 77's 36698688
+# bytes booted, boot 78's 36715104 went straight back to fastboot (shim never ran). The sweetgl
+# ROOTFIX carries the 19 MB dylib; once it is on the phone (write-if-absent) the base ROOTFIX
+# does as well, and xnu 0244 leaves a missing DYLD_INSERT_LIBRARIES file out (CPU renderer).
+abl_max=$((35 << 20))
+base_fix=$P/../research/taimen/rootfix.bin
+if [ "$(stat -c %s "$out/payload")" -gt $abl_max ] && [ -n "${SWEETGL_ROOTFIX:-}" ] && [ -f "$base_fix" ] &&
+	[ "$(realpath "${ROOTFIX:-/}")" = "$(realpath "$SWEETGL_ROOTFIX")" ]; then
+	echo "payload $(stat -c %s "$out/payload") bytes, over the $abl_max ABL starts: $base_fix instead (the dylib from an earlier boot)"
+	blobs=("${blobs[@]/#ROOTFIX=*/ROOTFIX=$(realpath "$base_fix")}")
+	python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline" "${blobs[@]}"
+fi
+[ "$(stat -c %s "$out/payload")" -le $abl_max ] || { echo "payload over the $abl_max bytes ABL starts" >&2; exit 1; }
 ls -l "$out/payload" | awk '{print "payload: " $5 " bytes"}'
 EXTRA_CFLAGS=-DSTAGE2 OUT_NAME=taimen-xnu "$P/shim/build-taimen.sh" "$P/../backup/boot_a.img" "$out/payload" | tail -2
 img="$P/shim/out/taimen-xnu.img"
