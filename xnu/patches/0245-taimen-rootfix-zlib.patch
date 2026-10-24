@@ -1,0 +1,127 @@
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index f86b81c..b2b854e 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -6,8 +6,9 @@
+  *   blob     "RFX1", u32 count, then records: u32 op, mode, uid, gid, path length, data
+  *            length, the NUL-terminated path, the data (both padded to 4 bytes)
+  *   ops      1 write (create or replace), 2 write only if absent (prefs iOS may own later),
+- *            3 mkdir if absent, 4 remove if present; owner and mode set on what was written
+- *            or created; "@HOSTUUID@" in a path is replaced by IOPlatformUUID
++ *            3 mkdir if absent, 4 remove if present, 5 as 2 from u32 size + zlib data;
++ *            owner and mode set on what was written or created; "@HOSTUUID@" in a path
++ *            is replaced by IOPlatformUUID
+  * Without the blob nothing happens. Boot-arg taimenrootfix=0 skips it.
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+@@ -26,6 +27,8 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <uuid/uuid.h>
++#include <libkern/zlib.h>
++#include <kern/kalloc.h>
+ 
+ extern vm_map_address_t phystokv(uint64_t pa);
+ extern kern_return_t IOBSDGetPlatformUUID(__darwin_uuid_t uuid, mach_timespec_t timeoutp);
+@@ -38,6 +41,7 @@ void taimen_rootfix(void);
+ #define RFX_CREATE      2u
+ #define RFX_MKDIR       3u
+ #define RFX_REMOVE      4u
++#define RFX_CREATE_Z    5u      /* as RFX_CREATE; data: u32 size, then a zlib stream */
+ 
+ /*
+  * "@HOSTUUID@" in a path becomes IOPlatformUUID (gethostuuid; from the ADT's unique-chip-id
+@@ -130,6 +134,75 @@ rootfix_mkdir(const char *path, uint32_t mode, uint32_t uid, uint32_t gid, vfs_c
+ 	return err;
+ }
+ 
++/*
++ * zlib's allocations (a few hundred KB for one inflate), with the size in front for the free.
++ */
++static void *
++rootfix_zalloc(void *opaque, u_int items, u_int size)
++{
++	(void)opaque;
++	size_t n = (size_t)items * size + 16;
++	uint8_t *p = kalloc_data(n, Z_WAITOK | Z_ZERO);
++	if (p == NULL) {
++		return NULL;
++	}
++	*(size_t *)p = n;
++	return p + 16;
++}
++
++static void
++rootfix_zfree(void *opaque, void *ptr)
++{
++	(void)opaque;
++	uint8_t *p = (uint8_t *)ptr - 16;
++	kfree_data(p, *(size_t *)p);
++}
++
++/*
++ * RFX_CREATE_Z: written only if absent, from u32 size + zlib data (mkrootfix.py --zfile). ABL
++ * starts no payload over ~35 MiB (boot 78); the 19 MB sweetgl dylib is ~4.4 MB this way.
++ */
++static int
++rootfix_create_z(const char *path, const uint8_t *data, uint32_t dlen, uint32_t mode, uint32_t uid,
++    uint32_t gid, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, ctx) == 0) {
++		vnode_put(vp);
++		return EEXIST;
++	}
++	if (dlen < 4) {
++		return EINVAL;
++	}
++	uint32_t olen;
++	memcpy(&olen, data, 4);
++	if (olen == 0 || olen > (256u << 20)) {
++		return EINVAL;
++	}
++	uint8_t *out = kalloc_data(olen, Z_WAITOK);
++	if (out == NULL) {
++		return ENOMEM;
++	}
++	z_stream zs = {
++		.next_in = (Bytef *)(uintptr_t)(data + 4), .avail_in = dlen - 4,
++		.next_out = out, .avail_out = olen,
++		.zalloc = rootfix_zalloc, .zfree = rootfix_zfree,
++	};
++	int err = EINVAL;
++	if (inflateInit(&zs) == Z_OK) {
++		int r = inflate(&zs, Z_FINISH);
++		inflateEnd(&zs);
++		err = r == Z_STREAM_END && zs.total_out == olen ? 0 : EINVAL;
++	}
++	if (err == 0) {
++		err = rootfix_write(path, out, olen, mode, uid, gid, true, ctx);
++	} else {
++		printf("TAIMEN ROOTFIX: %s: zlib data does not inflate to %u bytes\n", path, olen);
++	}
++	kfree_data(out, olen);
++	return err;
++}
++
+ /* EEXIST when there is nothing to remove (counted with "already present"). */
+ static int
+ rootfix_remove(const char *path, vfs_context_t ctx)
+@@ -177,6 +250,7 @@ rootfix_apply(void)
+ 		}
+ 		int err = op == RFX_MKDIR ? rootfix_mkdir(path, mode, uid, gid, ctx) :
+ 		    op == RFX_REMOVE ? rootfix_remove(path, ctx) :
++		    op == RFX_CREATE_Z ? rootfix_create_z(path, data, dlen, mode, uid, gid, ctx) :
+ 		    (op == RFX_WRITE || op == RFX_CREATE) ?
+ 		    rootfix_write(path, data, dlen, mode, uid, gid, op == RFX_CREATE, ctx) : EINVAL;
+ 		if (err == 0) {
+@@ -188,7 +262,8 @@ rootfix_apply(void)
+ 		}
+ 		if (err != EEXIST) {
+ 			printf("TAIMEN ROOTFIX: %s %s (%u bytes, %o %u:%u): %s%d\n",
+-			    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" : "write",
++			    op == RFX_MKDIR ? "mkdir" : op == RFX_REMOVE ? "remove" : op == RFX_CREATE ? "create" :
++			    op == RFX_CREATE_Z ? "create (zlib)" : "write",
+ 			    path, dlen, mode,
+ 			    uid, gid, err ? "error " : "ok ", err);
+ 		}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Make a sweetgl build (tools/sweetgl, CI workflow sweetgl.yml) the one GPU boots use:
 # wait for its CI run, download the dylib, build a ROOTFIX blob that installs it in the iOS root
-# as /usr/lib/sweetgl-<sha256 prefix>.dylib (write-if-absent), and record both in
+# as /usr/lib/sweetgl-<sha256 prefix>.dylib (write-if-absent, zlib-compressed: xnu 0245), and record both in
 # ../out/sweetgl/current.env, which boot-xnu.sh reads for ROOT=1 boots (GPU=0 to boot without).
 # Usage: tools/taimen/sweetgl-install.sh [SHA]      (default: the last commit touching tools/sweetgl)
 set -euo pipefail
@@ -27,7 +27,7 @@ rm -rf "$d"; mkdir -p "$d"
 (cd "$d" && sha256sum -c SHA256SUMS)
 lib=/usr/lib/sweetgl-$(sha256sum "$d/sweetgl.dylib" | cut -c1-8).dylib
 fix=$P/../research/taimen/rootfix-sweetgl-current.bin
-python3 -I "$P/tools/taimen/mkrootfix.py" "$P/../research/ipsw-x/ios16-root.img" "$fix" --file "$lib=$d/sweetgl.dylib" | tail -1
+python3 -I "$P/tools/taimen/mkrootfix.py" "$P/../research/ipsw-x/ios16-root.img" "$fix" --zfile "$lib=$d/sweetgl.dylib" | tail -1
 cat > "$P/../out/sweetgl/current.env" <<EOF
 SWEETGL_SHA=$sha
 SWEETGL_LIB=$lib

@@ -3,7 +3,7 @@
 boot, before launchd (xnu 0210, bsd/kern/taimen_rootfix.c). The Pixel 1 port's root tweaks
 (tools/sweet-root-tweaks.py) without reflashing userdata or writing HFS+ on the PC.
 
-  mkrootfix.py ROOT.img OUT.bin [--migrate] [--file /DEST=SRC ...]
+  mkrootfix.py ROOT.img OUT.bin [--migrate] [--file /DEST=SRC ...] [--zfile /DEST=SRC ...]
 
 ROOT.img is the raw root image (tools/simg2img.py of what was flashed); the original files the
 tweaks edit are read from it with 7-Zip (7z.exe on Windows reads HFS+). Without --migrate the
@@ -15,16 +15,19 @@ registers the app extensions: wallpapers, widgets).
 name (sweetgl.dylib goes in as /usr/lib/sweetgl-HASH.dylib): a new build is then a new file, and
 no boot rewrites a library a process may be loading (the records apply after launchd remounts
 the root read-write, when backboardd starts). Such a blob is for the boot that installs the
-file; later boots keep the small one, as the whole payload has ~40 MB of room.
+file; later boots keep the small one: ABL starts no payload over ~35 MiB (boot 78), and a
+development kernel takes ~17 MB of it. --zfile is --file zlib-compressed (op 5, xnu 0245; the
+19 MB sweetgl dylib goes in at about a third).
 
 Records: "RFX1", count, then {op, mode, uid, gid, path length, data length, path, data}
-(op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present; 4-byte padding).
+(op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present, 5 as 2 with the data a
+u32 size and a zlib stream; 4-byte padding).
 """
-import argparse, os, plistlib, struct, subprocess, sys, tempfile
+import argparse, os, plistlib, struct, subprocess, sys, tempfile, zlib
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
-WRITE, CREATE, MKDIR, REMOVE = 1, 2, 3, 4
+WRITE, CREATE, MKDIR, REMOVE, CREATE_Z = 1, 2, 3, 4, 5
 SEVENZIP = os.environ.get('SEVENZIP', '/mnt/c/Program Files/7-Zip/7z.exe')
 
 
@@ -99,6 +102,7 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--migrate', action='store_true')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
+    ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     a = ap.parse_args()
     b = Blob()
     srv = ['System/Library/Frameworks/MediaToolbox.framework/%s/SubServerConfiguration.plist' % d
@@ -152,6 +156,11 @@ def main():
         dest, src = f.split('=', 1)
         assert dest.startswith('/'), dest
         b.add(CREATE, dest, open(src, 'rb').read(), 0o755, 0, 0)
+    for f in a.zfile:
+        dest, src = f.split('=', 1)
+        assert dest.startswith('/'), dest
+        raw = open(src, 'rb').read()
+        b.add(CREATE_Z, dest, struct.pack('<I', len(raw)) + zlib.compress(raw, 9), 0o755, 0, 0)
 
     blob = b.pack()
     open(a.out, 'wb').write(blob)
