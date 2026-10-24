@@ -3,7 +3,9 @@ name: sweetgl
 # sweetgl.dylib: Mesa freedreno (Adreno 540 on taimen) + the libdrm/msm
 # emulation + the EAGL shim, for iOS 16 arm64 (docs/taimen-gpu-plan.md 4.4).
 # Same steps as on the Pixel 1's Mac: tools/sweetgl/mesa-fetch.sh,
-# mesa-setup.sh, build.sh, with Xcode's iPhoneOS SDK.
+# mesa-setup.sh, build.sh, with Xcode's iPhoneOS SDK. Mesa is pinned to
+# 26.3.0-rc2 on purpose (the Pixel 1's tree, matched by mesa.patch's blob ids):
+# see tools/sweetgl/env.sh before changing it.
 
 on:
   workflow_dispatch:
