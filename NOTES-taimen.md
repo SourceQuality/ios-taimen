@@ -598,3 +598,20 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   works**, "SWEET GPU: heap 256 MB at 0x16e400000"; same App Library picture at the end; kernel time per submit
   ~7 -> ~4 ms; 1.5-1.9 flushes/s, 1000-1700 draws per swipe window, swap gaps mostly 37-54 ms during the
   animations (~20-25 frames/s, from ~1 at the start of the night). 0241 splits the remaining ~4 ms.
+- 2026-10-24 boot 74 (r63 = +0241 submit split, heap on): **the ring never waits** ("0 ms waiting for room"; the
+  ring part 1 ms per 10 s) and **every page checked was flushed** (e.g. 618229 of 618229 in one 10 s window), ~1 us
+  each, ~4 ms per submit: the imported 13.9 MB display surfaces, ~3400 pages each, at every submit. Surface buffers
+  (IOBufferMemoryDescriptor) keep a writable kernel mapping, so pmap_clear_modify cannot clear their modified bit
+  and flush_if_written saw every page as written. 0242: imported buffer surfaces are flushed whole only when the
+  surface seed moved since the last flush (CPU writers lock; each write unlock bumps the seed, and the state page
+  is read-only for users).
+- 2026-10-24 **boot 75 (r64 = +0242, heap on, sweetgl 565f8e0): ~60 frames/s during the swipe animations.**
+  Submit cache work gone ("1342044 pages checked, 0 flushed", 0-4 ms per 10 s), ~0.1 ms of kernel time per
+  submit, 350-750 submits per swipe window; 4-11 flushes/s; swap gaps mostly under 20 ms (one window 84 of 98, the
+  others 33-38 per swipe); 3000-4000 draws per window at 60-90 us each, ~600 ms of GL time per 10 s; backboardd
+  4-10 % CPU; wired steady at ~62k pages (90k+ before the 96 MB surface cache limit). The home screen at 60 s and
+  the App Library at the end match the earlier boots, on the surface and on the panel (shots/).
+  The night's chain, ~1 -> ~60 frames/s: the first EAGL context waits for the GPU service (CA had kept its software
+  renderer), an A5xx texture barrier inside the batch (mesa.patch; CA's destination reads each flushed a batch),
+  Mesa's bos write-combined from a heap above XNU's RAM (0240), imported surfaces flushed only when their seed moves
+  (0242).
