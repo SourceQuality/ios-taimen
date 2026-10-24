@@ -14,6 +14,7 @@
  * (SweetGPU selector 12), wrapped in a pipe_resource, handed to
  * glEGLImageTargetTexture2DOES through the frontend's get_egl_image.
  */
+#include <dlfcn.h>
 #include <objc/NSObjCRuntime.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -1298,20 +1299,67 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
  * (IOMFB swap, copied by the kernel at once) without waiting for the GPU;
  * per-surface fences in the swap path would let the GPU run ahead.
  */
-/*
- * Frame timing, logged every 10 s: flushes, time blocked in glFinish (GPU
- * still busy) and the CPU time between one flush's return and the next.
- */
-static void
-flush_stats(uint64_t t0, uint64_t t1)
+uint64_t sgl_gap_ticks;
+static int gap_left = 400;
+static __thread uint64_t gap_last, gap_frame_start;
+static __thread unsigned gap_calls;
+static __thread bool gap_after_flush;
+
+static uint64_t
+ticks_us(uint64_t t)
 {
-	static uint64_t last, window, n, wait, wait_max, cpu;
 	static mach_timebase_info_data_t tb;
 	if (tb.denom == 0) {
 		mach_timebase_info(&tb);
 	}
+	return t * tb.numer / tb.denom / 1000;
+}
+
+void
+sgl_gap(void *ra)
+{
+	uint64_t now = mach_absolute_time(), last = gap_last;
+	bool after_flush = gap_after_flush;
+	gap_last = now;
+	gap_calls++;
+	if (after_flush) {
+		gap_after_flush = false;
+		gap_frame_start = now;
+	}
+	if (last == 0 || now - last < sgl_gap_ticks || gap_left <= 0) {
+		return;
+	}
+	gap_left--;
+	char line[600];
+	int o = snprintf(line, sizeof(line), "sweetgl: gap %llu ms %s (%u calls before), ra %p bt",
+	    ticks_us(now - last) / 1000, after_flush ? "after a flush" : "in a frame", gap_calls - 1, ra);
+	uintptr_t *fp = __builtin_frame_address(0);
+	for (int i = 0; i < 16 && fp != NULL && ((uintptr_t)fp & 7) == 0 && o < (int)sizeof(line) - 24; i++) {
+		uintptr_t *next = (uintptr_t *)fp[0];
+		o += snprintf(line + o, sizeof(line) - o, " %#lx", (unsigned long)fp[1]);
+		if (next <= fp || (uintptr_t)next - (uintptr_t)fp > (1u << 20)) {
+			break;
+		}
+		fp = next;
+	}
+	sweet_drm_log("%s", line);
+	gap_calls = 1;
+}
+
+/*
+ * Frame timing, logged every 10 s: flushes, time blocked in glFinish (GPU
+ * still busy), the CPU time between one flush's return and the next, and
+ * (SWEETGL_GAPS) the part of it from the frame's first GL call ("build").
+ */
+static void
+flush_stats(uint64_t t0, uint64_t t1)
+{
+	static uint64_t last, window, n, wait, wait_max, cpu, build;
 	if (last != 0) {
 		cpu += t0 - last;
+	}
+	if (gap_frame_start != 0 && gap_frame_start <= t0) {
+		build += t0 - gap_frame_start;
 	}
 	wait += t1 - t0;
 	wait_max = t1 - t0 > wait_max ? t1 - t0 : wait_max;
@@ -1320,13 +1368,12 @@ flush_stats(uint64_t t0, uint64_t t1)
 	if (window == 0) {
 		window = t1;
 	}
-	uint64_t span = (t1 - window) * tb.numer / tb.denom;
-	if (span >= 10000000000ull) {
-		sweet_drm_log("sweetgl: %.1f flushes/s, finish avg %llu us max %llu us, between %llu us",
-		    n * 1e9 / span, wait * tb.numer / tb.denom / 1000 / n, wait_max * tb.numer / tb.denom / 1000,
-		    cpu * tb.numer / tb.denom / 1000 / n);
+	uint64_t span = ticks_us(t1 - window);
+	if (span >= 10000000ull) {
+		sweet_drm_log("sweetgl: %.1f flushes/s, finish avg %llu us max %llu us, between %llu us (build %llu us)",
+		    n * 1e6 / span, ticks_us(wait) / n, ticks_us(wait_max), ticks_us(cpu) / n, ticks_us(build) / n);
 		window = t1;
-		n = wait = wait_max = cpu = 0;
+		n = wait = wait_max = cpu = build = 0;
 	}
 }
 
@@ -1336,7 +1383,10 @@ sgl_Flush(void *rctx)
 	SGL_CUR(rctx);
 	uint64_t t0 = mach_absolute_time();
 	glFinish();
-	flush_stats(t0, mach_absolute_time());
+	uint64_t t1 = mach_absolute_time();
+	flush_stats(t0, t1);
+	gap_last = t1;
+	gap_after_flush = true;
 }
 
 void
@@ -2283,6 +2333,15 @@ sweetgl_eagl_install(void)
 	const char *t = getenv("SWEETGL_TRACE");
 	trace_left = t && t[0] == '1' ? 20000 : 0;
 	dump_shaders = trace_left > 0;
+	const char *g = getenv("SWEETGL_GAPS");
+	uint64_t gap_ms = g ? strtoull(g, NULL, 10) : 50;
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	sgl_gap_ticks = gap_ms * 1000000ull * tb.denom / tb.numer;
+	Dl_info di;
+	if (dladdr((void *)sgl_gap, &di)) {
+		sweet_drm_log("sweetgl: loaded at %p, gaps over %llu ms logged", di.dli_fbase, gap_ms);
+	}
 	sgl_install_texfns();
 	if (trace_left > 0) {
 		sgl_install_fmt_hook();

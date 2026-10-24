@@ -18,7 +18,15 @@ GLenum sgl_tgt(GLenum target);
 /* rctx of the GLI calls: the shim's context; made current on the calling thread if it is not */
 extern __thread void *sgl_current;
 void sgl_bind(void *rctx);
-#define SGL_CUR(r) do { if (__builtin_expect(sgl_current != (r), 0)) sgl_bind(r); } while (0)
+/*
+ * SWEETGL_GAPS=MS (default 50, 0 = off): a GL call more than MS after the
+ * previous one on its thread (or after the last flush returned) logs the gap
+ * with the caller's frame-pointer backtrace; 400 lines at most.
+ */
+extern uint64_t sgl_gap_ticks;
+void sgl_gap(void *ra);
+#define SGL_CUR(r) do { if (__builtin_expect(sgl_gap_ticks != 0, 1)) sgl_gap(__builtin_return_address(0)); \
+	if (__builtin_expect(sgl_current != (r), 0)) sgl_bind(r); } while (0)
 
 /* SWEETGL_GLERR=1: glGetError after every call, logged (eats the error CA would see) */
 extern int sgl_check_errors;
