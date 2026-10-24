@@ -1,0 +1,73 @@
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..afe854a 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,13 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * 4 KiB pages, 1 GiB per L1 entry: RAM from 0xb1000000 to the upper bank's end
++ * (~3.2 GiB) takes 4 L2 tables for V=P and 4 for the kernel's VA, plus the two
++ * L1 tables and start.s's Device block at index 0. 8 pages fit only ~1.5 GiB.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 20)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 9c34592..6e7e992 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2000,7 +2000,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	size_t l1_entries = 1 + ((bytes_mapped + ARM_TT_L1_SIZE - 1) / ARM_TT_L1_SIZE);
+ 	/* 1 L1 each for V=P and KVA, plus 1 page for each L2 */
+ 	size_t pages_used = 2 * (l1_entries + 1);
+-	if (pages_used > BOOTSTRAP_TABLE_SIZE) {
++#if defined(TAIMEN)
++	pages_used += 1;        /* start.s: the MDP Device block (L1 index 0) */
++#endif
++	/* stock xnu compared pages with BOOTSTRAP_TABLE_SIZE in bytes: it never fired */
++	if (pages_used > BOOTSTRAP_TABLE_SIZE / ARM_PGBYTES) {
+ 		panic("BOOTSTRAP_TABLE_SIZE too small for memory config");
+ 	}
+ #endif
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 4d9b1b6..adedfba 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -729,17 +729,30 @@ Lkernelcache_base_found:
+ 	 *  - 0x9d400000..0xb0200000 (151 blocks, L1 index 2): the splash
+ 	 *    framebuffer (36 MiB) through the early log zone at 0xb0000000;
+ 	 *  - 0xc800000 (1 block, L1 index 0): MDP CTL0 START for frame kicks.
+-	 * Both L1 indices differ from RAM's (0x100000000, index 4), so each
+-	 * costs one extra bootstrap L2 page. Device: no speculative reads.
++	 * RAM from 0x100000000 (index 4 on): each costs one extra bootstrap L2
++	 * page. RAM from 0xb1000000 (mkadt TAIMEN_BASE: the low bank's top runs
++	 * on into the upper bank) already has an L2 table at index 2, and a new
++	 * one would unmap the kernel: the blocks go into RAM's table (they end
++	 * below 0xb1000000). Device: no speculative reads.
+ 	 */
+ 	MOV64	x0, 0x9d400000
+ 	mov	x4, x0
+ 	mov	x5, #151
++	and	x10, x0, #(ARM_TT_L1_INDEX_MASK)
++	lsr	x10, x10, #(ARM_TT_L1_SHIFT)
++	ldr	x12, [x1, x10, lsl #TTE_SHIFT]		// V=P L1 entry for index 2
++	tbz	x12, #0, Ltaimen_dev_new		// not valid: no RAM there
++	and	x12, x12, #(ARM_TTE_TABLE_MASK)		// RAM's L2 table
++	create_l2_block_entries x0, x4, x12, x5, x6, x10, x11, x13
++	b	Ltaimen_dev_attr
++Ltaimen_dev_new:
+ 	create_bootstrap_mapping x0, x4, x5, x1, x2, x6, x10, x11, x12, x13
++	mov	x12, x2
++Ltaimen_dev_attr:
+ 	MOV64	x10, 0x9d400000
+ 	and	x11, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr	x11, x11, #(ARM_TT_L2_SHIFT)
+-	add	x12, x2, x11, lsl #TTE_SHIFT
++	add	x12, x12, x11, lsl #TTE_SHIFT
+ 	mov	x13, #151
+ Ltaimen_dev_attr1:
+ 	ldr	x11, [x12]

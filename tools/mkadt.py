@@ -111,9 +111,15 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
         # TAIMEN_MEM (boot-xnu.sh): more of the free upper bank (Linux: System RAM up to 0x17e4bffff, ~2 GB
         # above 4 GB); 512 MiB is the S8 port's limit, untried above that on taimen (boot 61: iOS with
         # Mesa stalled, compressor busy)
+        # TAIMEN_BASE=0xb1000000: XNU's RAM starts in the low bank, whose top runs on into the upper
+        # bank (Linux System RAM b1000000-17e4bffff): ~3.2 GiB in one range (xnu 0251)
+        if taimen and os.environ.get('TAIMEN_BASE'):
+            phys_base = int(os.environ['TAIMEN_BASE'], 0)
+            assert phys_base in (0xb1000000, 0x100000000), hex(phys_base)
         if taimen and os.environ.get('TAIMEN_MEM'):
             mem_size = int(os.environ['TAIMEN_MEM'], 0)
-            assert 0x20000000 <= mem_size <= 0x7e4c0000 and mem_size % 0x200000 == 0, hex(mem_size)
+            assert 0x20000000 <= mem_size and phys_base + mem_size <= 0x17e4c0000 and mem_size % 0x200000 == 0, \
+                hex(mem_size)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
