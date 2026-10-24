@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 0894a96..6f2c075 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2415,8 +2415,8 @@ cp_test(vm_offset_t gpu, int level)
+ /*
+  * Adreno 540 power-up at XO (docs/taimen-gpu-plan.md 2.2; boot 50 with the same sequence in the
+  * perf thread: the GPU answered, VBIF_VERSION 0x200a0000, ALWAYSON counting). PM8005 S1 is left
+- * as ABL set it (752 mV, on: enough for XO and the 257 MHz corner). Returns the GPU's register
+- * mapping, or 0 after logging where it stopped.
++ * as ABL set it (752 mV, on: enough for XO and the 257 MHz corner), or set so if found off.
++ * Returns the GPU's register mapping, or 0 after logging where it stopped.
+  */
+ static vm_offset_t
+ taimen_power_up(void)
+@@ -2432,6 +2432,19 @@ taimen_power_up(void)
+ 	printf("SWEET GPU: taimen: S1 %s en %02x %u mV; gpucc cx %08x gx %08x misc %08x gfx3d %08x\n",
+ 	    s1 ? "ok" : "UNREADABLE", en, (unsigned)hi << 8 | lo, rd(cc, 0x1004), rd(cc, 0x1094), rd(cc, 0x130),
+ 	    rd(cc, 0x1098));
++	/*
++	 * Boot 78c (after two boot images ABL refused) found S1 off (en 00): set ABL's 752 mV
++	 * and switch it on, as the MSM8996 path does with its S2.
++	 */
++	for (int attempt = 0; s1 && attempt < 3 && (!(en & 0x80) || ((unsigned)hi << 8 | lo) < 700); attempt++) {
++		bool ok = sweet_pmic_write(0x514, 0x40, 752 & 0xff) && sweet_pmic_write(0x514, 0x41, 752 >> 8) &&
++		    sweet_pmic_write(0x514, 0x46, 0x80);
++		delay(1000 + attempt * 10000);
++		s1 = sweet_pmic_read(0x514, 0x46, &en) && sweet_pmic_read(0x514, 0x40, &lo) &&
++		    sweet_pmic_read(0x514, 0x41, &hi);
++		printf("SWEET GPU: taimen: S1 was off, switched on (%s, try %d): en %02x %u mV\n",
++		    ok ? "written" : "write FAILED", attempt + 1, en, (unsigned)hi << 8 | lo);
++	}
+ 	if (!s1 || !(en & 0x80) || ((unsigned)hi << 8 | lo) < 700) {
+ 		printf("SWEET GPU: GFX rail off or below 700 mV, stop\n");
+ 		return 0;
