@@ -635,3 +635,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   was there and injected, all six gesture cycles ran; but **PM8005 S1 (GFX) was off** ("S1 ok en 00 752 mV", every
   earlier boot en 80) after the two refused images, the GPU service stopped ("GFX rail off"), sweetgl waited its
   60 s and CA drew with its CPU renderer. xnu 0246 switches S1 on at 752 mV when found off.
+- 2026-10-24 **boot 79 (r68 = +0245 zlib ROOTFIX files, +0246 GFX rail on; GPU setup, the gesture script)**:
+  payload 22.9 MB; "create (zlib) /private/var/tmp/zfile-test-....bin ... ok" (op 5 inflates); S1 on this time,
+  the GPU service ready, Mesa after 5.7 s. Settings opened and Control Center came down, both drawn correctly
+  by Mesa (shots/settings-surface4.png, cc-surface4.png). Frame pacing: home screen paging stays ~60 frames/s;
+  the Settings launch/close and Control Center windows mostly 20-37 ms swap gaps with many under 20
+  (~35-50 frames/s); 1200-2700 submits per 10 s at ~0.1 ms of kernel time, glFinish 2-4 ms per frame,
+  backboardd 20-22 % CPU, SpringBoard 26-42 %, Preferences 26 % while it launches.
