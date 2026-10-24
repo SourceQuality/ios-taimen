@@ -468,3 +468,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   **VBIF_VERSION 0x200a0000, RBBM_STATUS 0x1, RBBM_ALWAYSON_COUNTER 0xac9 -> 0x1547 across a 100 us delay**. iOS ran
   normally around it. Next: E2, the command processor (SMMU identity map, a530 PM4/PFP microcode, ring, ME_INIT,
   CP_MEM_WRITE), from sweet_gpu.c's cp_test with the A540 values (docs/taimen-gpu-plan.md 2.6, 3.1).
+- 2026-10-23 **boot 51 (r51 = +0230, sweetgpu=2 GPUFW): the A540 command processor works.** SMMU sCR0 0x200626,
+  IDR0 0x48016403 (3 SMRs), IDR1 0x20008003 (3 CBs, CB space at +0x8000), SMR0 free, S2CR0 0x200ff (fault) before;
+  identity map accepted (SMR0 0x80000000, S2CR0 0, CBAR0 0x10000, SCTLR 7, tlbsync 1). a530 PM4 19648 / PFP 17104
+  bytes loaded, RBCCU and SP power on (0x140000), RBBM_STATUS 0x800001c1 before ME start; the ring was consumed (RPTR
+  = WPTR = 14, CP_HW_FAULT 0, TRUST still 1) and CP_MEM_WRITE put c0ffee01 in the scratch page. CB0 FSR 0x400, FAR 0
+  afterwards (to watch).
+- 2026-10-23 boot 52 (r52 = +0231): the same result with the short cycle: the GPU thread starts after 10 s and pauses
+  2 s; taimenend=1 ended the boot 15 s into the pet loop ("ending early ... GPU test done"); the PC ejected the reader
+  drive after copying and the reader went straight to fastboot; the reader was not reflashed (inputs unchanged).
+  **fastboot boot to fastboot again in 64 s** (was ~5-6 min). The PowerShell file list printed during the copy can
+  show short sizes (the \wsl.localhost view lags); the files are complete.
