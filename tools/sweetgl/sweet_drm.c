@@ -14,7 +14,8 @@
  *   GEM_SUBMIT               sel 13: CMD_BUF cmds become IBs at bo VA +
  *                            offset; every listed bo remembers the fence
  *   WAIT_FENCE, CPU_PREP     the read-only fence page, then sel 14
- *   GET_PARAM                sel 15 (chip id, GMEM) and constants
+ *   GET_PARAM                sel 15 (chip id, GMEM); GPU_ID from the chip
+ *                            id (0x05040001 -> 540), the rest constants
  *
  * One device per process; the "fd" is /dev/null (Mesa dup()s and closes
  * it). sweet_drm_import_iosurface() makes a GEM handle for an IOSurface
@@ -29,6 +30,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+#include <mach/vm_page_size.h>
 #include <IOKit/IOKitLib.h>
 
 #include "xf86drm.h"
@@ -178,7 +180,9 @@ get_param(struct drm_msm_param *p)
 {
 	switch (p->param) {
 	case MSM_PARAM_GPU_ID:
-		p->value = 530;
+		/* core.major.minor.patch, one byte each, as the msm kernel derives
+		 * it: A540 0x05040001 -> 540, A530 0x05030002 -> 530 */
+		p->value = (chip_id >> 24 & 0xff) * 100 + (chip_id >> 16 & 0xff) * 10 + (chip_id >> 8 & 0xff);
 		return 0;
 	case MSM_PARAM_GMEM_SIZE:
 		p->value = gmem_size;
@@ -219,7 +223,8 @@ gem_new(struct drm_msm_gem_new *r)
 		return -ENOMEM;
 	}
 	pthread_mutex_lock(&lock);
-	int ret = sbo_add((uint32_t)out[0], out[1], out[2], (r->size + 16383) & ~16383ull);
+	/* the kernel rounds to its page: 16 KB on the Pixel 1, 4 KB on taimen */
+	int ret = sbo_add((uint32_t)out[0], out[1], out[2], (r->size + vm_page_mask) & ~(uint64_t)vm_page_mask);
 	pthread_mutex_unlock(&lock);
 	if (ret) {
 		IOConnectCallScalarMethod(conn, 11, out, 1, NULL, NULL);
