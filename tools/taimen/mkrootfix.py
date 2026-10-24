@@ -3,13 +3,19 @@
 boot, before launchd (xnu 0210, bsd/kern/taimen_rootfix.c). The Pixel 1 port's root tweaks
 (tools/sweet-root-tweaks.py) without reflashing userdata or writing HFS+ on the PC.
 
-  mkrootfix.py ROOT.img OUT.bin [--migrate]
+  mkrootfix.py ROOT.img OUT.bin [--migrate] [--file /DEST=SRC ...]
 
 ROOT.img is the raw root image (tools/simg2img.py of what was flashed); the original files the
 tweaks edit are read from it with 7-Zip (7z.exe on Windows reads HFS+). Without --migrate the
 first-boot data migration is skipped (LastSystemVersion in the ByHost com.apple.migration
 prefs, sweet NOTES); with it the sweet sentinel makes it run once (~30 min on taimen, but it
 registers the app extensions: wallpapers, widgets).
+
+--file adds a file from the PC, written only if absent (op 2), mode 0755. Give it a versioned
+name (sweetgl.dylib goes in as /usr/lib/sweetgl-HASH.dylib): a new build is then a new file, and
+no boot rewrites a library a process may be loading (the records apply after launchd remounts
+the root read-write, when backboardd starts). Such a blob is for the boot that installs the
+file; later boots keep the small one, as the whole payload has ~40 MB of room.
 
 Records: "RFX1", count, then {op, mode, uid, gid, path length, data length, path, data}
 (op 1 write, 2 write if absent, 3 mkdir if absent, 4 remove if present; 4-byte padding).
@@ -92,6 +98,7 @@ def main():
     ap.add_argument('image')
     ap.add_argument('out')
     ap.add_argument('--migrate', action='store_true')
+    ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     a = ap.parse_args()
     b = Blob()
     srv = ['System/Library/Frameworks/MediaToolbox.framework/%s/SubServerConfiguration.plist' % d
@@ -140,6 +147,11 @@ def main():
             ('com.apple.managedconfiguration.notbackedup',
              {'LockdownActivationIndicatesCloudConfigurationAvailable': False})):
         b.plist(WRITE, f'{prefs}/{name}.plist', values, 0o600, MOBILE, MOBILE)
+
+    for f in a.file:
+        dest, src = f.split('=', 1)
+        assert dest.startswith('/'), dest
+        b.add(CREATE, dest, open(src, 'rb').read(), 0o755, 0, 0)
 
     blob = b.pack()
     open(a.out, 'wb').write(blob)

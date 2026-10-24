@@ -36,6 +36,9 @@ python3 -I "$P/tools/mkadt.py" "$out/taimen.adt" --taimen
 safe="sweetkeys=0 sweettouch=0 sweetusb=0 sweetperf=0 sweetbattery=0 sweetcharge=0 sweetbl=0"
 # taimenepoch: the PC clock for the calendar (xnu 0217; no RTC driver yet)
 cmdline="debug=0x10000c serial=3 cpus=1 keepsyms=1 -noprogress taimenepoch=$(date +%s) ${safe} ${args}"
+# mkpayload.py keeps 607 bytes (BOOT_LINE_LENGTH 608) and cuts the rest silently; the GPU boots
+# (sweetgpu, sweetenv for sweetgl) come close, so refuse instead.
+[ ${#cmdline} -le 607 ] || { echo "boot-args are ${#cmdline} bytes, over the 607 mkpayload keeps" >&2; exit 1; }
 # ROOTFIX=FILE: files the kernel writes into the iOS root before launchd (tools/taimen/mkrootfix.py, xnu 0210)
 blobs=()
 [ -n "${ROOTFIX:-}" ] && blobs+=(--blob "ROOTFIX=$(realpath "$ROOTFIX")")
