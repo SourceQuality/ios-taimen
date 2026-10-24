@@ -441,3 +441,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   APM and MEM-ACC 0, ACD 0x10000000. GFMUX cfg silver 0x301, **gold 0x403 (on GPLL0 / 2)**; silver PLL L 0x51
   (1555.2 MHz), **gold PLL running at L 0x20 = 614.4 MHz (mode 0x7) but not selected**. TSENS 35-39 C. boot-xnu.sh
   ROOT=1 now adds sweetperf=1 taimenddr=1804. Next: V1 (SPMI read of the S10/S13 rail voltages), then gold onto its PLL.
+- 2026-10-23 boot 45 (r46 = +0225 SPMI; taimenvread=1 sweetkeys=1): **SPMI works from XNU** (arbiter v3 0x30000000,
+  PON on APID 4). Rails, all FTS426 (type 0x1c, subtype 0x0a), enabled, mode 0x06: PM8998 S10 (silver) 828 mV,
+  S13 (gold) **896 mV**, PM8005 S1 (GFX) 752 mV. Volume up read cfg 0 and would not take its pull-up: the msm8998
+  TLMM is three tiles (WEST 0x3500000, NORTH 0x3900000, EAST 0x3d00000; pinctrl-msm8998.c) and GPIO 126 is in EAST.
+- 2026-10-23 **boot 46 (r47 = +0226 G1; cpus=8 taimengold=1728 sweetkeys=1, 300 s): gold at 1728 MHz.** Preconditions
+  all held (OSM 0, GFMUX 0x403, MEM-ACC 0, APM 0, S13 896 mV, gold PLL USER/CONFIG = silver's 0x9/0x20000aa8). Steps
+  902.4, 1132.8, 1344.0, 1574.4, 1728.0 MHz: each locked, every gold core measured 19.2 x L and matched CPU0's
+  self-test. Then MHz 1555 x 4 / 1727 x 4 for the whole run, no TSENS park. memcpy: silver ~1.0-1.1 GB/s, **gold
+  7.9 GB/s**. Volume-up GPIO 126 now cfg 0x3 in 1; no false key events. Lock screen at ~20 s (35 s with gold at
+  299 MHz, 15 s with 4 silver cores; 5 s resolution, and this boot also ran the ramp and the per-core benchmarks).
+  boot-xnu.sh ROOT=1 defaults: cpus=8 taimengold=1728 sweetkeys=1 (+ full screen, DDR 1804).

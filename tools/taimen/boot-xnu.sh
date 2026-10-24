@@ -14,13 +14,15 @@ args=${*:-}
 # ufsrw=1 (HFS+ journal replay, UFS console ring), cs_enforcement_disable=1 (4K pages vs the
 # 16K-signed cache), the userland switches dyld/launchd/watchdogd read from kern.bootargs;
 # sweetfb_noconsole=1: no kernel text over the GUI (the log reader brings the console back).
-# cpus=4: the silver cluster (boots 37-41: the gold cores run at 299 MHz, left there by ABL, and
-# 8 cores reach the lock screen at 35 s against 15 s with 4); taimenhwscale=2: QSEED3 full screen
+# cpus=8 taimengold=1728: all cores, the gold cluster moved from GPLL0 / 2 (299 MHz, where ABL
+# leaves it; boots 39-41) onto its own PLL at 1728 MHz at the boot voltage (xnu 0226, boot 46:
+# every step self-tested, gold memcpy 7.9 GB/s); sweetkeys=1: power, volume up, volume down as
+# Home (xnu 0225-0226); taimenhwscale=2: QSEED3 full screen
 # (xnu 0218, boot 36); sweetperf=1 taimenddr=1804: the perf thread votes DDR to 1804 MHz through
 # the RPM (xnu 0224, boot 44: bimc 648 -> 902 MHz, memcpy ~0.8 -> 1.09 GB/s). Later extra args
 # override all of these (the last occurrence wins).
 if [ "${ROOT:-0}" = 1 ]; then
-	args="cpus=4 taimenhwscale=2 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
+	args="cpus=8 taimengold=1728 sweetkeys=1 taimenhwscale=2 sweetperf=1 taimenddr=1804 rd=ufsroot0 ufsrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin sweetfb_noconsole=1 ${args}"
 fi
 mkdir -p "$out"
 export PATH="$HOME/.local/bin:$PATH"
