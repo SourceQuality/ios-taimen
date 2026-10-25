@@ -174,6 +174,8 @@ def main():
     ap.add_argument('--apps-part', metavar='PARTITION', help='apply the blob on PARTITION at boot (op 8)')
     ap.add_argument('--findrm', action='append', default=[], metavar='/DIR:DEPTH:PREFIX*SUFFIX',
                     help='remove matching files below DIR at boot, first thing (op 9, xnu 0280)')
+    ap.add_argument('--remove', action='append', default=[], metavar='/PATH',
+                    help='remove a file at boot (before the --file/--zfile records)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--daemon', action='append', default=[], metavar='LABEL=/PATH[,ARG...]',
@@ -247,6 +249,9 @@ def main():
     for spec in a.list:
         d, _, depth = spec.partition(':')
         b.add(LIST, d, b'', int(depth or 1), 0, 0)
+    for path in a.remove:
+        assert path.startswith('/'), path
+        b.add(REMOVE, path)
     for f in a.file:
         dest, src = f.split('=', 1)
         assert dest.startswith('/'), dest

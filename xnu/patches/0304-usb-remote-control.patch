@@ -1,0 +1,243 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 48cde19..24680d1 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -39,6 +39,7 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -1147,6 +1148,176 @@ ud_tcplog_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++/*
++ * 0304: remote control over the USB link, TCP 5144 on the phone (tools/taimen/phonectl.py). One
++ * command per line, panel coordinates (1440 x 2880), each answered "OK" or "ERR ...":
++ *   tap X Y                     a touch of 80 ms (finger 9, as the gesture script uses)
++ *   swipe X1 Y1 X2 Y2 [MS]      16 moves over MS ms (default 250)
++ *   shot                        "SHOT W H" then H rows of W x 4 bytes (BGRA) of the last surface
++ *                               backboardd swapped (the 1125 x 2436 canvas), then "OK"
++ * Only the PC at the other end of the phone's own USB cable can reach it. sweetusbctl=0: off.
++ */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern bool sweet_fb_grab(uintptr_t *base, uint32_t *w, uint32_t *h, uint32_t *bpr, void **ref);
++extern void sweet_fb_grab_release(void *ref);
++
++static int
++ctl_send(socket_t s, const void *p, size_t n)
++{
++	while (n > 0) {
++		struct iovec iov = { .iov_base = (void *)(uintptr_t)p, .iov_len = MIN(n, (size_t)65536) };
++		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++		size_t sent = 0;
++		if (sock_send(s, &msg, 0, &sent) != 0 || sent == 0) {
++			return -1;
++		}
++		p = (const uint8_t *)p + sent;
++		n -= sent;
++	}
++	return 0;
++}
++
++static int
++ctl_say(socket_t s, const char *text)
++{
++	return ctl_send(s, text, strlen(text));
++}
++
++static int
++ctl_readline(socket_t s, char *buf, size_t max)
++{
++	size_t n = 0;
++	for (;;) {
++		char c;
++		size_t got = 0;
++		struct iovec iov = { .iov_base = &c, .iov_len = 1 };
++		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++		if (sock_receive(s, &msg, 0, &got) != 0 || got == 0) {
++			return -1;
++		}
++		if (c == '\n') {
++			break;
++		}
++		if (c != '\r' && n + 1 < max) {
++			buf[n++] = c;
++		}
++	}
++	buf[n] = 0;
++	return (int)n;
++}
++
++/* the decimal numbers on a line, after the command word */
++static int
++ctl_args(const char *p, int *v, int max)
++{
++	int n = 0;
++	while (*p && *p != ' ') {
++		p++;
++	}
++	while (n < max) {
++		while (*p == ' ') {
++			p++;
++		}
++		if (*p < '0' || *p > '9') {
++			break;
++		}
++		int x = 0;
++		while (*p >= '0' && *p <= '9') {
++			x = x * 10 + (*p++ - '0');
++		}
++		v[n++] = x;
++	}
++	return n;
++}
++
++static void
++ctl_command(socket_t s, const char *line)
++{
++	int v[5], n = ctl_args(line, v, 5);
++	char reply[96];
++	if (strncmp(line, "tap", 3) == 0 && n == 2) {
++		sweet_hid_touch(9, 1, v[0], v[1]);
++		delay(80000);
++		sweet_hid_touch(9, 0, v[0], v[1]);
++		ctl_say(s, "OK\n");
++	} else if (strncmp(line, "swipe", 5) == 0 && n >= 4) {
++		int ms = n >= 5 ? v[4] : 250;
++		for (int i = 0; i <= 16; i++) {
++			sweet_hid_touch(9, 1, v[0] + (v[2] - v[0]) * i / 16, v[1] + (v[3] - v[1]) * i / 16);
++			delay((uint32_t)(ms * 1000 / 16));
++		}
++		sweet_hid_touch(9, 0, v[2], v[3]);
++		ctl_say(s, "OK\n");
++	} else if (strncmp(line, "shot", 4) == 0) {
++		uintptr_t base;
++		uint32_t w, h, bpr;
++		void *ref;
++		if (!sweet_fb_grab(&base, &w, &h, &bpr, &ref)) {
++			ctl_say(s, "ERR no surface swapped yet\n");
++			return;
++		}
++		snprintf(reply, sizeof(reply), "SHOT %u %u\n", w, h);
++		int err = ctl_say(s, reply);
++		for (uint32_t y = 0; y < h && err == 0; y++) {
++			err = ctl_send(s, (const void *)(base + (uintptr_t)y * bpr), (size_t)w * 4);
++		}
++		sweet_fb_grab_release(ref);
++		if (err == 0) {
++			ctl_say(s, "OK\n");
++		}
++	} else {
++		ctl_say(s, "ERR commands: tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot\n");
++	}
++}
++
++static void
++ud_ctl_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static char line[128];
++	socket_t ls = NULL;
++	for (;;) {
++		if (ls == NULL) {
++			ud_sleep_ms(1000);
++			if (!ud.configured) {
++				continue;
++			}
++			if (sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls) != 0) {
++				ls = NULL;
++				continue;
++			}
++			int on = 1;
++			(void)sock_setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++			struct sockaddr_in a;
++			bzero(&a, sizeof(a));
++			a.sin_len = sizeof(a);
++			a.sin_family = AF_INET;
++			a.sin_port = htons(5144);
++			a.sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2: the USB link only */
++			if (sock_bind(ls, (struct sockaddr *)&a) != 0 || sock_listen(ls, 1) != 0) {
++				sock_close(ls);
++				ls = NULL;
++				continue;
++			}
++		}
++		socket_t cs = NULL;
++		if (sock_accept(ls, NULL, 0, 0, NULL, NULL, &cs) != 0 || cs == NULL) {
++			ud_sleep_ms(100);
++			continue;
++		}
++		int on = 1;
++		(void)sock_setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
++		while (ctl_readline(cs, line, sizeof(line)) >= 0) {
++			if (line[0] != 0) {
++				printf("SWEET USB: remote: %s\n", line);
++				ctl_command(cs, line);
++			}
++		}
++		sock_close(cs);
++	}
++}
++#endif
++
+ static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1452,5 +1623,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_tcplog_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	int ctl = 1;
++	PE_parse_boot_argn("sweetusbctl", &ctl, sizeof(ctl));
++	if (ctl && ud.ifp != NULL && kernel_thread_start(ud_ctl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++#endif
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4914dc3..742d378 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -439,6 +439,36 @@ sweet_fb_screenshot(const char *tag)
+ 	}
+ 	sweet_console_muted = muted;
+ }
++
++/*
++ * 0304: the last swapped surface for the remote screenshot (bsd/dev/sweet_usb.c, TCP 5144): its
++ * kernel address and geometry, retained until sweet_fb_grab_release(ref).
++ */
++extern "C" bool sweet_fb_grab(uintptr_t *base, uint32_t *w, uint32_t *h, uint32_t *bpr, void **ref);
++extern "C" void sweet_fb_grab_release(void *ref);
++
++bool
++sweet_fb_grab(uintptr_t *base, uint32_t *w, uint32_t *h, uint32_t *bpr, void **ref)
++{
++	SweetSurface *s = sweet_fb_last_id ? sweet_surface_copy(sweet_fb_last_id) : NULL;
++	if (s == NULL || s->kernelAddress() == 0 || !(s->bytesPerElement == 4 || s->bytesPerElement == 0)) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	*base = s->kernelAddress() + s->offset;
++	*w = s->width;
++	*h = s->height;
++	*bpr = s->bytesPerRow;
++	*ref = s;
++	return true;
++}
++
++void
++sweet_fb_grab_release(void *ref)
++{
++	SweetSurface *s = (SweetSurface *)ref;
++	OSSafeReleaseNULL(s);
++}
+ #endif
+ 
+ bool
