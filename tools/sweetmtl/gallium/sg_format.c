@@ -307,5 +307,57 @@ sg_format_supported(struct sg_device *dev, uint32_t vk, uint32_t usage, uint32_t
    enum pipe_texture_target t = (usage & SG_USAGE_VERTEX) ? PIPE_BUFFER : PIPE_TEXTURE_2D;
    if ((usage & SG_USAGE_BLEND) && util_format_is_pure_integer(f))
       return false;
+   if (usage & SG_USAGE_BLEND)
+      bind |= PIPE_BIND_BLENDABLE;
    return dev->screen->is_format_supported(dev->screen, f, t, s, s, bind);
+}
+
+uint32_t
+sg_format_features(struct sg_device *dev, uint32_t vk)
+{
+   enum pipe_format f = (enum pipe_format)sg_pipe_format(vk);
+   if (f == PIPE_FORMAT_NONE)
+      return 0;
+   struct pipe_screen *s = dev->screen;
+   const struct util_format_description *d = util_format_description(f);
+   bool integer = util_format_is_pure_integer(f);
+   bool zs = util_format_is_depth_or_stencil(f);
+   bool f32 = d && d->channel[0].type == UTIL_FORMAT_TYPE_FLOAT && d->channel[0].size == 32;
+   uint32_t out = 0;
+#define HAS(target, bind) s->is_format_supported(s, f, target, 0, 0, bind)
+   if (HAS(PIPE_TEXTURE_2D, PIPE_BIND_SAMPLER_VIEW)) {
+      out |= SG_FEAT_SAMPLED;
+      if (!integer && !f32)
+         out |= SG_FEAT_FILTER;
+   }
+   if (!zs && !util_format_is_compressed(f) && HAS(PIPE_TEXTURE_2D, PIPE_BIND_SHADER_IMAGE)) {
+      out |= SG_FEAT_STORAGE;
+      if (f == PIPE_FORMAT_R32_UINT || f == PIPE_FORMAT_R32_SINT)
+         out |= SG_FEAT_STORAGE_ATOMIC;
+   }
+   if (zs) {
+      if (HAS(PIPE_TEXTURE_2D, PIPE_BIND_DEPTH_STENCIL))
+         out |= SG_FEAT_DEPTH_STENCIL;
+   } else if (HAS(PIPE_TEXTURE_2D, PIPE_BIND_RENDER_TARGET)) {
+      out |= SG_FEAT_COLOR;
+      if (!integer && HAS(PIPE_TEXTURE_2D, PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE))
+         out |= SG_FEAT_BLEND;
+   }
+   if (!zs && HAS(PIPE_TEXTURE_2D, PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR))
+      out |= SG_FEAT_LINEAR;
+   if (!zs && util_format_is_compressed(f) == false) {
+      if (HAS(PIPE_BUFFER, PIPE_BIND_VERTEX_BUFFER))
+         out |= SG_FEAT_VERTEX;
+      if (HAS(PIPE_BUFFER, PIPE_BIND_SAMPLER_VIEW))
+         out |= SG_FEAT_UNIFORM_TEXEL;
+      if (HAS(PIPE_BUFFER, PIPE_BIND_SHADER_IMAGE))
+         out |= SG_FEAT_STORAGE_TEXEL;
+   }
+   for (unsigned n = 2; n <= 8; n *= 2) {
+      unsigned bind = zs ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET;
+      if (s->is_format_supported(s, f, PIPE_TEXTURE_2D, n, n, bind))
+         out |= SG_FEAT_SAMPLES_2 << (n == 2 ? 0 : n == 4 ? 1 : 2);
+   }
+#undef HAS
+   return out;
 }

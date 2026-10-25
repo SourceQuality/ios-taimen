@@ -82,22 +82,30 @@ if [ "$BUILD" = 1 ]; then
 		--print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
 	echo "$NATIVE" > "$OUT/native-static-libs.txt"
 
-	# 4. the self-test tool: bridge + runtime + translator, the shim, Mesa
-	echo "== mtlbridgetest"
-	$CC -O1 -g -Wall -I "$H/bridge" -o "$OUT/mtlbridgetest" "$H/test/mtlbridgetest.c" \
-		"$OUT/target/release/libnative_metal_bridge.a" "$OUT/gallium/libsweetgallium.a" \
-		-Wl,--start-group $(cat "$OUT/gallium/mesa-libs.txt") -Wl,--end-group \
-		$(pkg-config --libs libdrm zlib) -lexpat -lstdc++ $(cat "$OUT/native-static-libs.txt") \
-		-Wl,--build-id=sha1 > "$OUT/link.log" 2>&1 || { tail -30 "$OUT/link.log"; exit 1; }
+	# 4. the test tools: bridge + runtime + translator, the shim, Mesa
+	for t in mtlbridgetest mtlabitest; do
+		echo "== $t"
+		$CC -O1 -g -Wall -I "$H/bridge" -o "$OUT/$t" "$H/test/$t.c" \
+			"$OUT/target/release/libnative_metal_bridge.a" "$OUT/gallium/libsweetgallium.a" \
+			-Wl,--start-group $(cat "$OUT/gallium/mesa-libs.txt") -Wl,--end-group \
+			$(pkg-config --libs libdrm zlib) -lexpat -lstdc++ $(cat "$OUT/native-static-libs.txt") \
+			-Wl,--build-id=sha1 > "$OUT/link-$t.log" 2>&1 || { tail -30 "$OUT/link-$t.log"; exit 1; }
+	done
+	# mtlabitest's extra fixtures, from metal2vulkan's validation fixtures
+	F=$H/m2v/crates/metal2vulkan-validation/fixtures/public
+	mkdir -p "$OUT/air"
+	"$LLVM_AS" -o "$OUT/air/stage_io.air" "$F/engine/stage_io.ll"
+	"$LLVM_AS" -o "$OUT/air/sampling.air" "$F/engine/sampling.ll"
+	"$LLVM_AS" -o "$OUT/air/threadgroup_word.air" "$F/kernel_threadgroup_word.ll"
 fi
+SHIM_ENV="LD_PRELOAD=$MESA_BUILD/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so FD_GPU_ID=540 SWEETMTL_DRM_SHIM=1
+	LD_LIBRARY_PATH=${CONDA_PREFIX:-$HOME/tools/mamba/root/envs/m0}/lib:${LD_LIBRARY_PATH:-}"
 
 # 5. run on drm-shim as an Adreno 540, dumping every submit
 echo "== running on freedreno drm-shim, FD_GPU_ID=540"
 rm -rf "$OUT/rd" "$OUT/cache" && mkdir -p "$OUT/rd"
 set +e
-env LD_PRELOAD="$MESA_BUILD/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so" FD_GPU_ID=540 \
-	FD_RD_DUMP=combine FD_RD_DUMP_PATH="$OUT/rd" SWEETMTL_TRACE=1 SWEETMTL_DRM_SHIM=1 \
-	LD_LIBRARY_PATH="${CONDA_PREFIX:-$HOME/tools/mamba/root/envs/m0}/lib:${LD_LIBRARY_PATH:-}" \
+env $SHIM_ENV FD_RD_DUMP=combine FD_RD_DUMP_PATH="$OUT/rd" SWEETMTL_TRACE=1 \
 	"$OUT/mtlbridgetest" "$OUT/cache" $QC > "$OUT/run.log" 2>&1
 RC=$?
 set -e
@@ -127,4 +135,12 @@ awk '
 		printf "submits: %d (decoded in %s)\n", n, FILENAME
 	}' "$OUT/rd/submits.txt"
 echo "self-test exit: $RC (0 = every step ran)"
-exit $RC
+
+# 7. the object ABI beyond the self-test (the frontend's calls)
+echo "== mtlabitest"
+set +e
+env $SHIM_ENV SWEETMTL_TRACE=${SWEETMTL_TRACE:-0} "$OUT/mtlabitest" "$OUT/air" > "$OUT/abi.log" 2>&1
+ABI=$?
+set -e
+cat "$OUT/abi.log"
+[ "$RC" = 0 ] && [ "$ABI" = 0 ]

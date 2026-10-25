@@ -386,9 +386,6 @@ impl ComputeCommandEncoder {
         if !c.push_holes.is_empty() {
             return Err(not_yet(format!("push holes {:?} (device addresses the shader reads)", c.push_holes)));
         }
-        if !self.table.threadgroup.is_empty() {
-            return Err(not_yet("threadgroup memory lengths set on the encoder"));
-        }
         let mut used = Vec::new();
         let stages = [StageRef { program: &p.0.program, metal: Stage::Kernel, table: &self.table }];
         let binds = resolve(&device, &stages, &plan, &c.descriptor_ranges, None, &mut used)?;

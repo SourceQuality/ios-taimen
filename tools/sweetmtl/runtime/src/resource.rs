@@ -196,8 +196,8 @@ fn new_sg_buffer(device: &Device, length: u64) -> Result<SgBuffer, Error> {
     if length > device.properties().max_buffer_length {
         return Err(invalid(format!("buffer of {length} bytes is past maxBufferLength")));
     }
-    // SAFETY: valid device.
-    let sg = unsafe { ffi::sg_buffer_new(device.gpu().sg, length.max(1)) };
+    // SAFETY: valid device. The binder binds ranges of a buffer rounded up to 16 bytes (its padding).
+    let sg = unsafe { ffi::sg_buffer_new(device.gpu().sg, length.max(1).div_ceil(16) * 16) };
     if sg.is_null() {
         return Err(gallium("buffer"));
     }

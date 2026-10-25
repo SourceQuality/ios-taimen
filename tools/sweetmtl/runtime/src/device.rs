@@ -12,9 +12,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// The device profile the translator targets (tools/sweetmtl/m0/a540-gallium.json: what Gallium
-/// a5xx provides or emulates). `SWEETMTL_PROFILE=path` replaces it, for experiments.
-static PROFILE: &str = include_str!("../../m0/a540-gallium.json");
+/// The device profile the translator targets: tools/sweetmtl/profile/a540-gallium.json, M0's profile (what Gallium a5xx
+/// provides or emulates) with the format table freedreno states for the a540 (profile/make-profile.py).
+/// `SWEETMTL_PROFILE=path` replaces it, for experiments.
+static PROFILE: &str = include_str!("../../profile/a540-gallium.json");
 
 /// The Metal release whose measured answers a level stands for (kept for the bridge's options;
 /// this runtime answers from the device, not from a measured Apple GPU).

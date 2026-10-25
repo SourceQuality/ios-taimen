@@ -144,17 +144,71 @@ pub(crate) struct StageProgram {
     spirv: Arc<[u32]>,
     entry: CString,
     pub(crate) bindings: Vec<ffi::sg_binding>,
+    /// The layout's immutable samplers this stage sees (a function's constexpr samplers): set,
+    /// binding, Gallium sampler. Bound whether or not the plan writes their descriptor.
+    pub(crate) immutable: Vec<(u32, u32, Arc<SgSampler>)>,
     defaults: Spec,
     variants: Mutex<Vec<(Spec, Arc<Shader>)>>,
 }
 
+/// A Gallium sampler for a layout's immutable sampler (Vulkan's description of a constexpr one).
+pub(crate) fn sampler_from_vk(device: &Device, s: &vk::SamplerDesc) -> Result<Arc<SgSampler>, Error> {
+    // VkSamplerAddressMode -> MTLSamplerAddressMode
+    let address = |m: vk::SamplerAddressMode| -> Result<u32, Error> {
+        Ok(match m.as_raw() {
+            0 => 2, // repeat
+            1 => 3, // mirrored repeat
+            2 => 0, // clamp to edge
+            3 => 5, // clamp to border
+            4 => 1, // mirror clamp to edge
+            other => return Err(not_yet(format!("sampler address mode {other}"))),
+        })
+    };
+    if s.mip_lod_bias != 0.0 {
+        return Err(not_yet("a constexpr sampler with a LOD bias"));
+    }
+    // VkBorderColor: float/int transparent black 0/1, opaque black 2/3, opaque white 4/5
+    let border = s.border_color.as_raw() as u32;
+    let desc = ffi::sg_sampler_desc {
+        min_filter: s.min_filter.as_raw() as u32,
+        mag_filter: s.mag_filter.as_raw() as u32,
+        mip_filter: s.mipmap_mode.as_raw() as u32 + 1,
+        s_address: address(s.address_mode_u)?,
+        t_address: address(s.address_mode_v)?,
+        r_address: address(s.address_mode_w)?,
+        border: border / 2,
+        normalized: 1,
+        max_anisotropy: s.max_anisotropy.map_or(1, |a| a as u32),
+        compare: s.compare.map_or(0, |c| c.as_raw() as u32),
+        compare_enable: s.compare.is_some() as u32,
+        integer_border: border % 2,
+        lod_min: s.min_lod,
+        lod_max: s.max_lod,
+    };
+    // SAFETY: valid device and descriptor.
+    let sg = unsafe { ffi::sg_sampler_new(device.gpu().sg, &desc) };
+    if sg.is_null() {
+        return Err(gallium("constexpr sampler"));
+    }
+    Ok(Arc::new(SgSampler { sg }))
+}
+
 impl StageProgram {
-    fn new(stage: u32, module: &metal2vulkan::pipeline::StageModule, layout: &PipelineLayout) -> Result<StageProgram, Error> {
+    fn new(device: &Device, stage: u32, module: &metal2vulkan::pipeline::StageModule, layout: &PipelineLayout)
+           -> Result<StageProgram, Error> {
         let bit = match stage {
             ffi::SG_VERTEX => vk::ShaderStageFlags::VERTEX,
             ffi::SG_FRAGMENT => vk::ShaderStageFlags::FRAGMENT,
             _ => vk::ShaderStageFlags::COMPUTE,
         };
+        let mut immutable = Vec::new();
+        for set in &layout.sets {
+            for b in &set.bindings {
+                if let (true, Some(s)) = (b.stages.intersects(bit), &b.immutable_sampler) {
+                    immutable.push((set.set, b.binding, sampler_from_vk(device, s)?));
+                }
+            }
+        }
         let defaults = module
             .specialization
             .constants
@@ -168,9 +222,14 @@ impl StageProgram {
             spirv: module.spirv.clone(),
             entry: CString::new(module.entry_point.clone()).map_err(|_| invalid("entry point name"))?,
             bindings: assign_slots(layout, bit, stage)?,
+            immutable,
             defaults,
             variants: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(crate) fn immutable_sampler(&self, set: u32, binding: u32) -> Option<&Arc<SgSampler>> {
+        self.immutable.iter().find(|(s, b, _)| *s == set && *b == binding).map(|(_, _, s)| s)
     }
 
     /// The CSO for `spec` (over the stage's defaults), compiled now if this is its first use.
@@ -370,7 +429,7 @@ impl Device {
         if pipeline.stage.stage != vk::ShaderStage::COMPUTE {
             return Err(not_yet(format!("a compute pipeline of stage {:?}", pipeline.stage.stage)));
         }
-        let program = StageProgram::new(ffi::SG_COMPUTE, &pipeline.stage, &pipeline.layout)?;
+        let program = StageProgram::new(self, ffi::SG_COMPUTE, &pipeline.stage, &pipeline.layout)?;
         program.shader(self, &Vec::new())?;
         self.message(MessageSeverity::Info, "metal2vulkan-pipeline-creation",
                      format!("compute pipeline made in {:.3} ms", began.elapsed().as_secs_f64() * 1000.0));
@@ -450,8 +509,8 @@ impl Device {
         let mut fs = None;
         for stage in &pipeline.stages {
             match stage.stage {
-                vk::ShaderStage::VERTEX => vs = Some(StageProgram::new(ffi::SG_VERTEX, stage, &pipeline.layout)?),
-                vk::ShaderStage::FRAGMENT => fs = Some(StageProgram::new(ffi::SG_FRAGMENT, stage, &pipeline.layout)?),
+                vk::ShaderStage::VERTEX => vs = Some(StageProgram::new(self, ffi::SG_VERTEX, stage, &pipeline.layout)?),
+                vk::ShaderStage::FRAGMENT => fs = Some(StageProgram::new(self, ffi::SG_FRAGMENT, stage, &pipeline.layout)?),
                 other => return Err(not_yet(format!("a render stage {other:?}"))),
             }
         }

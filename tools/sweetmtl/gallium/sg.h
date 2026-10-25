@@ -85,6 +85,23 @@ void sg_unlock(struct sg_device *dev);
 /* Whether the device takes `vk_format` for every use in `usage` at `samples` (0/1 single). */
 bool sg_format_supported(struct sg_device *dev, uint32_t vk_format, uint32_t usage,
                          uint32_t samples);
+/* What the device does with `vk_format` (the a540's answers, from freedreno's format tables):
+ * SG_FEAT_* bits. The device profile's format table is made of them (profile/make-profile.py). */
+#define SG_FEAT_SAMPLED 0x1u
+#define SG_FEAT_FILTER 0x2u
+#define SG_FEAT_STORAGE 0x4u
+#define SG_FEAT_STORAGE_ATOMIC 0x8u
+#define SG_FEAT_COLOR 0x10u
+#define SG_FEAT_BLEND 0x20u
+#define SG_FEAT_DEPTH_STENCIL 0x40u
+#define SG_FEAT_LINEAR 0x80u
+#define SG_FEAT_VERTEX 0x100u
+#define SG_FEAT_UNIFORM_TEXEL 0x200u
+#define SG_FEAT_STORAGE_TEXEL 0x400u
+#define SG_FEAT_SAMPLES_2 0x800u
+#define SG_FEAT_SAMPLES_4 0x1000u
+#define SG_FEAT_SAMPLES_8 0x2000u
+uint32_t sg_format_features(struct sg_device *dev, uint32_t vk_format);
 /* Bytes, width and height of a block (a texel for uncompressed formats); 0 for unknown. */
 uint32_t sg_format_block_bytes(uint32_t vk_format);
 uint32_t sg_format_block_width(uint32_t vk_format);

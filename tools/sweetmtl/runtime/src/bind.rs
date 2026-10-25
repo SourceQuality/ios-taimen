@@ -243,7 +243,8 @@ fn table<'a>(stages: &'a [StageRef<'a>], slot: &SlotRef) -> Result<&'a Table, Er
         .ok_or_else(|| not_yet(format!("a descriptor of stage {:?} this command does not run", slot.stage)))
 }
 
-fn sampler_of(device: &Device, stages: &[StageRef], source: &SamplerSource) -> Result<Arc<SgSampler>, Error> {
+fn sampler_of(device: &Device, stages: &[StageRef], source: &SamplerSource, program: &StageProgram, set: u32, binding: u32)
+              -> Result<Arc<SgSampler>, Error> {
     match source {
         SamplerSource::Slot { slot, compare, integer, .. } => {
             let t = table(stages, slot)?;
@@ -254,7 +255,10 @@ fn sampler_of(device: &Device, stages: &[StageRef], source: &SamplerSource) -> R
             s.sg(*compare, *integer)
         }
         SamplerSource::Neutral(_) => neutral_sampler(device),
-        SamplerSource::Immutable => Err(not_yet("immutable samplers (a function's constexpr sampler in a combined descriptor)")),
+        SamplerSource::Immutable => program
+            .immutable_sampler(set, binding)
+            .cloned()
+            .ok_or_else(|| invalid(format!("an immutable sampler at ({set}, {binding}) the layout lacks"))),
     }
 }
 
@@ -342,10 +346,10 @@ pub(crate) fn resolve(device: &Device, stages: &[StageRef], plan: &BindingPlan, 
                 }
                 WriteSource::Sampler { slot: mslot, compare, integer, opaque_black } => {
                     let source = SamplerSource::Slot { slot: *mslot, compare: *compare, integer: *integer, opaque_black: *opaque_black };
-                    BindRes::Sampler(sampler_of(device, stages, &source)?)
+                    BindRes::Sampler(sampler_of(device, stages, &source, s.program, w.set, w.binding)?)
                 }
                 WriteSource::CombinedImageSampler { image, sampler } => {
-                    BindRes::Combined(image_of(stages, image)?, sampler_of(device, stages, sampler)?)
+                    BindRes::Combined(image_of(stages, image)?, sampler_of(device, stages, sampler, s.program, w.set, w.binding)?)
                 }
                 WriteSource::Attachment { color_index } => {
                     let a = attachments
@@ -357,6 +361,20 @@ pub(crate) fn resolve(device: &Device, stages: &[StageRef], plan: &BindingPlan, 
                 other => return Err(not_yet(format!("descriptor source {other:?}"))),
             };
             out.push(Bind { stage: s.program.stage, cls: b.cls, slot, sampler_slot, res });
+        }
+    }
+    // Immutable samplers of sampler-only descriptors take no write (Vulkan's rule): bind them.
+    for s in stages {
+        for (set, binding, sampler) in &s.program.immutable {
+            let Some(b) = s.program.binding(*set, *binding) else { continue };
+            if b.cls != ffi::SG_CLASS_SAMPLER {
+                continue;
+            }
+            let written = out.iter().any(|o| o.stage == s.program.stage && o.cls == b.cls && o.sampler_slot == b.sampler_slot);
+            if !written {
+                out.push(Bind { stage: s.program.stage, cls: b.cls, slot: 0, sampler_slot: b.sampler_slot,
+                                res: BindRes::Sampler(sampler.clone()) });
+            }
         }
     }
     Ok(out)
