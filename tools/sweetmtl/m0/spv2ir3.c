@@ -332,17 +332,18 @@ main(int argc, char **argv)
             nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo |
                nir_var_mem_push_const,
             NULL);
-   nir->info.num_ubos = s.next[C_UBO] + 1;
-   nir->info.num_ssbos = s.next[C_SSBO];
-   nir->info.num_textures = s.next[C_TEX];
-   nir->info.num_images = s.next[C_IMG];
-
    nir_assign_io_var_locations(nir, nir_var_shader_in);
    nir_assign_io_var_locations(nir, nir_var_shader_out);
    ir3_nir_lower_io(nir);
 
    /* ir3_screen_finalize_nir, then the Gallium shader state */
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   /* after gather_info, which recounts textures and images from the (removed) variables: 0 put
+    * images' texture slots on texture 0 (gallium/sg_shader.c, the same fix) */
+   nir->info.num_ubos = s.next[C_UBO] + 1;
+   nir->info.num_ssbos = s.next[C_SSBO];
+   nir->info.num_textures = s.next[C_TEX];
+   nir->info.num_images = s.next[C_IMG];
    if (getenv("SPV2IR3_PRE"))
       nir_print_shader(nir, stderr);
    const struct ir3_shader_nir_options fopts = {};

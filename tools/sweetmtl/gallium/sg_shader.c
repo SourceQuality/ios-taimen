@@ -565,7 +565,6 @@ translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shade
             nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo |
                nir_var_mem_push_const,
             NULL);
-   count_slots(d, nir);
 
    nir_assign_io_var_locations(nir, nir_var_shader_in);
    nir_assign_io_var_locations(nir, nir_var_shader_out);
@@ -578,6 +577,12 @@ translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shade
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    }
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   /* after gather_info, which recounts num_textures/num_images from the variables (gone by now:
+    * 0). ir3 places an image's texture slot (a5xx: image size queries, read-only image loads)
+    * at num_textures + n: with 0 it took the slot of texture 0, and fd5 emits images' texture
+    * state after the textures', so the kernel's texture 0 read the image (mtlabitest, boot 164:
+    * compute on storage textures, texel 0 read dst's contents). */
+   count_slots(d, nir);
    if (getenv("SG_PRINT_NIR"))
       nir_print_shader(nir, stderr);
    /* ir3_screen_finalize_nir: what the state tracker runs before making a CSO (softpipe has
