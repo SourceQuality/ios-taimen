@@ -266,10 +266,30 @@ pub(crate) fn trace(line: std::fmt::Arguments) {
     let text = format!("sweetmtl: {line}\n");
     eprint!("{text}");
     #[cfg(target_os = "ios")]
-    if let Ok(mut null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
-        use std::io::Write;
-        let _ = null.write_all(text.as_bytes());
+    if !stderr_is_dev_null() {
+        if let Ok(mut null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+            use std::io::Write;
+            let _ = null.write_all(text.as_bytes());
+        }
     }
+}
+
+/// Whether stderr is /dev/null already (a launchd job's), so the trace line reached the kernel's
+/// tee once and needs no second write.
+#[cfg(target_os = "ios")]
+fn stderr_is_dev_null() -> bool {
+    static NULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NULL.get_or_init(|| {
+        // SAFETY: plain stat calls into zeroed structs.
+        unsafe {
+            let mut err: libc::stat = std::mem::zeroed();
+            let mut null: libc::stat = std::mem::zeroed();
+            libc::fstat(2, &mut err) == 0
+                && libc::stat(c"/dev/null".as_ptr(), &mut null) == 0
+                && (err.st_mode & libc::S_IFMT) == libc::S_IFCHR
+                && err.st_rdev == null.st_rdev
+        }
+    })
 }
 
 /// A process-unique id for a resource (never reused).
