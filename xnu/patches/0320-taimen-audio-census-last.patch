@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index d803ce7..876a53b 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -1877,13 +1877,14 @@ audio_thread(void *arg, wait_result_t)
+ 		if (!m4 && adsp_core_state == 1 && apr_versions_done) {
+ 			m4 = true;
+ 			LOG("t=%u.%03u 4: M4 ADSP core ready, service versions read", T);
++			if (level >= 6) {
++				(void)stage6();
++			}
++			/* SMMU reads can hang an unclocked bus: on request, and after the AFE test */
+ 			int census = 0;
+ 			(void)PE_parse_boot_argn("taimenaudiosmmu", &census, sizeof(census));
+ 			if (level >= 5 && census != 0) {
+-				(void)stage5();         /* SMMU reads can hang an unclocked bus: on request */
+-			}
+-			if (level >= 6) {
+-				(void)stage6();
++				(void)stage5();
+ 			}
+ 		}
+ 		if (slave != NULL && (*slave & SLAVE_ERR_FATAL) != 0) {
