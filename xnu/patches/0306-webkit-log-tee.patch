@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index c467155..088bd2c 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -176,6 +176,19 @@ sweet_null_tee(char *name, size_t len)
+ 	}
+ 	proc_selfname(name, (int)len);
+ 	size_t n = strlen(name);
++	/*
++	 * 0306: always our own daemons (netsvcd*, tools/phone), and with sweetwklog=1 WebKit's
++	 * processes and MobileSafari (their os_log mirrored to stderr, bsd/kern/kern_exec.c).
++	 */
++	static int wklog = -1;
++	if (wklog < 0) {
++		wklog = 0;
++		(void)PE_parse_boot_argn("sweetwklog", &wklog, sizeof(wklog));
++	}
++	if (strncmp(name, "netsvcd", 7) == 0 ||
++	    (wklog && (strncmp(name, "com.apple.WebKit", 16) == 0 || strcmp(name, "MobileSafari") == 0))) {
++		return true;
++	}
+ 	for (const char *t = sweet_null_names; *t;) {
+ 		const char *end = strchr(t, ',');
+ 		size_t tl = end ? (size_t)(end - t) : strlen(t);
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 848e6ac..38ef7f3 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -486,6 +486,38 @@ sweet_exec_denied(const char *name)
+  * without editing launchd.plist on the phone). Several NAME:... entries
+  * are separated by ';'.
+  */
++/*
++ * 0306: boot-arg sweetwklog=1: WebKit's processes and MobileSafari mirror their os_log and CFLog
++ * messages to stderr (as under Xcode), which is /dev/null for them and teed into the kernel log
++ * (bsd/dev/mem.c). The boot-args have no room for it in sweetenv (607 bytes, ROOT=1 + GPU boots).
++ */
++static int
++sweet_exec_wklog(struct image_params *imgp, int ptr_size, const char *base)
++{
++	static int wklog = -1;
++	if (wklog < 0) {
++		wklog = 0;
++		(void)PE_parse_boot_argn("sweetwklog", &wklog, sizeof(wklog));
++	}
++	if (!wklog || (strncmp(base, "com.apple.WebKit.", 17) != 0 && strcmp(base, "MobileSafari") != 0)) {
++		return 0;
++	}
++	static const char *const vars[] = { "OS_ACTIVITY_DT_MODE=YES", "CFLOG_FORCE_STDERR=1" };
++	for (unsigned i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
++		int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(vars[i]), UIO_SYSSPACE, TRUE);
++		if (error) {
++			return error;
++		}
++		if (imgp->ip_argspace < ptr_size) {
++			return E2BIG;
++		}
++		imgp->ip_argspace -= ptr_size;
++		imgp->ip_envc++;
++	}
++	printf("SWEET ENV: %s += OS_ACTIVITY_DT_MODE=YES CFLOG_FORCE_STDERR=1 (sweetwklog)\n", base);
++	return 0;
++}
++
+ static int
+ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ {
+@@ -494,15 +526,16 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ 	if (state == 0) {
+ 		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
+ 	}
+-	if (state != 2) {
+-		return 0;
+-	}
+ 	const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
+ 	for (const char *c = path; *c; c++) {
+ 		if (*c == '/') {
+ 			base = c + 1;
+ 		}
+ 	}
++	int wkerr = sweet_exec_wklog(imgp, ptr_size, base);
++	if (wkerr != 0 || state != 2) {
++		return wkerr;
++	}
+ 	const char *entry = spec;
+ 	for (;;) {
+ 		size_t n = 0;

@@ -135,13 +135,13 @@ class Blob:
 def launchd(plist, daemons=()):
     """sweet-root-tweaks.py launchd(): no panics on crashes, no baseband/FairPlay/diagnostics jobs.
     daemons: (label, argv) jobs of ours to add (--daemon), run as root at load, kept alive,
-    stdout/stderr on /dev/console (the kernel log)."""
+    stdout/stderr on /dev/null, which xnu 0306 tees into the kernel log for netsvcd*."""
     jobs = plist['LaunchDaemons']
     for label, argv in daemons:
         jobs[f'/System/Library/LaunchDaemons/{label}.plist'] = {
             'Label': label, 'ProgramArguments': argv, 'RunAtLoad': True, 'KeepAlive': True,
             'ThrottleInterval': 10, 'UserName': 'root',
-            'StandardOutPath': '/dev/console', 'StandardErrorPath': '/dev/console'}
+            'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
         print(f'launchd.plist: job {label} added: {" ".join(argv)}')
     renamed = 0
     for job in jobs.values():
