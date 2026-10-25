@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fa4faa0..48cde19 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -847,6 +847,19 @@ ud_tx_kick_locked(void)
+ static errno_t
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
++	/*
++	 * 0303: the first IPv4 packets for addresses off the link: proof that iOS routes through the PC
++	 * (netsvcd made ue0 the primary service). Multicast and broadcast do not count.
++	 */
++	static unsigned offlink;
++	uint8_t h[38];
++	if (offlink < 12 && mbuf_pkthdr_len(m) >= sizeof(h) && mbuf_copydata(m, 0, sizeof(h), h) == 0 &&
++	    h[12] == 0x08 && h[13] == 0x00 && h[14] == 0x45 && !(h[30] == 192 && h[31] == 168 && h[32] == 7) &&
++	    h[30] < 224 && !(h[30] == 127)) {
++		offlink++;
++		printf("SWEET USB: off-link packet %u: to %u.%u.%u.%u proto %u port %u\n", offlink, h[30], h[31], h[32],
++		    h[33], h[23], (h[23] == 6 || h[23] == 17) ? (unsigned)(h[36] << 8 | h[37]) : 0);
++	}
+ 	lck_mtx_lock(ud.lock);
+ 	if (ud.txq_count == UD_TXQ || !ud.configured) {
+ 		lck_mtx_unlock(ud.lock);
