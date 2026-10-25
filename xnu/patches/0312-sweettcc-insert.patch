@@ -1,0 +1,121 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 9a2b34b..136e036 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -497,6 +497,25 @@ sweet_exec_denied(const char *name)
+  */
+ bool sweet_logp_match(const char *name);
+ 
++/* NAME in a comma-separated list */
++static bool
++sweet_name_in(const char *list, const char *name)
++{
++	size_t n = strlen(name);
++	for (const char *t = list; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
+ bool
+ sweet_logp_match(const char *name)
+ {
+@@ -549,26 +568,63 @@ sweet_exec_wklog(struct image_params *imgp, int ptr_size, const char *base)
+ 	}
+ 	printf("SWEET ENV: %s += OS_ACTIVITY_DT_MODE=YES CFLOG_FORCE_STDERR=1 (%s)\n", base,
+ 	    webkit ? "sweetwklog" : "sweetlogp");
+-	/*
+-	 * 0311: sweetlogp processes also get sweetexc.dylib (tools/phone/sweetexc.m), which prints an
+-	 * uncaught exception's name, reason and throw-site backtrace before the process dies; only when
+-	 * the file is there (dyld refuses to start a process whose inserted library is missing).
+-	 */
+-	static const char exc[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetexc.dylib";
+-	vnode_t lib = NULLVP;
+-	if (!webkit && vnode_lookup(exc + sizeof("DYLD_INSERT_LIBRARIES=") - 1, 0, &lib, vfs_context_kernel()) == 0) {
+-		vnode_put(lib);
+-		int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(exc), UIO_SYSSPACE, TRUE);
+-		if (error) {
+-			return error;
++	return 0;
++}
++
++/*
++ * Libraries of ours for some processes, as one DYLD_INSERT_LIBRARIES, each only when its file is
++ * there (dyld refuses to start a process whose inserted library is missing):
++ *   0311 sweetexc.dylib for the sweetlogp processes: an uncaught exception's name, reason and
++ *        throw site before the process dies (tools/phone/sweetexc.m)
++ *   0312 sweettcc.dylib for the sweettcc processes (default: the Photos stack): TCCAccessPreflight
++ *        that agrees with tccd's audit token check (tools/phone/sweettcc.c; tccd denies every
++ *        preflight on taimen, boot 144)
++ */
++static int
++sweet_exec_insert(struct image_params *imgp, int ptr_size, const char *base)
++{
++	static char tcc[160];
++	static int tcc_state;
++	if (tcc_state == 0) {
++		tcc_state = 1;
++		if (!PE_parse_boot_argn("sweettcc", tcc, sizeof(tcc))) {
++			strlcpy(tcc, "assetsd,MobileSlideShow,photoanalysisd,mediaanalysisd,cloudphotod,photolibraryd", sizeof(tcc));
++		}
++	}
++	static const struct {
++		const char *path;
++		bool (*want)(const char *name);
++	} libs[] = {
++		{ "/usr/local/lib/sweetexc.dylib", sweet_logp_match },
++		{ "/usr/local/lib/sweettcc.dylib", NULL },
++	};
++	char var[160] = "DYLD_INSERT_LIBRARIES=";
++	size_t empty = strlen(var);
++	for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); i++) {
++		bool want = libs[i].want ? libs[i].want(base) : sweet_name_in(tcc, base);
++		vnode_t lib = NULLVP;
++		if (!want || vnode_lookup(libs[i].path, 0, &lib, vfs_context_kernel()) != 0) {
++			continue;
+ 		}
+-		if (imgp->ip_argspace < ptr_size) {
+-			return E2BIG;
++		vnode_put(lib);
++		if (strlen(var) > empty) {
++			strlcat(var, ":", sizeof(var));
+ 		}
+-		imgp->ip_argspace -= ptr_size;
+-		imgp->ip_envc++;
+-		printf("SWEET ENV: %s += %s\n", base, exc);
++		strlcat(var, libs[i].path, sizeof(var));
++	}
++	if (strlen(var) == empty) {
++		return 0;
+ 	}
++	int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++	if (error) {
++		return error;
++	}
++	if (imgp->ip_argspace < ptr_size) {
++		return E2BIG;
++	}
++	imgp->ip_argspace -= ptr_size;
++	imgp->ip_envc++;
++	printf("SWEET ENV: %s += %s\n", base, var);
+ 	return 0;
+ }
+ 
+@@ -587,6 +643,9 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ 		}
+ 	}
+ 	int wkerr = sweet_exec_wklog(imgp, ptr_size, base);
++	if (wkerr == 0) {
++		wkerr = sweet_exec_insert(imgp, ptr_size, base);
++	}
+ 	if (wkerr != 0 || state != 2) {
+ 		return wkerr;
+ 	}

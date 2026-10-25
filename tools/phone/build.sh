@@ -5,6 +5,7 @@
 #   netsvcd   USB Ethernet as iOS's primary network service (launchd job com.sweet.netsvcd)
 #   sweetexc.dylib  prints why a process dies of an uncaught exception (xnu 0311 inserts it)
 #   tcctest   what tccd answers an entitled platform process (launchd job com.sweet.tcctest)
+#   sweettcc.dylib  TCCAccessPreflight that agrees with tccd's audit token check (xnu 0312 inserts it)
 set -euo pipefail
 cd "$(dirname "$0")"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -23,3 +24,4 @@ build() {	# NAME SOURCE [FLAGS...]
 build netsvcd netsvcd.c -framework CoreFoundation -framework SystemConfiguration
 build sweetexc.dylib sweetexc.m -dynamiclib -install_name /usr/local/lib/sweetexc.dylib -fobjc-arc -framework Foundation
 build tcctest tcctest.c -framework CoreFoundation
+build sweettcc.dylib sweettcc.c -dynamiclib -install_name /usr/local/lib/sweettcc.dylib TCC.tbd -framework CoreFoundation
