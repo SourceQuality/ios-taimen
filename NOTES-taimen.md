@@ -1028,3 +1028,19 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (phonectl.py tapc 562 2128, type, enter): Wikipedia's front page drew in full. Safari restored apple.com
   after the reboot and drew it too. DNS through the agent (netsvcd 127.0.0.1:53 -> CONNECT 1.1.1.1:53):
   74 queries, 0 failed in the first two minutes; 103 app connections spliced, 0 without an agent.
+- 2026-10-25 boots 139-141 (r128-r129 = +0309/0310; sweetlogp via the ADT): why things fail.
+  bluetoothd: "No bluetooth on this device" (no device tree bluetooth node), so it exits and launchd relaunches
+  it (21 times in boot 138). mediaserverd: its image decoder rejects our pixel buffers ("Pixel buffer needs to
+  be at least 1536x512, but got 1326x1160", "OOB destination for 512x512 tile ... with 0/0 edge": it decodes in
+  512-pixel tiles into buffers without extended pixels); it aborted once (boot 138) on an uncaught C++ exception
+  in a dispatch block. Podcasts: a Swift trap in PodcastsUI (sig 5, no message). AegirPoster (the lock screen's
+  poster) dies of an NSException every ~8 s (96 times in 13 minutes), assetsd and Photos (MobileSlideShow) of
+  NSExceptions too, MusicWidgets and Music of SIGSEGV. libc++abi only says "uncaught exception of type
+  NSException": xnu 0311 + tools/phone/sweetexc.dylib print name, reason and throw site next.
+  **App survey (boot 141, tools/taimen/appsurvey.sh over the remote control):** open and draw: Calendar, Mail,
+  Notes, Reminders, Clock (World Clock), News, TV, App Store, Maps (its intro), Wallet, Settings, Phone (keypad),
+  Messages (compose), Safari. Do not open: Photos, Music, Podcasts. FaceTime: black. Location Services is off,
+  so Reminders and Maps raise an alert that also blocks the home gesture until it is answered.
+  Boot-args: ROOT=1 + GPU + sweetusb + sweetlogp came to 643 of 607 bytes (boot 139 refused to start); xnu 0309
+  reads /chosen sweet-boot-args (TAIMEN_ADT_ARGS) for what the command line lacks. 0310 joins partial
+  /dev/null writes into lines.
