@@ -28,10 +28,13 @@ Not stored locally (read online on 2026-10-25, cite by file name):
 | 9 /dev/redwood-audio, feeder | xnu 0323 | sessions open on frames and close after 3 s; 0 dropped, 0 DSP underflows |
 | 10 RedwoodAudio plug-in | tools/phone/RedwoodAudio, mkrootfix --hal-plugin | loads in mediaserverd on the install boot; Safari's MP4 audible |
 
-Defaults since xnu 0326: taimenaudio=9 with the stream 1 bank; boot-xnu.sh adds the blobs unless AUDIO=0; the
-default GPU ROOTFIX carries the plug-in. Level cap taimenaudiobelow=160 (-20 dB) until it has been heard.
-Not yet: microphones (WCD9340 over SLIMbus), haptics (PMI8998, in progress), firmware from the root instead of
-the payload, earpiece routing for calls.
+Defaults since xnu 0326: taimenaudio=9 with the stream 1 bank; the default GPU ROOTFIX carries the plug-in.
+Level cap taimenaudiobelow=160 (-20 dB) until it has been heard. Since xnu 0330 the firmware comes from
+/usr/standalone/firmware/taimen-audio in the iOS root (installed once with `mkrootfix.py --audio-fw`, boot 162),
+so boot-xnu.sh adds the payload blobs only with AUDIO=1 (a phone without them in its root).
+Haptics: the DRV2624 behind /dev/redwood-haptic (xnu 0328) plays iOS's Actuator stream since boot 165
+(mkadt.py's /product/haptics, MobileGestalt cache rebuilt once).
+Not yet: microphones (WCD9340 over SLIMbus), earpiece routing for calls.
 
 ## 0. Verdict in one paragraph
 

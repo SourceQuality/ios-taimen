@@ -114,10 +114,12 @@ fi
 # AUDIOFW=DIR: the ADSP and TAS2557 firmware for taimenaudio>=1 (xnu 0317, docs/taimen-audio-plan.md
 # stage 1; pulled by the log reader as fw-adsp.* / fw-tas2557s_*, the calibration from persist, kept in
 # ../research/taimen/firmware, never in git): ADSP-MDT, ADSP-Bnn, TAS-FW, TAS-CAL, ~9.4 MB of payload.
-# Sound is the kernel's default since xnu 0326 (taimenaudio=9): the blobs go in unless AUDIO=0 or
-# taimenaudio=0.
+# Sound is the kernel's default since xnu 0326 (taimenaudio=9). Since xnu 0330 TaimenAudio reads the
+# same files from /usr/standalone/firmware/taimen-audio in the iOS root when the payload has none
+# (installed once by a ROOTFIX made with mkrootfix.py --audio-fw, boot 162): so the blobs go in only
+# with AUDIO=1 (a phone without them in its root), and never with taimenaudio=0.
 audio=$(echo "$cmdline ${TAIMEN_ADT_ARGS:-}" | sed -n 's/.*taimenaudio=\([0-9]*\).*/\1/p')
-[ "${AUDIO:-1}" = 0 ] && audio=0
+[ "${AUDIO:-0}" = 1 ] || audio=0
 AUDIOFW=${AUDIOFW:-$P/../research/taimen/firmware}
 if [ "${audio:-9}" -ge 1 ] && [ -f "$AUDIOFW/adsp.mdt" ]; then
 	blobs+=(--blob "ADSP-MDT=$AUDIOFW/adsp.mdt")
