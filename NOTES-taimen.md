@@ -1044,3 +1044,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Boot-args: ROOT=1 + GPU + sweetusb + sweetlogp came to 643 of 607 bytes (boot 139 refused to start); xnu 0309
   reads /chosen sweet-boot-args (TAIMEN_ADT_ARGS) for what the command line lacks. 0310 joins partial
   /dev/null writes into lines.
+- 2026-10-25 boots 142-144 (r130 = +0311, sweetexc.dylib, tcctest): the reasons. **assetsd** dies of
+  "NSInternalInconsistencyException: assetsd requires TCCPhotosService access": it calls
+  [[PLPrivacy sharedInstance] photosAccessAllowedWithScope:7], which preflights kTCCServicePhotos
+  (_isPhotosAccessAllowedWithScope:promptIfUnknown:synchronous:resultHandler: -> _authStatusForScope: ->
+  TCCAccessPreflight), and throws on anything but granted (assetsd itself holds com.apple.private.tcc.allow for
+  Photos). **Photos** (MobileSlideShow) then asserts "assetsDataSourceManager.dataSource.numberOfSections == 1".
+  **Music** and MusicWidgets crash in -[MPMediaLibrary _MediaLibrary_coreLibrary] on [[self databasePath]
+  lastPathComponent].UTF8String = NULL (no media library database path; /var/mobile/Media/iTunes_Control/iTunes
+  exists, empty). **tcctest** (tools/phone; the same entitlement; csops VALID|SIGNED|PLATFORM):
+  TCCAccessCheckAuditToken grants Photos and Contacts and not Camera or Microphone, exactly as entitled, but
+  TCCAccessPreflight answers "denied" for all four: tccd honours entitlements but its preflight path fails
+  (identity lookup? still open). 0312 + sweettcc.dylib: preflight agrees with the audit token check, inserted
+  into the Photos stack. New tools: tools/sweetgl/dsc-dis.py by address, mkrootfix.py --mkdir, the contact sheet
+  and Mach-O disassembly scripts (scratch). AegirPoster did not crash in boots 142-143.
