@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index f708376..ab03cd4 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -2644,7 +2644,10 @@ audio_thread(void *arg, wait_result_t)
+ 			}
+ 			int addr = 0;
+ 			(void)PE_parse_boot_argn("taimenaudioaddr", &addr, sizeof(addr));
+-			if (level >= 8 && m6 && (m5 || addr == 1)) {
++			/* the 3 s test tone: at level 8, or with taimenaudiotone=1 (0327: not a beep every boot) */
++			int tone = level == 8;
++			(void)PE_parse_boot_argn("taimenaudiotone", &tone, sizeof(tone));
++			if (level >= 8 && tone != 0 && m6 && (m5 || addr == 1)) {
+ 				(void)stage8();
+ 				lpass_smmu_faults("after the stream");
+ 			}
