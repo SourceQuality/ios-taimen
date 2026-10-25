@@ -75,6 +75,11 @@ if [ -n "$vd" ] && [ -b "/dev/$vd" ]; then
 			[ -f "/vendor/firmware/$f" ] && cp "/vendor/firmware/$f" "/out/fw-$f"
 		done
 		ls -lR /vendor/firmware/wlan > /out/fw-wlan-list.txt 2>&1
+		# the ADSP and TAS2557 speaker-amp firmware (docs/taimen-audio-plan.md stage 1), ~9.4 MB,
+		# and the Android audio routing tables (open question 5)
+		for f in /vendor/firmware/adsp.* /vendor/firmware/tas2557s_*.bin /vendor/etc/mixer_paths*.xml /vendor/etc/audio_platform_info*.xml; do
+			[ -f "$f" ] && cp "$f" "/out/fw-$(basename "$f")"
+		done
 		umount /vendor
 		log "vendor /dev/$vd: $(ls /out | grep -c '^fw-a5') GPU and $(ls /out | grep -c '^fw-wlanmdsp\|^fw-bdwlan\|^fw-modemuw') WLAN firmware files copied"
 	else
