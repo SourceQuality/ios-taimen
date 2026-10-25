@@ -189,6 +189,10 @@ def main():
     ap.add_argument('--phone-tools', metavar='DIR',
                     help='install the phone-tools CI build in DIR (tools/windows/ci-phone-tools.sh): '
                          'netsvcd as /usr/local/bin/netsvcd-HASH with its launchd job, sweetexc.dylib')
+    ap.add_argument('--hal-plugin', metavar='DIR',
+                    help='install the RedwoodAudio HAL plug-in from a phone-tools build in DIR (RedwoodAudio + '
+                         'RedwoodAudio.plist): /System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver, executable '
+                         'RedwoodAudio-HASH, Info.plist rewritten every boot to name it (docs/taimen-audio-plan.md 1.4)')
     ap.add_argument('--daemon', action='append', default=[], metavar='LABEL=/PATH[,ARG...]',
                     help='add a launchd job of ours (RunAtLoad, KeepAlive, output to the console)')
     a = ap.parse_args()
@@ -204,6 +208,20 @@ def main():
         if os.path.exists(exc):
             a.zfile.append(f'/usr/local/lib/sweetexc.dylib={exc}')
         print(f'--phone-tools: netsvcd-{tag}' + (', sweetexc.dylib' if os.path.exists(exc) else ''))
+    hal = None
+    if a.hal_plugin:
+        # The HAL loads every .driver it finds, so the bundle directory keeps one name and the
+        # executable carries the build's hash (ROOTFIX only creates absent files); Info.plist is
+        # rewritten each boot to point at it.
+        import hashlib
+        exe = os.path.join(a.hal_plugin, 'RedwoodAudio')
+        tag = hashlib.sha256(open(exe, 'rb').read()).hexdigest()[:8]
+        info = plistlib.load(open(os.path.join(a.hal_plugin, 'RedwoodAudio.plist'), 'rb'))
+        info['CFBundleExecutable'] = f'RedwoodAudio-{tag}'
+        drv = '/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver'
+        a.zfile.append(f'{drv}/RedwoodAudio-{tag}={exe}')
+        hal = (drv, info)
+        print(f'--hal-plugin: {drv}/RedwoodAudio-{tag}')
     if a.apps_archive:
         apps_archive(a.image, a.apps_archive)
         return
@@ -282,6 +300,9 @@ def main():
     if a.locationd:
         b.plist(WRITE, '/private/var/root/Library/Preferences/com.apple.locationd.plist',
                 {'LocationServicesEnabledIn7.0': True, 'LocationServicesEnabled': True}, 0o600, 0, 0)
+    if hal is not None:
+        b.mkdirs(hal[0])
+        b.plist(WRITE, hal[0] + '/Info.plist', hal[1], 0o644, 0, 0, plistlib.FMT_XML)
     for f in a.write:
         dest, src = f.split('=', 1)
         src, _, uid = src.partition(':')
