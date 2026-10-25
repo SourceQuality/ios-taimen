@@ -124,8 +124,14 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
+    # TAIMEN_ADT_ARGS: boot-args beyond the 607 bytes of the command line (xnu 0309 reads
+    # /chosen sweet-boot-args for an argument the command line does not have)
+    extra_args = os.environ.get('TAIMEN_ADT_ARGS', '').strip()
+    if extra_args:
+        print(f'/chosen sweet-boot-args: {extra_args}', file=sys.stderr)
     chosen = node('chosen', [
         ph(),
+    ] + ([('sweet-boot-args', cstr(extra_args))] if extra_args else []) + [
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),

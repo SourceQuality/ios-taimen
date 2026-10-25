@@ -1,0 +1,80 @@
+diff --git a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+index c94c0eb..5399f81 100644
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -187,13 +187,56 @@ gotit:
+ 	return arg_found;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0309: more boot-args than the 607 bytes of the boot_args command line (ROOT=1 + GPU boots come
++ * to ~590): /chosen "sweet-boot-args" in the ADT (tools/mkadt.py, from TAIMEN_ADT_ARGS). An
++ * argument is looked up there only when the command line does not have it, and only once the
++ * device tree is up (earlier calls see the command line alone).
++ */
++static char sweet_extra[1024];
++static int sweet_extra_state;           /* 0 not looked up, 1 none, 2 copied */
++
++static char *
++sweet_extra_args(void)
++{
++	if (sweet_extra_state == 0) {
++		DTEntry chosen;
++		void const *prop;
++		unsigned int size;
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
++			return NULL;            /* no device tree yet: try again later */
++		}
++		sweet_extra_state = 1;
++		if (SecureDTGetProperty(chosen, "sweet-boot-args", &prop, &size) == kSuccess && size > 1) {
++			if (size > sizeof(sweet_extra) - 1) {
++				size = sizeof(sweet_extra) - 1;
++			}
++			memcpy(sweet_extra, prop, size);
++			sweet_extra[size] = '\0';
++			sweet_extra_state = 2;
++		}
++	}
++	return sweet_extra_state == 2 ? sweet_extra : NULL;
++}
++#endif
++
+ boolean_t
+ PE_parse_boot_argn(
+ 	const char      *arg_string,
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE)) {
++		return TRUE;
++	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	char *extra = sweet_extra_args();
++	if (extra != NULL) {
++		return PE_parse_boot_argn_internal(extra, arg_string, arg_ptr, max_len, FALSE);
++	}
++#endif
++	return FALSE;
+ }
+ 
+ boolean_t
+@@ -202,7 +245,16 @@ PE_parse_boot_arg_str(
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE)) {
++		return TRUE;
++	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	char *extra = sweet_extra_args();
++	if (extra != NULL) {
++		return PE_parse_boot_argn_internal(extra, arg_string, arg_ptr, strlen, TRUE);
++	}
++#endif
++	return FALSE;
+ }
+ 
+ #if defined(CONFIG_XNUPOST)
