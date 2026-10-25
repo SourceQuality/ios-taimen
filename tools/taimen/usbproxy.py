@@ -7,7 +7,7 @@ splices each app connection onto one of the idle connections this agent keeps op
 used, this is an ordinary HTTP proxy: CONNECT host:port is tunneled (HTTPS), absolute-URI
 requests are forwarded (plain HTTP). Runs from WSL or any Python 3.8+.
 
-    tools/taimen/usbproxy.py [--phone 192.168.7.2] [--pool 12] [--minutes N]
+    tools/taimen/usbproxy.py [--phone 192.168.7.2] [--pool 24] [--minutes N]
     tools/taimen/usbproxy.py --status           netsvcd's state (port 5143) and exit
 """
 import argparse
@@ -139,7 +139,7 @@ def status(phone):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--phone', default='192.168.7.2')
-    ap.add_argument('--pool', type=int, default=12, help='idle connections kept open (default 12)')
+    ap.add_argument('--pool', type=int, default=24, help='idle connections kept open (default 24)')
     ap.add_argument('--minutes', type=float, default=0, help='stop after this long (default: never)')
     ap.add_argument('--status', action='store_true', help="print netsvcd's state and exit")
     a = ap.parse_args()

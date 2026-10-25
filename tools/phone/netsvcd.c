@@ -192,11 +192,12 @@ agent_alive(void)
 static int
 publish(SCDynamicStoreRef st, int proxied)
 {
-	const char *addr[] = { ADDR }, *mask[] = { MASK }, *dns[] = { "1.1.1.1", "8.8.8.8" };
+	const char *addr[] = { ADDR }, *mask[] = { MASK }, *dns[] = { "1.1.1.1", "8.8.8.8" }, *local[] = { "127.0.0.1" };
 	const char *k4[] = { "Addresses", "SubnetMasks", "Router", "InterfaceName", "ConfigMethod" };
 	CFTypeRef v4[] = { arr(1, addr), arr(1, mask), str(ROUTER), str(IFNAME), str("Manual") };
 	const char *kd[] = { "ServerAddresses" };
-	CFTypeRef vd[] = { arr(2, dns) };
+	/* with the agent, DNS goes through it too (dns_thread); with NAT straight to the servers */
+	CFTypeRef vd[] = { proxied ? arr(1, local) : arr(2, dns) };
 	const char *ki[] = { "Addresses", "SubnetMasks" };
 	CFTypeRef vi[] = { arr(1, addr), arr(1, mask) };
 	CFTypeRef vals[] = { dict(5, k4, v4), dict(1, kd, vd), dict(2, ki, vi), NULL, NULL };
@@ -212,8 +213,9 @@ publish(SCDynamicStoreRef st, int proxied)
 		CFRelease(gone);
 	}
 	n_publish++;
-	say("published " IFNAME " (router " ROUTER ", DNS 1.1.1.1 8.8.8.8, %s): %s",
-	    proxied ? "proxy 127.0.0.1:8080 to the PC agent" : "no proxy", ok ? "ok" : SCErrorString(SCError()));
+	say("published " IFNAME " (router " ROUTER ", %s): %s",
+	    proxied ? "proxy 127.0.0.1:8080 and DNS 127.0.0.1 through the PC agent" : "DNS 1.1.1.1 8.8.8.8, no proxy",
+	    ok ? "ok" : SCErrorString(SCError()));
 	return ok;
 }
 
@@ -437,6 +439,108 @@ proxy_thread(void *arg)
 	return NULL;
 }
 
+/*
+ * DNS through the agent: queries to 127.0.0.1:53 (the service's DNS server while the agent is
+ * there) go as DNS over TCP through an agent connection, CONNECT 1.1.1.1:53, one connection per
+ * query, and the answer comes back to the asker over UDP.
+ */
+struct dnsq {
+	int s;
+	struct sockaddr_in from;
+	ssize_t n;
+	unsigned char q[512];
+};
+
+static unsigned long n_dns, n_dns_failed;
+
+static int
+read_full(int s, unsigned char *b, size_t n)
+{
+	struct pollfd p = { s, POLLIN, 0 };
+	while (n > 0) {
+		if (poll(&p, 1, 5000) <= 0) {
+			return -1;
+		}
+		ssize_t r = read(s, b, n);
+		if (r <= 0) {
+			return -1;
+		}
+		b += r;
+		n -= (size_t)r;
+	}
+	return 0;
+}
+
+static void *
+dns_query_thread(void *arg)
+{
+	struct dnsq *d = arg;
+	unsigned char ans[4096], len[2];
+	int ok = 0, a = take_agent();
+	if (a >= 0) {
+		static const char req[] = "CONNECT 1.1.1.1:53 HTTP/1.1\r\nHost: 1.1.1.1:53\r\n\r\n";
+		char head[256] = "";
+		size_t hn = 0;
+		if (write_all(a, req, sizeof(req) - 1) == 0) {
+			/* the agent's reply head, up to the blank line */
+			while (hn < sizeof(head) - 1 && read_full(a, (unsigned char *)head + hn, 1) == 0) {
+				hn++;
+				if (hn >= 4 && memcmp(head + hn - 4, "\r\n\r\n", 4) == 0) {
+					break;
+				}
+			}
+			head[hn] = 0;
+		}
+		len[0] = (unsigned char)(d->n >> 8);
+		len[1] = (unsigned char)d->n;
+		size_t al = 0;
+		if (strncmp(head, "HTTP/1.1 200", 12) == 0 && write_all(a, (const char *)len, 2) == 0 &&
+		    write_all(a, (const char *)d->q, d->n) == 0 && read_full(a, len, 2) == 0 &&
+		    (al = (size_t)(len[0] << 8 | len[1])) <= sizeof(ans) && read_full(a, ans, al) == 0) {
+			sendto(d->s, ans, al, 0, (struct sockaddr *)&d->from, sizeof(d->from));
+			ok = 1;
+		}
+		close(a);
+	}
+	if (!ok && n_dns_failed++ % 20 == 0) {
+		say("DNS query failed (%s): %lu so far", a < 0 ? "no agent" : "through the agent", n_dns_failed);
+	}
+	free(d);
+	return NULL;
+}
+
+static void *
+dns_thread(void *arg)
+{
+	(void)arg;
+	int s = socket(AF_INET, SOCK_DGRAM, 0), on = 1;
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_len = sizeof(a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons(53);
+	a.sin_addr.s_addr = inet_addr("127.0.0.1");
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	while (bind(s, (struct sockaddr *)&a, sizeof(a)) != 0) {
+		say("DNS: bind 127.0.0.1:53: %s", strerror(errno));
+		sleep(10);
+	}
+	for (;;) {
+		struct dnsq *d = malloc(sizeof(*d));
+		socklen_t fl = sizeof(d->from);
+		d->s = s;
+		d->n = recvfrom(s, d->q, sizeof(d->q), 0, (struct sockaddr *)&d->from, &fl);
+		pthread_t t;
+		if (d->n < 12 || pthread_create(&t, NULL, dns_query_thread, d) != 0) {
+			free(d);
+			continue;
+		}
+		pthread_detach(t);
+		n_dns++;
+	}
+	return NULL;
+}
+
 static SCDynamicStoreRef store(int wait);
 
 static void *
@@ -461,7 +565,8 @@ status_thread(void *arg)
 		}
 		pthread_mutex_lock(&mu);
 		fprintf(f, "netsvcd: published %lu times; agents %lu (%d idle); app connections %lu, spliced %lu, "
-		    "without an agent %lu\n%s", n_publish, n_agents, nidle, n_clients, n_spliced, n_noagent, events);
+		    "without an agent %lu; DNS queries %lu, failed %lu\n%s", n_publish, n_agents, nidle, n_clients,
+		    n_spliced, n_noagent, n_dns, n_dns_failed, events);
 		pthread_mutex_unlock(&mu);
 		show_to(st, f);
 		fclose(f);
@@ -526,6 +631,7 @@ main(int argc, char **argv)
 	pthread_create(&t, NULL, agent_thread, NULL);
 	pthread_create(&t, NULL, proxy_thread, NULL);
 	pthread_create(&t, NULL, status_thread, NULL);
+	pthread_create(&t, NULL, dns_thread, NULL);
 	int proxied = -1;
 	for (;;) {
 		int want = agent_alive();
