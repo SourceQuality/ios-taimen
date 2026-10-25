@@ -907,3 +907,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   on our side: the modem opens ten GLINK channels besides IPCRTR (glink_ssr, SSM_RTR_MODEM_APPS, apr_voice_svc,
   apr_apps2, LOOPBACK_CTL_MPSS, DS, DATA1-4, DATA11) and none was ever acknowledged. 0290 acknowledges and opens
   them all, gives them intents and discards what arrives (counted).
+- 2026-10-24 boot 122 (r110 = +0263-0290, a plain ROOTFIX + taimenwifi=10, 420 s): all ten extra modem GLINK
+  channels acknowledged and open both ways (glink_ssr, SSM_RTR_MODEM_APPS, apr_voice_svc, apr_apps2,
+  LOOPBACK_CTL_MPSS, DS, DATA1-4, DATA11); the modem sent nothing on any of them. FATAL at +14.2 s as before
+  (scan 43 networks). Ruled out so far for the starvation: the HTT rx ring, the IPA clock, the power cycle at
+  FW_READY, rejuvenate/VBATT, the unacknowledged channels. Boot 123 bisects: FW_READY, then the WLAN left off
+  as Android does without a WLAN driver (taimenmission=0, 0291), no WLAN_CFG/mission.

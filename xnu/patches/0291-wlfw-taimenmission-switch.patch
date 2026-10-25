@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index e54a651..7a196c2 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2931,6 +2931,18 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 				bool o17 = sweet_rpm_ldoa_off(17), o25 = sweet_rpm_ldoa_off(25);
+ 				LOG("M7: t=%u ms: WLAN power off (as icnss at FW_READY): L5 %s L7 %s L17 %s L25 %s", g_ms,
+ 				    o5 ? "off" : "FAILED", o7 ? "off" : "FAILED", o17 ? "off" : "FAILED", o25 ? "off" : "FAILED");
++				/*
++				 * 0291: taimenmission=0 stops here, as Android does without a WLAN driver: the hardware
++				 * stays off, no WLAN_CFG or mission mode. Boots 116-122 all died 9.5 s after mission;
++				 * this tells FW_READY from mission mode.
++				 */
++				uint32_t mission = 1;
++				(void)PE_parse_boot_argn("taimenmission", &mission, sizeof(mission));
++				if (mission == 0) {
++					LOG("M7: t=%u ms: taimenmission=0: WLAN left off after FW_READY, no WLAN_CFG/mission", g_ms);
++					w_step = "FW_READY, left off (taimenmission=0)";
++					return;
++				}
+ 				IOSleep(10);
+ 				w_rails();
+ 			}
