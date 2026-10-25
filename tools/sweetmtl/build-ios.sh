@@ -85,7 +85,7 @@ for t in mtlbridgetest mtlabitest; do
 	# ld64 searches every archive as often as needed: no link groups
 	$CC -O2 -Wall $EXTRA -I "$H/bridge" -I "$H/test" -o "$OUT/$t.unstripped" "$H/test/$t.c" "$BRIDGE" \
 		"$OUT/gallium/libsweetgallium.a" $(cat "$OUT/gallium/mesa-libs.txt") \
-		-framework IOKit -framework CoreFoundation -framework IOSurface -lc++ -Wl,-dead_strip
+		-framework IOKit -framework CoreFoundation -framework IOSurface -lc++ -lz -Wl,-dead_strip
 	cp "$OUT/$t.unstripped" "$OUT/$t"
 	"$(xcrun --sdk iphoneos --find strip)" -x "$OUT/$t"
 	codesign -f -s - --entitlements "$H/test/mtltool-ents.plist" "$OUT/$t"
