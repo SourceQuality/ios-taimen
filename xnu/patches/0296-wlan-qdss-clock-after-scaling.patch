@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index f9468be..f05e1d4 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -426,6 +426,19 @@ sweet_rpm_rail_level(uint32_t type, uint32_t level)
+ 	return ok;
+ }
+ 
++/* One key/value in the sleep and then the active set (TaimenModem's QDSS and RF_CLK2 votes). */
++bool sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++bool
++sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	uint32_t kv[2] = {key, value};
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request(what, 1, type, id, kv, 1) && rpm_request(what, 0, type, id, kv, 1);
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: %s (both sets): %s\n", what, ok ? "ok" : "FAILED");
++	return ok;
++}
++
+ /* Any active-set request (TaimenModem's BoB vote): type, id, then nkvp key/value pairs. */
+ bool sweet_rpm_vote(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp);
+ bool
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index d4fd64b..6a6dcd2 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2606,6 +2606,7 @@ extern "C" bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
+ extern "C" bool sweet_rpm_ldoa_off(unsigned ldo);
+ extern "C" bool sweet_rpm_vote(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp);
+ extern "C" bool sweet_rpm_smpa(unsigned smps, uint32_t uv);
++extern "C" bool sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+ static void w_rails(void);
+ 
+ /* ---------------------------------------------------------------- M7: WLFW (QMI 0x45) */
+@@ -3232,6 +3233,19 @@ w_rails(void)
+ 	 * Android has IPA up (ipa3, WDI2 for the WLAN) long before; a modem task stalled on an unclocked
+ 	 * IPA would look like this. 150 MHz is ipa3's nominal rate.
+ 	 */
++	/*
++	 * 0296: the QDSS (debug subsystem) clock and RF_CLK2, again, now that RPM clock scaling is on. The
++	 * handoff voted them before scaling was enabled, and the RPM drops votes from before then (DDR
++	 * ignored an acked rate vote, sweet_rpm.c). On mainline msm8998 the WLAN firmware crashes ~10 s
++	 * after loading unless QDSS stays on (diag-router keeps it on; Bjorn Andersson's fix puts
++	 * RPM_SMD_QDSS_CLK and RPM_SMD_RF_CLK2_PIN in the wifi node), the same 9.5 s after mission as
++	 * boots 116-127; flame lesson 6 too.
++	 */
++	bool qdss = sweet_rpm_kv_both("QDSS on", 0x306b6c63u, 1, 0x62616e45u, 1);                 /* clk0 1 Enab */
++	bool rf2 = sweet_rpm_kv_both("RF_CLK2 on", 0x616b6c63u, 5, 0x6e657773u, 1);               /* clka 5 swen */
++	bool rf2p = sweet_rpm_kv_both("RF_CLK2_PIN on", 0x616b6c63u, 5, 0x62636370u, 1);          /* clka 5 pccb */
++	LOG("M7: QDSS clock %s, RF_CLK2 %s, RF_CLK2_PIN %s (after clock scaling)", qdss ? "on" : "FAILED",
++	    rf2 ? "on" : "FAILED", rf2p ? "on" : "FAILED");
+ 	bool ipa = sweet_rpm_clk(0x617069u, 0, 150000);
+ 	LOG("M7: IPA core clock 150 MHz %s", ipa ? "ok" : "FAILED");
+ 	/*

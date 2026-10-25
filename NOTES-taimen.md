@@ -942,3 +942,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-24 boot 127 (r115 = +0263-0295, a plain ROOTFIX + taimenwifi=10, 420 s): host_version "5.2.1.1L" in
   WLAN_CFG (accepted); FW_READY, mission, scan (32 networks); FATAL at +14.21 s as before. Every difference left
   in our messages up to the mission mode has now been matched to icnss (and HOST_CAP to mainline) with no effect.
+- 2026-10-24 a lead from mainline: on the Pixel 2 XL (and the OnePlus 5) the WLAN firmware "crashes every 10 seconds
+  or so" unless diag-router runs (Caleb Connolly, 2021 Pixel 2 XL DT patch, lkml 2103.0/09882); Bjorn Andersson:
+  diag-router makes the modem keep the debug subsystem (QDSS) clock on, and the real fix is RPM_SMD_QDSS_CLK and
+  RPM_SMD_RF_CLK2_PIN in the wifi node. Ours: the RPM handoff votes QDSS (clk0 1 Enab) before clock scaling is on,
+  and the RPM drops votes from before scaling (the DDR rate vote, sweet_rpm.c). 0296 votes QDSS, RF_CLK2 and
+  RF_CLK2_PIN again in both sets with the WLAN rails, after scaling. Also noted for later (postmarketOS msm8998):
+  iwd's ControlPortOverNL80211=false "is required to avoid modem firmware crash".
