@@ -83,3 +83,25 @@ tools/taimen/attention.sh "test alert"      # sound, balloon, speech
 ```
 
 Next step after the move: boot 17, the on-screen log viewer (NOTES-taimen.md, last entries).
+
+## 5. The phone on the network over its USB cable (xnu 0297-0308)
+
+Boot with `sweetusb=2`. The phone's kernel is a USB Ethernet (CDC-NCM) device; Windows binds
+its built-in UsbNcm driver ("Sweet iOS (USB Ethernet)" in Device Manager) and gets
+**192.168.7.1** from the phone's own DHCP server, so nothing needs admin rights. The phone is
+**192.168.7.2**. Everything below connects *out* from the PC, so the Windows firewall needs no
+rules.
+
+- **Live kernel log**: TCP 5141. `powershell -ExecutionPolicy Bypass -File tools\windows\usblog.ps1 -Out log.txt`.
+- **Internet for iOS**: `tools/taimen/usbproxy.py` in WSL (leave it running). It keeps idle
+  connections open to the phone's netsvcd (192.168.7.2:5142), which makes the link iOS's primary
+  network with an HTTP/HTTPS proxy and DNS that both go through this agent. Safari, iCloud and the
+  system daemons work this way. `usbproxy.py --status` prints netsvcd's state.
+  The agent finds a rebooted phone by itself (TCP keepalive).
+- **Full internet (every app, not only proxy-aware traffic)**: once, from an elevated PowerShell
+  while the phone's adapter is up: `tools\windows\usb-share.ps1` (Windows NAT for
+  192.168.7.0/24; `-Off` undoes it). With NAT on, stop `usbproxy.py`, and netsvcd then gives iOS
+  1.1.1.1 / 8.8.8.8 and no proxy.
+- **Remote control**: TCP 5144, `tools/taimen/phonectl.py`: `shot out.png` (1125x2436, ~1 s),
+  `unlock`, `tapc X Y` / `swipec ...` in screenshot coordinates, `type TEXT`, `enter`,
+  `key power|volup|voldown|home`, and `run STEP...` for scripts.
