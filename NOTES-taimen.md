@@ -959,3 +959,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   tftp_server, irsc_util, pm-service/pm-proxy, time_daemon, thermal-engine, wpa_supplicant, init.qcom.wlan.sh,
   among others). No separate recipe to copy: the parts we can reimplement from public protocols (rmtfs, tftp,
   pd-mapper, the BDF download) already are; the rest are closed vendor binaries.
+- 2026-10-24 Wi-Fi parked at the scan (the user: "let's get everything else working"). USB networking instead: sweet's
+  DWC3 device-mode gadget (USB Ethernet + the live log over UDP) ported to taimen (0297), as CDC-NCM for Windows'
+  built-in UsbNcm (0298). Boot 129 (r117 = +0297, sweetusb=2, 240 s): GDSC and all USB clocks on, DWC3 3.00a
+  (GSNPSID 0x5533300a) in device mode as ABL left it, DCFG speed 4 (ABL runs SuperSpeed); ue0 192.168.7.2 up;
+  soft reset done in 1 ms, then endpoint 0 SETEPCONFIG timed out (1 ms timeout). 0299: GUSB3PIPECTL.SUSPHY
+  before the reset (Linux's default; no PIPE clock wait at high speed), 10 ms after it, 50 ms command timeout,
+  the PHY registers logged on a timeout.

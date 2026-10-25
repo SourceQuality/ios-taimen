@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9d603a8..201c93c 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -294,7 +294,8 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	/* 50 ms (Linux allows 5): boot 129's first SETEPCONFIG on taimen did not finish in 1 */
++	for (int i = 0; i < 50000; i++) {
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -306,7 +307,8 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	printf("SWEET USB: ep%u cmd 0x%x timeout (DEPCMD 0x%08x GUSB3PIPECTL 0x%08x GUSB2PHYCFG 0x%08x DSTS 0x%08x)\n",
++	    ep, cmd & 0xf, dwc_rd(DEPCMD(ep)), dwc_rd(0xc2c0), dwc_rd(0xc200), dwc_rd(DSTS));
+ 	return -1;
+ }
+ 
+@@ -937,6 +939,16 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
++	/*
++	 * 0299, taimen: ABL runs this port at SuperSpeed (boot 129: DCFG speed 4) and the endpoint 0
++	 * setup after the soft reset timed out. The core may suspend the USB3 PHY (GUSB3PIPECTL.SUSPHY,
++	 * Linux's default) so that, at high speed, nothing waits for a PIPE clock.
++	 */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	uint32_t pipe = dwc_rd(0xc2c0);
++	dwc_wr(0xc2c0, pipe | (1u << 17));
++	printf("SWEET USB: GUSB3PIPECTL 0x%08x -> 0x%08x (SUSPHY)\n", pipe, dwc_rd(0xc2c0));
++#endif
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+@@ -948,6 +960,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++	delay(10000);                           /* 0299: let the PHY clocks settle after the reset */
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
