@@ -88,6 +88,19 @@ def d22ap_product(path=D22AP_ADT):
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
+
+def d22ap_product_child(name, path=D22AP_ADT):
+    """Properties of /product/NAME in the real tree (no syscfg placeholders, no bookkeeping)."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for g in c.children:
+                if dict((k, v) for k, f, v in g.props).get('name') == cstr(name):
+                    return [(k, v) for k, f, v in g.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -324,7 +337,15 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
         # cannot draw into: the dock / App Library backgrounds stayed white.
         product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
                          for k, v in product_props]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # /product/haptics (closed-loop 1, supports-3rd-party-haptics 1): without it iOS plays nothing on
+    # the plug-in's "Actuator" device (boot 162: a Haptic Touch menu, no samples), as HackiOS found.
+    # taimen only: its DRV2624 is behind /dev/redwood-haptic (xnu 0328). TAIMEN_HAPTICS=0 leaves it out.
+    product_children = []
+    if taimen and os.environ.get('TAIMEN_HAPTICS', '1') != '0':
+        haptics = d22ap_product_child('haptics')
+        if haptics:
+            product_children.append(node('haptics', [ph()] + haptics))
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

@@ -1157,3 +1157,27 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   haptics block is disabled in this DT) behind /dev/redwood-haptic. 0329: taimenmtl=NAME puts
   MetalPluginName/MetalPluginClassName on IOAcceleratorES. 0330: the audio firmware from
   /usr/standalone/firmware/taimen-audio (mkrootfix.py --audio-fw, once) instead of payload blobs.
+- 2026-10-25 boot 162 (r150 = +0328-0330, AUDIO=0 with the --audio-fw ROOTFIX): **the audio firmware from the
+  root.** TaimenAudio read 11 files (9763271 bytes) from /usr/standalone/firmware/taimen-audio 2 s after it
+  asked, and M2-M7 passed as with payload blobs: the payload is ~9.4 MB smaller. Haptics: the DRV2624
+  answered (ID 3), took Android's configuration, /dev/redwood-haptic was ready, but a Haptic Touch long
+  press (the menu opened) played nothing: mediaserverd only asked the Actuator device for properties, no
+  I/O. The real D22AP tree has /product/haptics (closed-loop 1, supports-3rd-party-haptics 1), which
+  mkadt.py left out (it copied /product's properties, not its children); HackiOS's loader copied it. 0331:
+  `phonectl end` ends a boot early (265 s here).
+- 2026-10-25 **boot 163 (r150): Metal on the phone.** mtlbridgetest (sweetmtl run 40204982902) as a run-once
+  launchd job next to backboardd's sweetgl: the GPU service up after 2.5 s, then in 12.9 s compute bad
+  0/1000, render bad 0/64, IOSurface import bad 0/4096, QuartzCore's default.metallib 141 functions:
+  kernels 3 ok 4 failed, vertex/fragment pairs 13 ok 8 failed, as on the PC. No GPU hang; the home
+  screen kept drawing (two GPU clients); command buffers 2-6.5 ms. Only driverkitd crashed (once).
+- 2026-10-25 boot 164 (r150): mtlabitest, the frontend's object ABI, on the phone: every check `ok` but one,
+  `stage_io` ran, heaps and archive serialization `not yet`, as on the PC. The one FAIL: compute on storage
+  textures (invert_texels, 8x8 RGBA8, src read-only image, dst read-write image pre-filled with 0x5a): texel 0
+  came out (165,165,165,90), the inverse of dst's 0x5a junk, the other 63 texels right. Boot 165 the same:
+  deterministic. Haptics: mkadt.py now copies /product/haptics from the D22AP tree, but still nothing played,
+  because MobileGestalt's cache was built on boots without it.
+- 2026-10-25 **boot 165 (r150, MobileGestalt cache removed once): haptics.** iOS rebuilt the cache from the
+  tree with /product/haptics and plays on the Actuator: mediaserverd's plug-in wrote 256-frame bursts (peak
+  up to 23112), the DRV2624 played them: a 313 ms closed-loop vibration (LRA ~143 Hz) and 25 ms taps
+  (RTP 0x7f) for the two Haptic Touch long presses. A phone whose cache predates /product/haptics needs
+  `mkrootfix.py --remove .../com.apple.MobileGestalt.plist` once (done on this one).
