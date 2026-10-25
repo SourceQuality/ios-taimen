@@ -174,6 +174,8 @@ def main():
     ap.add_argument('--apps-part', metavar='PARTITION', help='apply the blob on PARTITION at boot (op 8)')
     ap.add_argument('--findrm', action='append', default=[], metavar='/DIR:DEPTH:PREFIX*SUFFIX',
                     help='remove matching files below DIR at boot, first thing (op 9, xnu 0280)')
+    ap.add_argument('--mkdir', action='append', default=[], metavar='/PATH[:UID]',
+                    help='mkdir -p at boot (after the --list records), owned by UID (default 0, mobile = 501)')
     ap.add_argument('--remove', action='append', default=[], metavar='/PATH',
                     help='remove a file at boot (before the --file/--zfile records)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
@@ -249,6 +251,10 @@ def main():
     for spec in a.list:
         d, _, depth = spec.partition(':')
         b.add(LIST, d, b'', int(depth or 1), 0, 0)
+    for spec in a.mkdir:
+        path, _, uid = spec.partition(':')
+        assert path.startswith('/'), path
+        b.mkdirs(path, uid=int(uid or 0), gid=int(uid or 0))
     for path in a.remove:
         assert path.startswith('/'), path
         b.add(REMOVE, path)

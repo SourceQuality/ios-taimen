@@ -2,6 +2,7 @@
 """Disassemble one function of an extracted shared cache, branch targets named.
 
   dsc-dis.py CACHE_DIR IMAGE SYMBOL_SUBSTRING [MAX_BYTES]
+  dsc-dis.py CACHE_DIR IMAGE 0xADDRESS [MAX_BYTES]     the function (symbol) the address is in
 
 Unslid addresses. Needs aarch64-linux-gnu-objdump (binutils-aarch64-linux-gnu).
 Calls (bl/b) and adrp+add/ldr pairs are annotated with the symbol or C string
@@ -22,7 +23,14 @@ def main():
     limit = int(sys.argv[4], 0) if len(sys.argv) > 4 else 0x2000
     mh = next(t[2] for t in im.text if t[3] == image)
     syms, addrs = im.symbols(mh)
-    hits = [(a, n) for a, n in syms if want in n]
+    if want.startswith('0x'):         # redacted functions: by address (unslid)
+        at = int(want, 16)
+        i = bisect.bisect_right(addrs, at) - 1
+        if i < 0:
+            sys.exit('%s: before the first symbol of %s' % (want, image))
+        hits = [(a, n) for a, n in syms if a == addrs[i]][:1] or [(addrs[i], '?')]
+    else:
+        hits = [(a, n) for a, n in syms if want in n]
     if not hits:
         sys.exit('no symbol with %r in %s' % (want, image))
     for a, n in hits[:8]:
