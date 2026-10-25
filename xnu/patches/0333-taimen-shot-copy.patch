@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 745ca6b..21276af 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -26,6 +26,7 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <kern/kalloc.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+@@ -1351,12 +1352,30 @@ ctl_command(socket_t s, const char *line)
+ 			ctl_say(s, "ERR no surface swapped yet\n");
+ 			return;
+ 		}
++		/*
++		 * 0333: copy the surface first, then send it. Sending takes ~1 s at the link's pace, and
++		 * CA renders into this surface again as soon as it has swapped another: boots 162-165
++		 * had strips of a half-drawn frame across a still Haptic Touch menu.
++		 */
++		size_t row = (size_t)w * 4, len = row * h;
++		uint8_t *copy = kalloc_data(len, Z_WAITOK);
++		if (copy != NULL) {
++			for (uint32_t y = 0; y < h; y++) {
++				memcpy(copy + (size_t)y * row, (const void *)(base + (uintptr_t)y * bpr), row);
++			}
++			sweet_fb_grab_release(ref);
++		}
+ 		snprintf(reply, sizeof(reply), "SHOT %u %u\n", w, h);
+ 		int err = ctl_say(s, reply);
+ 		for (uint32_t y = 0; y < h && err == 0; y++) {
+-			err = ctl_send(s, (const void *)(base + (uintptr_t)y * bpr), (size_t)w * 4);
++			err = ctl_send(s, copy != NULL ? (const void *)(copy + (size_t)y * row) :
++			    (const void *)(base + (uintptr_t)y * bpr), row);
++		}
++		if (copy != NULL) {
++			kfree_data(copy, len);
++		} else {
++			sweet_fb_grab_release(ref);
+ 		}
+-		sweet_fb_grab_release(ref);
+ 		if (err == 0) {
+ 			ctl_say(s, "OK\n");
+ 		}
