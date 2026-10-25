@@ -1,0 +1,242 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0c2e3ad..fa4faa0 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -44,6 +44,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ static int ud_ncm;                              /* defined with the descriptors (0298) */
++static int ud_dhcp;                             /* defined with the DHCP server (0302) */
+ static bool ud_ss;                              /* 0300: run at SuperSpeed, as ABL left the port */
+ static bool ud_conn_ss;                         /* the host connected at SuperSpeed */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -105,6 +106,7 @@ sweet_usb_probe(void)
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	PE_parse_boot_argn("sweetusbncm", &ud_ncm, sizeof(ud_ncm));
++	PE_parse_boot_argn("sweetusbdhcp", &ud_dhcp, sizeof(ud_dhcp));
+ 	if (!enabled) {
+ 		return;
+ 	}
+@@ -613,6 +615,133 @@ ud_rx_arm(void)
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+ }
+ 
++/*
++ * 0302: a DHCP server for the PC end of the link. Windows gives the NCM adapter no static address
++ * without admin rights and falls back to 169.254.x.x, where 192.168.7.1 (the live log) does not
++ * exist. DISCOVER and REQUEST from the PC (UDP 68 -> 67) are answered here with an OFFER / ACK of
++ * 192.168.7.1/24 from 192.168.7.2, with no router and no DNS, so the PC keeps its own internet.
++ * The reply is broadcast (the PC has no address yet). Boot-arg sweetusbdhcp=0 disables it.
++ */
++static int ud_dhcp = 1;
++static errno_t ud_if_output(ifnet_t ifp, mbuf_t m);
++
++static uint16_t
++ud_ip_sum(const uint8_t *h, unsigned n)
++{
++	uint32_t sum = 0;
++	for (unsigned i = 0; i + 1 < n; i += 2) {
++		sum += (uint32_t)(h[i] << 8 | h[i + 1]);
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
++/* true: the frame was a DHCP request to a server (answered or ignored), not for the stack */
++static bool
++ud_dhcp_frame(const uint8_t *f, uint32_t len)
++{
++	if (!ud_dhcp || ud.ifp == NULL || len < 14 + 20 + 8 + 240 || f[12] != 0x08 || f[13] != 0x00) {
++		return false;
++	}
++	const uint8_t *ip = f + 14;
++	uint32_t ihl = (ip[0] & 0xfu) * 4;
++	if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17 || 14 + ihl + 8 + 240 > len) {
++		return false;
++	}
++	const uint8_t *udp = ip + ihl;
++	if (udp[0] != 0 || udp[1] != 68 || udp[2] != 0 || udp[3] != 67) {
++		return false;
++	}
++	const uint8_t *bp = udp + 8;
++	uint32_t blen = len - (uint32_t)(bp - f);
++	static const uint8_t cookie[4] = { 0x63, 0x82, 0x53, 0x63 };
++	if (bp[0] != 1 || memcmp(bp + 236, cookie, 4) != 0) {
++		return true;
++	}
++	uint8_t type = 0;
++	for (uint32_t o = 240; o + 1 < blen && bp[o] != 255;) {
++		if (bp[o] == 0) {
++			o++;
++			continue;
++		}
++		if (o + 2 + bp[o + 1] > blen) {
++			break;
++		}
++		if (bp[o] == 53 && bp[o + 1] >= 1) {
++			type = bp[o + 2];
++		}
++		o += 2 + bp[o + 1];
++	}
++	static unsigned logged;
++	if (logged++ < 10) {
++		printf("SWEET USB: DHCP %s from the PC (%02x:%02x:%02x:%02x:%02x:%02x)\n",
++		    type == 1 ? "DISCOVER" : type == 3 ? "REQUEST" : type == 7 ? "RELEASE" : type == 8 ? "INFORM" : "message",
++		    bp[28], bp[29], bp[30], bp[31], bp[32], bp[33]);
++	}
++	if (type != 1 && type != 3) {
++		return true;
++	}
++	/* Ethernet 14 + IPv4 20 + UDP 8 + BOOTP 300 */
++	const uint32_t flen = 14 + 20 + 8 + 300;
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < flen) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		return true;
++	}
++	uint8_t *r = mbuf_data(m);
++	bzero(r, flen);
++	memset(r, 0xff, 6);
++	memcpy(r + 6, ud_phone_mac, 6);
++	r[12] = 0x08;
++	uint8_t *rip = r + 14;
++	rip[0] = 0x45;
++	rip[2] = (uint8_t)((20 + 8 + 300) >> 8);
++	rip[3] = (uint8_t)(20 + 8 + 300);
++	rip[8] = 64;
++	rip[9] = 17;
++	rip[12] = 192; rip[13] = 168; rip[14] = 7; rip[15] = 2;
++	memset(rip + 16, 0xff, 4);
++	uint16_t sum = ud_ip_sum(rip, 20);
++	rip[10] = (uint8_t)(sum >> 8);
++	rip[11] = (uint8_t)sum;
++	uint8_t *ru = rip + 20;
++	ru[1] = 67;
++	ru[3] = 68;
++	ru[4] = (uint8_t)((8 + 300) >> 8);
++	ru[5] = (uint8_t)(8 + 300);             /* UDP checksum 0: none (IPv4) */
++	uint8_t *rb = ru + 8;
++	rb[0] = 2;                              /* BOOTREPLY, Ethernet, 6-byte address */
++	rb[1] = 1;
++	rb[2] = 6;
++	memcpy(rb + 4, bp + 4, 4);              /* xid */
++	memcpy(rb + 10, bp + 10, 2);            /* flags */
++	rb[16] = 192; rb[17] = 168; rb[18] = 7; rb[19] = 1;     /* yiaddr: the PC */
++	rb[20] = 192; rb[21] = 168; rb[22] = 7; rb[23] = 2;     /* siaddr: us */
++	memcpy(rb + 28, bp + 28, 16);           /* chaddr */
++	memcpy(rb + 236, cookie, 4);
++	static const uint8_t opt[] = {
++		53, 1, 0,                       /* message type, filled in */
++		54, 4, 192, 168, 7, 2,          /* server id */
++		51, 4, 0x00, 0x09, 0x3a, 0x80,  /* lease: 7 days */
++		1, 4, 255, 255, 255, 0,         /* subnet mask; no router, no DNS */
++		255,
++	};
++	memcpy(rb + 240, opt, sizeof(opt));
++	rb[242] = type == 1 ? 2 : 5;            /* OFFER / ACK */
++	mbuf_setlen(m, flen);
++	mbuf_pkthdr_setlen(m, flen);
++	ud_if_output(ud.ifp, m);
++	if (logged <= 10) {
++		printf("SWEET USB: DHCP %s 192.168.7.1/24 to the PC\n", type == 1 ? "OFFER" : "ACK");
++	}
++	return true;
++}
++
+ static void
+ ud_rx_done(void)
+ {
+@@ -637,6 +766,11 @@ ud_rx_done(void)
+ 		}
+ 		len = dl;
+ 	}
++	if (len <= ETHER_MAX_LEN && ud_dhcp_frame((const uint8_t *)(ud.dma + UD_RX + off), len)) {
++		ud.rx_frames++;
++		ud_rx_arm();
++		return;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+@@ -940,6 +1074,66 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
+ 
++/*
++ * 0302: the live log over TCP as well, port 5141 on the phone (192.168.7.2). The PC connects out,
++ * so its firewall needs no inbound rule (Windows: tools/windows/usblog.ps1). Each connection gets
++ * the last 64 KiB, then the new bytes every 100 ms. Nothing here may print.
++ */
++static void
++ud_tcplog_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static char chunk[1400];
++	socket_t ls = NULL;
++	for (;;) {
++		if (ls == NULL) {
++			ud_sleep_ms(1000);
++			if (!ud.configured) {
++				continue;
++			}
++			if (sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls) != 0) {
++				ls = NULL;
++				continue;
++			}
++			int on = 1;
++			(void)sock_setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++			struct sockaddr_in a;
++			bzero(&a, sizeof(a));
++			a.sin_len = sizeof(a);
++			a.sin_family = AF_INET;
++			a.sin_port = htons(5141);
++			if (sock_bind(ls, (struct sockaddr *)&a) != 0 || sock_listen(ls, 1) != 0) {
++				sock_close(ls);
++				ls = NULL;
++				continue;
++			}
++		}
++		socket_t cs = NULL;
++		if (sock_accept(ls, NULL, 0, 0, NULL, NULL, &cs) != 0 || cs == NULL) {
++			ud_sleep_ms(100);
++			continue;
++		}
++		uint64_t pos = sweet_log_position();
++		pos = pos > 65536 ? pos - 65536 : 0;
++		for (;;) {
++			uint32_t n;
++			int err = 0;
++			while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
++				struct iovec iov = { .iov_base = chunk, .iov_len = n };
++				struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++				size_t sent = 0;
++				if ((err = sock_send(cs, &msg, 0, &sent)) != 0) {
++					break;
++				}
++			}
++			if (err != 0) {
++				break;
++			}
++			ud_sleep_ms(100);
++		}
++		sock_close(cs);
++	}
++}
++
+ static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1242,5 +1436,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_tcplog_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_TAIMEN */
