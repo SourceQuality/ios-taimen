@@ -7,7 +7,8 @@ and TaimenAudio (xnu) feeds them to the ADSP (docs/taimen-audio-plan.md, stages 
 
 The code comes from HackiOS user space (<https://github.com/oosexgang/hackios-xnu-userland>, MIT
 License, Copyright (c) 2026 OOSEX GANG; see LICENSE), as ios-topaz carries it in
-`userland/audio`. The one taimen change is the manufacturer string.
+`userland/audio`. The taimen changes: the manufacturer string, and the speaker device is opened again at the start of
+play if it was not there when the HAL initialized the plug-in.
 
 tools/phone/build.sh builds it on the phone-tools CI as an ad hoc signed MH_BUNDLE.
 `tools/taimen/mkrootfix.py --hal-plugin` installs it.

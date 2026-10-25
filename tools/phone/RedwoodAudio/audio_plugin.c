@@ -893,6 +893,10 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		d->periods = 0;
 		if (d->output != 0) {
 			written = refused = 0;
+			/* taimen: the kernel may make the device after the HAL initialized us */
+			if (sink < 0 && (sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY)) >= 0) {
+				say("redwood: audio: %s: open at the start of play\n", REDWOOD_AUDIO_DEVICE);
+			}
 			say("redwood: audio: playing\n");
 		}
 		if (d->object == OBJECT_CODEC) {
