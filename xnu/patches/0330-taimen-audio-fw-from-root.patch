@@ -1,0 +1,225 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1e99569..9855d15 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/taimen_touch.c			standard
+ bsd/dev/taimen_i2c.c			standard
+ bsd/dev/taimen_tas2557.c		standard
+ bsd/dev/taimen_haptic.c			standard
++bsd/dev/taimen_fwfile.c			standard
+ bsd/dev/sailfish_wlan.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/taimen_fwfile.c b/bsd/dev/taimen_fwfile.c
+new file mode 100755
+index 0000000..0a168d2
+--- /dev/null
++++ b/bsd/dev/taimen_fwfile.c
+@@ -0,0 +1,74 @@
++/*
++ * Firmware files from the iOS root for taimen's drivers (xnu 0330): TaimenAudio reads the ADSP
++ * and TAS2557 firmware from /usr/standalone/firmware/taimen-audio, which a ROOTFIX installs once
++ * (tools/taimen/mkrootfix.py --audio-fw), instead of carrying ~9.4 MB of payload blobs on every
++ * boot (ABL starts no payload over ~35 MiB, NOTES boot 78). Plain vnode KPIs with the kernel's
++ * context, as bsd/kern/taimen_rootfix.c writes its files; usable once the root is mounted.
++ *
++ *   taimen_fw_load(path, max, &data, &len)  the whole file into kalloc_data memory: 0, ENOENT,
++ *                                           EFBIG (empty or over max), EIO, ENOMEM
++ *   taimen_fw_free(data, len)
++ */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <kern/kalloc.h>
++
++int taimen_fw_load(const char *path, uint32_t max, void **data, uint32_t *len);
++void taimen_fw_free(void *data, uint32_t len);
++
++int
++taimen_fw_load(const char *path, uint32_t max, void **data, uint32_t *len)
++{
++	if (rootvnode == NULLVP) {
++		return ENOENT;          /* no root yet: the caller asks again */
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err != 0) {
++		return ENOENT;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	err = vnode_getattr(vp, &va, ctx);
++	if (err != 0 || !VATTR_IS_SUPPORTED(&va, va_data_size) || va.va_data_size == 0 ||
++	    va.va_data_size > max) {
++		(void)vnode_close(vp, FREAD, ctx);
++		return err != 0 ? EIO : EFBIG;
++	}
++	uint32_t n = (uint32_t)va.va_data_size;
++	void *buf = kalloc_data(n, Z_WAITOK);
++	if (buf == NULL) {
++		(void)vnode_close(vp, FREAD, ctx);
++		return ENOMEM;
++	}
++	int resid = 0;
++	err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	(void)vnode_close(vp, FREAD, ctx);
++	if (err != 0 || resid != 0) {
++		kfree_data(buf, n);
++		return EIO;
++	}
++	*data = buf;
++	*len = n;
++	return 0;
++}
++
++void
++taimen_fw_free(void *data, uint32_t len)
++{
++	if (data != NULL) {
++		kfree_data(data, len);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index ab03cd4..932e0be 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -4,6 +4,8 @@
+  *
+  * 1 (0317): the firmware is there: the payload blobs ADSP-MDT and ADSP-Bnn (boot-xnu.sh AUDIOFW,
+  *   the reader's fw-adsp.* copy of /vendor/firmware), TAS-FW and TAS-CAL.
++ *   0330: without the blobs, the same files from /usr/standalone/firmware/taimen-audio in the iOS root
++ *   (mkrootfix.py --audio-fw installs them once), waited for up to 300 s.
+  * 2 (0317): the ADSP boots by PAS (id 1) like the A540 zap shader (bsd/dev/sweet_gpu.c zap_load):
+  *   CX at turbo over the RPM, SMP2P out (item 429, "master-kernel") in the APPS<->ADSP partition,
+  *   INIT_IMAGE with the .mdt, MEM_SETUP for a relocatable image, the .bNN segments into the
+@@ -61,6 +63,8 @@ extern "C" vm_map_address_t phystokv(uint64_t pa);
+ extern "C" bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
+ extern "C" void taimen_audio_init(void);
+ extern "C" bool sweet_gpu_ready(void);       /* bsd/dev/sweet_gpu.c */
++extern "C" int taimen_fw_load(const char *path, uint32_t max, void **data, uint32_t *len);   /* taimen_fwfile.c */
++extern "C" void taimen_fw_free(void *data, uint32_t len);
+ extern "C" {                                    /* bsd/dev/taimen_tas2557.c (stage 7) */
+ bool taimen_tas2557_init(const uint8_t *fw, uint32_t fw_len, const uint8_t *cal, uint32_t cal_len, unsigned bit_width);
+ bool taimen_tas2557_power(bool on);
+@@ -150,21 +154,86 @@ now_ms(void)
+ 
+ /* ---------------------------------------------------------------- firmware blobs */
+ 
++/*
++ * 0330: without payload blobs the same files come from the iOS root, where a ROOTFIX installed
++ * them once (mkrootfix.py --audio-fw): read into kernel memory by fw_from_root(), freed after
++ * stage 7.
++ */
++#define FW_DIR                  "/usr/standalone/firmware/taimen-audio/"
++static struct fw_file { const char *blob, *file; void *data; uint32_t len; } fw_files[] = {
++	{ "ADSP-MDT", "adsp.mdt", NULL, 0 },
++	{ "ADSP-B02", "adsp.b02", NULL, 0 }, { "ADSP-B03", "adsp.b03", NULL, 0 }, { "ADSP-B04", "adsp.b04", NULL, 0 },
++	{ "ADSP-B05", "adsp.b05", NULL, 0 }, { "ADSP-B06", "adsp.b06", NULL, 0 }, { "ADSP-B07", "adsp.b07", NULL, 0 },
++	{ "ADSP-B08", "adsp.b08", NULL, 0 }, { "ADSP-B09", "adsp.b09", NULL, 0 }, { "ADSP-B10", "adsp.b10", NULL, 0 },
++	{ "ADSP-B11", "adsp.b11", NULL, 0 }, { "ADSP-B12", "adsp.b12", NULL, 0 },
++	{ "TAS-FW", "tas2557s_PG21_uCDSP.bin", NULL, 0 }, { "TAS-CAL", "tas2557_cal.bin", NULL, 0 },
++};
++
+ static bool
+ blob(const char *name, const uint8_t **data, uint32_t *len)
+ {
+ 	DTEntry node;
+ 	uint64_t const *v;
+ 	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, name, (void const **)&v, &size) != kSuccess || size != 16) {
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) == kSuccess &&
++	    SecureDTGetProperty(node, name, (void const **)&v, &size) == kSuccess && size == 16) {
++		*data = (const uint8_t *)phystokv(v[0]);
++		*len = (uint32_t)v[1];
++		return true;
++	}
++	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
++		if (strcmp(fw_files[i].blob, name) == 0 && fw_files[i].data != NULL) {
++			*data = (const uint8_t *)fw_files[i].data;
++			*len = fw_files[i].len;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* The firmware from FW_DIR, once the root has it (the install boot: after the ROOTFIX), 300 s at most. */
++static bool
++fw_from_root(void)
++{
++	uint64_t t = now_ms();
++	char path[96];
++	int err = ENOENT;
++	while (now_ms() - t < 300000) {
++		snprintf(path, sizeof(path), "%s%s", FW_DIR, fw_files[0].file);
++		err = taimen_fw_load(path, 1u << 20, &fw_files[0].data, &fw_files[0].len);
++		if (err == 0) {
++			break;
++		}
++		IOSleep(1000);
++	}
++	if (err != 0) {
++		LOG("1: no payload blobs and no %sadsp.mdt after %llu s (%d)", FW_DIR, (now_ms() - t) / 1000, err);
+ 		return false;
+ 	}
+-	*data = (const uint8_t *)phystokv(v[0]);
+-	*len = (uint32_t)v[1];
++	uint64_t bytes = fw_files[0].len;
++	unsigned n = 1;
++	for (unsigned i = 1; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
++		snprintf(path, sizeof(path), "%s%s", FW_DIR, fw_files[i].file);
++		if (taimen_fw_load(path, 16u << 20, &fw_files[i].data, &fw_files[i].len) == 0) {
++			bytes += fw_files[i].len;
++			n++;
++		}
++	}
++	LOG("1: firmware from the root (%s): %u files, %llu bytes, %llu ms after the thread asked", FW_DIR, n,
++	    bytes, now_ms() - t);
+ 	return true;
+ }
+ 
++static void
++fw_release(void)
++{
++	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
++		taimen_fw_free(fw_files[i].data, fw_files[i].len);
++		fw_files[i].data = NULL;
++		fw_files[i].len = 0;
++	}
++}
++
+ /* ---------------------------------------------------------------- the audio pool */
+ 
+ static IOMemoryMap *pool_map;
+@@ -494,7 +563,10 @@ static uint32_t fw_mdt_len;
+ static bool
+ stage1(void)
+ {
+-	if (!blob("ADSP-MDT", &fw_mdt, &fw_mdt_len) || fw_mdt_len < sizeof(struct elf32_ehdr)) {
++	if (!blob("ADSP-MDT", &fw_mdt, &fw_mdt_len) && fw_from_root()) {
++		(void)blob("ADSP-MDT", &fw_mdt, &fw_mdt_len);
++	}
++	if (fw_mdt == NULL || fw_mdt_len < sizeof(struct elf32_ehdr)) {
+ 		LOG("1: no ADSP-MDT in the payload (boot-xnu.sh AUDIOFW)");
+ 		return false;
+ 	}
+@@ -2614,6 +2686,7 @@ audio_thread(void *arg, wait_result_t)
+ 					amps = taimen_tas2557_init(fw, fwn, cal, caln, 24);
+ 				}
+ 				LOG("t=%u.%03u 7: %s", T, amps ? "M7 TAS2557 amps loaded (powered down)" : "the amps did NOT load");
++				fw_release();           /* the ADSP image is in its carve-out, the amps loaded */
+ 			}
+ 			/* SMMU reads can hang an unclocked bus: on request, and after the AFE test */
+ 			int census = 2;         /* 0326: the stream 1 bank by default (boot 159: CB1 works) */

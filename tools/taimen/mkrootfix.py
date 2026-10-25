@@ -193,6 +193,10 @@ def main():
                     help='install the RedwoodAudio HAL plug-in from a phone-tools build in DIR (RedwoodAudio + '
                          'RedwoodAudio.plist): /System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver, executable '
                          'RedwoodAudio-HASH, Info.plist rewritten every boot to name it (docs/taimen-audio-plan.md 1.4)')
+    ap.add_argument('--audio-fw', metavar='DIR',
+                    help='install the ADSP and TAS2557 firmware from DIR (adsp.mdt, adsp.bNN, '
+                         'tas2557s_PG21_uCDSP.bin, audio/tas2557_cal.bin) into '
+                         '/usr/standalone/firmware/taimen-audio, where xnu 0330 reads it without payload blobs')
     ap.add_argument('--daemon', action='append', default=[], metavar='LABEL=/PATH[,ARG...]',
                     help='add a launchd job of ours (RunAtLoad, KeepAlive, output to the console)')
     a = ap.parse_args()
@@ -222,6 +226,17 @@ def main():
         a.zfile.append(f'{drv}/RedwoodAudio-{tag}={exe}')
         hal = (drv, info)
         print(f'--hal-plugin: {drv}/RedwoodAudio-{tag}')
+    if a.audio_fw:
+        import glob
+        fw = glob.glob(os.path.join(a.audio_fw, 'adsp.mdt')) + sorted(glob.glob(os.path.join(a.audio_fw, 'adsp.b[0-9][0-9]')))
+        fw = [f for f in fw if not f.endswith(('.b00', '.b01'))]            # inside adsp.mdt
+        for f in ('tas2557s_PG21_uCDSP.bin', 'audio/tas2557_cal.bin'):
+            if os.path.exists(os.path.join(a.audio_fw, f)):
+                fw.append(os.path.join(a.audio_fw, f))
+        assert fw and fw[0].endswith('adsp.mdt'), 'no adsp.mdt in ' + a.audio_fw
+        for f in fw:
+            a.zfile.append(f'/usr/standalone/firmware/taimen-audio/{os.path.basename(f)}={f}')
+        print(f'--audio-fw: {len(fw)} files into /usr/standalone/firmware/taimen-audio')
     if a.apps_archive:
         apps_archive(a.image, a.apps_archive)
         return
