@@ -1181,3 +1181,16 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   up to 23112), the DRV2624 played them: a 313 ms closed-loop vibration (LRA ~143 Hz) and 25 ms taps
   (RTP 0x7f) for the two Haptic Touch long presses. A phone whose cache predates /product/haptics needs
   `mkrootfix.py --remove .../com.apple.MobileGestalt.plist` once (done on this one).
+- 2026-10-25 **boot 166 (r151 = +0332): GPU hang recovery; mtlabitest clean.** The texel-0 failure was the Gallium
+  shim's: it set num_textures/num_images before nir_shader_gather_info, which zeroes and recounts them from
+  variables already removed, so ir3 put image 0's texture slot (a5xx image size queries and read-only image
+  loads use the texture state) on texture 0, and fd5 emitted the image's descriptor over the texture's (47eabf4;
+  the drm-shim disassembly now has the image on t#1). mtlabitest from that build: FAIL lines 0. Then
+  taimengpuhang=120 hung the CP on purpose (CP_WAIT_REG_MEM on a word never written): after 2 s the fence wait
+  declared it hung and 0332 recovered it in 3 ms (RBBM_SW_RESET_CMD 0x43, cp_test's registers again, ME_INIT,
+  zap shader resumed through TZ SET_REMOTE_STATE, CP_SET_SECURE_MODE 0, fences up to 1632 written as done);
+  the kernel quad self-test passed after it and backboardd kept compositing: Control Center opened and drew
+  (14.7 swaps/s in its animation). Present times as in earlier boots. A GPU hang no longer costs the boot.
+  0333: the remote `shot` copies the surface into kernel memory before sending it (~1.2 s over USB): the 3-9
+  row strips across the still Haptic Touch menu in boots 162/164/165 sat at a different height each time,
+  CA re-rendering that surface while it was being sent.
