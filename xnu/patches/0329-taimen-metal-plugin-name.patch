@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b1ecbf9..21c33df 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -193,6 +193,14 @@ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+  * boot, logs/pixel-0165a.txt = 30 s). This one has no MetalPluginName, so
+  * Metal passes over it and CA still picks GLES (sweetgl). Boot-arg
+  * sweetaccel=0 leaves it out. Idea from the ios-topaz fork (0138).
++ *
++ * 0329 (docs/taimen-metal-plan.md 4.0, M1): taimenmtl=NAME makes it Metal's:
++ * MetalPluginName NAME (MTLRegisterDevices loads
++ * /System/Library/Extensions/NAME.bundle) and MetalPluginClassName
++ * taimenmtlclass= (default SweetMTLDevice, the plug-in's _MTLDevice
++ * subclass, -initWithAcceleratorPort:); taimenmtlgl=1 also IOGLBundleName
++ * NAME, as flame had it. Hash-named bundles (SweetMetal-<hash8>) fit
++ * ROOTFIX's write-if-absent rule.
+  */
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
+@@ -583,6 +591,20 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetaccel", &accel, sizeof(accel));
+ 	IOAcceleratorES *es = accel ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (es != NULL && es->init() && es->attach(this)) {
++		char mtl[64] = "", mtlclass[64] = "SweetMTLDevice";
++		int mtlgl = 0;
++		if (PE_parse_boot_arg_str("taimenmtl", mtl, sizeof(mtl)) && mtl[0] != 0) {
++			(void)PE_parse_boot_arg_str("taimenmtlclass", mtlclass, sizeof(mtlclass));
++			(void)PE_parse_boot_argn("taimenmtlgl", &mtlgl, sizeof(mtlgl));
++			es->setProperty("MetalPluginName", mtl);
++			es->setProperty("MetalPluginClassName", mtlclass);
++			if (mtlgl) {
++				es->setProperty("IOGLBundleName", mtl);
++			}
++			es->setProperty("model", "Adreno 540");
++			IOLog("SWEET MTL: IOAcceleratorES with MetalPluginName %s, class %s%s\n", mtl, mtlclass,
++			    mtlgl ? ", IOGLBundleName" : "");
++		}
+ 		es->registerService();
+ 	}
+ 	OSSafeReleaseNULL(es);
