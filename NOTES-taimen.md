@@ -901,3 +901,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   covers it) and gave nothing actionable; 0289 removes it. Also found: icnss's default quirks are VBATT_DISABLE
   and FW_REJUVENATE_ENABLE, i.e. Android never sends VBATT but does register for the rejuvenate indication.
   0289: no VBATT, rejuvenate_enable in IND_REGISTER, REJUVENATE indications logged and ACKed.
+- 2026-10-24 boot 121 (r109 = +0263-0289, a plain ROOTFIX + taimenwifi=10, 420 s): rejuvenate registered, no
+  VBATT: no REJUVENATE indication ever came, FATAL at +14.2 s as before (scan 39 networks). Four changes to match
+  icnss (IPA clock, power cycle, rejuvenate, no VBATT) did nothing for the starvation. The one standing anomaly
+  on our side: the modem opens ten GLINK channels besides IPCRTR (glink_ssr, SSM_RTR_MODEM_APPS, apr_voice_svc,
+  apr_apps2, LOOPBACK_CTL_MPSS, DS, DATA1-4, DATA11) and none was ever acknowledged. 0290 acknowledges and opens
+  them all, gives them intents and discards what arrives (counted).

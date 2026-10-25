@@ -1,0 +1,179 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 2a0886f..e54a651 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -1320,18 +1320,77 @@ send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
+ 	tx_write(&m, sizeof(m), NULL, 0);
+ }
+ 
++/*
++ * 0290: the modem's other channels (glink_ssr, SSM_RTR_MODEM_APPS, apr_*, LOOPBACK_CTL_MPSS, DS,
++ * DATA1-4/11) were never acknowledged. Android's daemons open them; a modem task waiting on one of
++ * them would look like the DOG_HB starvation that follows WLAN mission (boots 116-121). Each one is
++ * now acknowledged and opened from our side, given receive intents, and what comes in is counted
++ * and discarded.
++ */
++struct xchan { char name[33]; uint32_t rcid, lcid, rx, bytes; bool acked, closed; };
++static struct xchan g_x[16];
++static unsigned g_nx;
++
+ static void
+-send_open(void)
++send_open_ch(uint32_t lcid, const char *name)
+ {
+-	struct { struct glink_msg m; char name[8]; } __attribute__((packed)) req = {};
++	struct { struct glink_msg m; char name[40]; } __attribute__((packed)) req = {};
++	uint32_t l = (uint32_t)strlen(name) + 1;
+ 	req.m.cmd = CMD_OPEN;
+-	req.m.p1 = CHAN_LCID;
+-	req.m.p2 = sizeof(CHAN_NAME);
+-	memcpy(req.name, CHAN_NAME, sizeof(CHAN_NAME));
+-	tx_write(&req, sizeof(req), NULL, 0);
++	req.m.p1 = (uint16_t)lcid;
++	req.m.p2 = l;
++	memcpy(req.name, name, MIN(l, 39u));
++	tx_write(&req, sizeof(struct glink_msg) + ((l + 7) & ~7u), NULL, 0);
++}
++
++static void
++send_open(void)
++{
++	send_open_ch(CHAN_LCID, CHAN_NAME);
+ 	g_open_sent = true;
+ }
+ 
++/* our lcid for the modem's channel id */
++static uint32_t
++lcid_of(uint32_t rcid)
++{
++	if (rcid == g_rcid) {
++		return CHAN_LCID;
++	}
++	for (unsigned i = 0; i < g_nx; i++) {
++		if (g_x[i].rcid == rcid) {
++			return g_x[i].lcid;
++		}
++	}
++	return CHAN_LCID;
++}
++
++static struct xchan *
++xchan_by_rcid(uint32_t rcid)
++{
++	for (unsigned i = 0; i < g_nx; i++) {
++		if (g_x[i].rcid == rcid && rcid != g_rcid) {
++			return &g_x[i];
++		}
++	}
++	return NULL;
++}
++
++static void
++advertise_intents_ch(uint32_t lcid, uint32_t count, uint32_t size)
++{
++	struct { struct glink_msg m; uint32_t pair[2 * OUR_INTENTS]; } __attribute__((packed)) m = {};
++	count = MIN(count, (uint32_t)OUR_INTENTS);
++	m.m.cmd = CMD_INTENT;
++	m.m.p1 = (uint16_t)lcid;
++	m.m.p2 = count;
++	for (uint32_t i = 0; i < count; i++) {
++		m.pair[2 * i] = size;
++		m.pair[2 * i + 1] = g_next_intent++;
++	}
++	tx_write(&m, sizeof(struct glink_msg) + 8 * count, NULL, 0);
++}
++
+ static void
+ advertise_intents(uint32_t count, uint32_t size)
+ {
+@@ -1580,6 +1639,15 @@ rx_one(void)
+ 			if (!g_open_sent) {
+ 				send_open();
+ 			}
++		} else if (g_nx < sizeof(g_x) / sizeof(g_x[0])) {
++			struct xchan *x = &g_x[g_nx];
++			bzero(x, sizeof(*x));
++			strlcpy(x->name, name, sizeof(x->name));
++			x->rcid = m.p1;
++			x->lcid = 2 + g_nx;                 /* IPCRTR is 1 */
++			g_nx++;
++			send_cmd(CMD_OPEN_ACK, (uint16_t)x->rcid, 0);
++			send_open_ch(x->lcid, x->name);
+ 		}
+ 		break;
+ 	}
+@@ -1589,6 +1657,12 @@ rx_one(void)
+ 		if (m.p1 == CHAN_LCID) {
+ 			g_open_acked = true;
+ 		}
++		for (unsigned i = 0; i < g_nx; i++) {
++			if (g_x[i].lcid == m.p1 && !g_x[i].acked) {
++				g_x[i].acked = true;
++				advertise_intents_ch(g_x[i].lcid, 4, 0x800);
++			}
++		}
+ 		break;
+ 	case CMD_CLOSE:
+ 		rx_advance(8);
+@@ -1596,6 +1670,8 @@ rx_one(void)
+ 		send_cmd(CMD_CLOSE_ACK, m.p1, 0);
+ 		if (m.p1 == g_rcid) {
+ 			g_remote_open = false;
++		} else if (xchan_by_rcid(m.p1) != NULL) {
++			xchan_by_rcid(m.p1)->closed = true;
+ 		}
+ 		break;
+ 	case CMD_INTENT:
+@@ -1630,11 +1706,13 @@ rx_one(void)
+ 			}
+ 		}
+ 		break;
+-	case CMD_RX_INTENT_REQ:
++	case CMD_RX_INTENT_REQ: {
+ 		rx_advance(8);
+-		advertise_intents(1, MAX(m.p2, OUR_INTENT_SIZE));
+-		send_cmd(CMD_RX_INTENT_REQ_ACK, CHAN_LCID, 1);
++		uint32_t lc = lcid_of(m.p1);
++		advertise_intents_ch(lc, 1, MAX(m.p2, OUR_INTENT_SIZE));
++		send_cmd(CMD_RX_INTENT_REQ_ACK, (uint16_t)lc, 1);
+ 		break;
++	}
+ 	case CMD_RX_INTENT_REQ_ACK:
+ 		rx_advance(8);
+ 		if (m.p2 == 0) {
+@@ -1669,14 +1747,21 @@ rx_one(void)
+ 		}
+ 		rx_advance(n);
+ 		if (hdr[1] == 0) {
++			uint32_t lc = lcid_of(m.p1);
+ 			if (m.p1 == g_rcid) {
+ 				qrtr_rx(g_asm, g_asm_len);
++			} else if (xchan_by_rcid(m.p1) != NULL) {
++				struct xchan *x = xchan_by_rcid(m.p1);
++				if (x->rx++ == 0) {
++					LOG("M5: t=%u ms: glink %s: first message, %u bytes (discarded)", g_ms, x->name, g_asm_len);
++				}
++				x->bytes += g_asm_len;
+ 			}
+ 			if (g_features & 1) {
+-				send_cmd(CMD_RX_DONE_W_REUSE, CHAN_LCID, m.p2);
++				send_cmd(CMD_RX_DONE_W_REUSE, (uint16_t)lc, m.p2);
+ 			} else {
+-				send_cmd(CMD_RX_DONE, CHAN_LCID, m.p2);
+-				advertise_intents(1, OUR_INTENT_SIZE);
++				send_cmd(CMD_RX_DONE, (uint16_t)lc, m.p2);
++				advertise_intents_ch(lc, 1, lc == CHAN_LCID ? OUR_INTENT_SIZE : 0x800);
+ 			}
+ 		}
+ 		break;
+@@ -1791,6 +1876,10 @@ glink_summary(void)
+ 	LOG("M5: glink rx %u msgs, tx %u, IPCRTR %s, modem intents %u, txq %u drops %u; qrtr node %#x hello %u, "
+ 	    "%u services, %u RESUME_TX", g_rx_msgs, g_tx_msgs, chan_up() ? "UP" : "down", g_ri_count,
+ 	    g_txq_tail - g_txq_head, g_txq_drops, q_modem_node, q_hello_rx, q_srv_count, q_resumes);
++	for (unsigned i = 0; i < g_nx; i++) {
++		LOG("M5:   channel %s: rcid %u lcid %u %s%s, %u messages, %u bytes", g_x[i].name, g_x[i].rcid, g_x[i].lcid,
++		    g_x[i].acked ? "open" : "not acked", g_x[i].closed ? " (closed by the modem)" : "", g_x[i].rx, g_x[i].bytes);
++	}
+ 	if (m6_on) {
+ 		svc_summary();
+ 	}
