@@ -150,7 +150,9 @@ def launchd(plist, daemons=()):
             renamed += 1
     gone = ('com.apple.CommCenter', 'com.apple.fairplayd.H2', 'com.apple.voicemail.vmd',
             'com.apple.ReportCrash', 'com.apple.spindump', 'com.apple.tailspind',
-            'com.apple.aggregated', 'com.apple.aggregated.addaily')
+            'com.apple.aggregated', 'com.apple.aggregated.addaily',
+            # boot 149: relaunched 546 times in 15 minutes (on demand, ThrottleInterval 0), exits at once
+            'com.apple.lskdd')
     removed = [k for k, j in jobs.items() if j.get('Label') in gone]
     for k in removed:
         del jobs[k]
@@ -179,6 +181,10 @@ def main():
     ap.add_argument('--remove', action='append', default=[], metavar='/PATH',
                     help='remove a file at boot (before the --file/--zfile records)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
+    ap.add_argument('--write', action='append', default=[], metavar='/DEST=SRC[:UID]',
+                    help='write a file at boot even if it exists (mode 0644, owner UID, default 0)')
+    ap.add_argument('--locationd', action='store_true',
+                    help='Location Services on (root\'s com.apple.locationd.plist): no "Turn On Location Services" alerts')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--phone-tools', metavar='DIR',
                     help='install the phone-tools CI build in DIR (tools/windows/ci-phone-tools.sh): '
@@ -273,6 +279,14 @@ def main():
     for path in a.remove:
         assert path.startswith('/'), path
         b.add(REMOVE, path)
+    if a.locationd:
+        b.plist(WRITE, '/private/var/root/Library/Preferences/com.apple.locationd.plist',
+                {'LocationServicesEnabledIn7.0': True, 'LocationServicesEnabled': True}, 0o600, 0, 0)
+    for f in a.write:
+        dest, src = f.split('=', 1)
+        src, _, uid = src.partition(':')
+        assert dest.startswith('/'), dest
+        b.add(WRITE, dest, open(src, 'rb').read(), 0o644, int(uid or 0), int(uid or 0))
     for f in a.file:
         dest, src = f.split('=', 1)
         assert dest.startswith('/'), dest
