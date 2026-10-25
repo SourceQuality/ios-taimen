@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Build the Gallium shim (sg_*.c) as a static library against a host Mesa build tree:
+#   tools/sweetmtl/gallium/build-host.sh MESA_SRC MESA_BUILD OUT_DIR
+# The compiler flags (include paths, Mesa's configure-time defines) are those Mesa's own build
+# gives freedreno_resource.c (compile_commands.json), as tools/sweetgl/build.sh takes the state
+# tracker's. Output: OUT_DIR/libsweetgallium.a and OUT_DIR/mesa-libs.txt (the Mesa static
+# libraries to link after it, in order).
+set -euo pipefail
+H=$(cd "$(dirname "$0")" && pwd)
+M=$(cd "$1" && pwd)
+B=$(cd "$2" && pwd)
+O=$3
+mkdir -p "$O"
+CC=${CC:-cc}
+python3 -I - "$B/compile_commands.json" "$O/mesa-flags.rsp" <<'PY'
+import json, shlex, sys, os
+cc = json.load(open(sys.argv[1]))
+e = [x for x in cc if x["file"].endswith("drivers/freedreno/freedreno_resource.c")][0]
+d = e["directory"]
+args = shlex.split(e["command"])
+out = []
+i = 0
+while i < len(args):
+    a = args[i]
+    if a.startswith("-I"):
+        p = a[2:]
+        out.append("-I" + os.path.normpath(os.path.join(d, p)))
+    elif a.startswith("-D") or a.startswith("-std=") or a.startswith("-f") and a in ("-fno-math-errno", "-fno-trapping-math", "-fvisibility=hidden"):
+        out.append(a)
+    elif a == "-include":
+        out += ["-include", os.path.normpath(os.path.join(d, args[i + 1]))]
+        i += 1
+    i += 1
+open(sys.argv[2], "w").write("\n".join(shlex.quote(x) for x in out) + "\n")
+PY
+EXTRA="-I$M/src/gallium/drivers/freedreno -I$M/src/freedreno -I$M/src/freedreno/common
+	-I$M/src/gallium/auxiliary -I$M/src/gallium/include -I$M/src/gallium/winsys -I$M/include
+	-I$M/src -I$B/src -I$B/src/freedreno/common -I$B/src/compiler/nir -I$B/src/compiler/spirv
+	-I$M/src/compiler/nir -I$M/src/compiler -I$B/src/compiler -I$M/src/vulkan/util
+	-I$M/src/gallium/drivers -I$H/../../sweetgl"
+OBJS=
+for f in sg_device sg_resource sg_shader sg_replay sg_format sg_map; do
+	$CC -c -O2 -g -fPIC -Wall -Wno-unused-function -Wno-missing-field-initializers \
+		@"$O/mesa-flags.rsp" $EXTRA -o "$O/$f.o" "$H/$f.c"
+	OBJS="$OBJS $O/$f.o"
+done
+rm -f "$O/libsweetgallium.a"
+ar rcs "$O/libsweetgallium.a" $OBJS
+# Mesa's static libraries for the shim, in link order (the gallium driver first).
+cat > "$O/mesa-libs.txt" <<EOF
+$B/src/gallium/winsys/freedreno/drm/libfreedrenowinsys.a
+$B/src/gallium/drivers/freedreno/libfreedreno.a
+$B/src/freedreno/drm/libfreedreno_drm.a
+$B/src/freedreno/ir3/libfreedreno_ir3.a
+$B/src/freedreno/ir2/libfreedreno_ir2.a
+$B/src/freedreno/fdl/libfreedreno_layout.a
+$B/src/freedreno/common/libfreedreno_common.a
+$B/src/freedreno/perfcntrs/libfreedreno_perfcntrs.a
+$B/src/freedreno/isa/libir3encode.a
+$B/src/freedreno/isa/libir3decode.a
+$B/src/compiler/isaspec/libisaspec.a
+$B/src/gallium/auxiliary/libgallium.a
+$B/src/compiler/spirv/libvtn.a
+$B/src/compiler/nir/libnir.a
+$B/src/compiler/libcompiler.a
+$B/src/util/libxmlconfig.a
+$B/src/util/libmesa_util.a
+$B/src/util/libmesa_util_simd.a
+$B/src/util/libmesa_util_clflush.a
+$B/src/util/libmesa_util_clflushopt.a
+$B/src/util/blake3/libblake3.a
+$B/src/c11/impl/libmesa_util_c11.a
+EOF
+echo "$O/libsweetgallium.a"

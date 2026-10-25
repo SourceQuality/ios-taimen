@@ -1,0 +1,33 @@
+[package]
+name = "native-metal-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "flame's native Metal bridge (C ABI for the Objective-C frontend) over sweetmtl-runtime"
+build = "build.rs"
+
+[workspace]
+
+[lib]
+name = "native_metal_bridge"
+path = "NativeMetalBridge.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+metal2vulkan = { path = "../m2v/crates/metal2vulkan" }
+sweetmtl-runtime = { path = "../runtime" }
+libc = "0.2"
+
+[profile.release]
+panic = "unwind"
+debug = 1
+incremental = true
+
+[profile.dev]
+panic = "unwind"
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

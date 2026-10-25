@@ -1,0 +1,17 @@
+[package]
+name = "sweetmtl-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "The Metal object model on Mesa Gallium freedreno (Adreno 540) for taimen's Metal bridge"
+
+[lib]
+name = "sweetmtl_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+# The metal2vulkan translator at the pin with flame's patches (tools/sweetmtl/m2v-fetch.sh puts
+# it, or a link to an existing checkout, at tools/sweetmtl/m2v).
+metal2vulkan = { path = "../m2v/crates/metal2vulkan" }
+libc = "0.2"
