@@ -939,3 +939,6 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   clock, the power cycle at FW_READY, rejuvenate, VBATT, the unacknowledged GLINK channels, HOST_CAP (no
   daemon), BoB PWM and S3/S5. The 80-byte SFR does not name the task. Stopped guessing here; next steps need a
   known-good reference (e.g. this firmware under a mainline kernel) or a different priority.
+- 2026-10-24 boot 127 (r115 = +0263-0295, a plain ROOTFIX + taimenwifi=10, 420 s): host_version "5.2.1.1L" in
+  WLAN_CFG (accepted); FW_READY, mission, scan (32 networks); FATAL at +14.21 s as before. Every difference left
+  in our messages up to the mission mode has now been matched to icnss (and HOST_CAP to mainline) with no effect.
