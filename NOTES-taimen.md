@@ -913,3 +913,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (scan 43 networks). Ruled out so far for the starvation: the HTT rx ring, the IPA clock, the power cycle at
   FW_READY, rejuvenate/VBATT, the unacknowledged channels. Boot 123 bisects: FW_READY, then the WLAN left off
   as Android does without a WLAN driver (taimenmission=0, 0291), no WLAN_CFG/mission.
+- 2026-10-24 boot 123 (r111 = +0263-0291, a plain ROOTFIX + taimenwifi=8 taimenmission=0, 360 s): FW_READY at
+  +4.70 s, the WLAN hardware powered off and left off (Android without a WLAN driver), no WLAN_CFG/mission:
+  **the modem stayed up the whole 200 s watch.** So the starvation comes from WLAN_CFG or WLAN_MODE, not from
+  the BDF or FW_READY. Boot 124: taimenmission=2, WLAN_CFG without WLAN_MODE (0292).

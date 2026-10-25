@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 7a196c2..755a2c3 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2645,6 +2645,7 @@ static uint64_t w_msa_pa;
+ static const uint8_t *w_bdf;
+ static uint32_t w_bdf_len, w_bdf_off, w_bdf_seg;
+ static bool w_fw_ready, w_mission;
++static uint32_t w_mission_arg = 1;              /* taimenmission: 0 off after FW_READY, 2 WLAN_CFG only */
+ static const char *w_step = "not started";
+ 
+ struct wmsg { uint8_t b[1024]; uint32_t n; };
+@@ -2936,9 +2937,8 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 				 * stays off, no WLAN_CFG or mission mode. Boots 116-122 all died 9.5 s after mission;
+ 				 * this tells FW_READY from mission mode.
+ 				 */
+-				uint32_t mission = 1;
+-				(void)PE_parse_boot_argn("taimenmission", &mission, sizeof(mission));
+-				if (mission == 0) {
++				(void)PE_parse_boot_argn("taimenmission", &w_mission_arg, sizeof(w_mission_arg));
++				if (w_mission_arg == 0) {
+ 					LOG("M7: t=%u ms: taimenmission=0: WLAN left off after FW_READY, no WLAN_CFG/mission", g_ms);
+ 					w_step = "FW_READY, left off (taimenmission=0)";
+ 					return;
+@@ -3054,6 +3054,11 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		break;
+ 	case WLFW_WLAN_CFG:
+ 		LOG("M7: t=%u ms: wlan_cfg %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (ok && w_mission_arg == 2) {
++			LOG("M7: t=%u ms: taimenmission=2: WLAN_CFG only, no WLAN_MODE", g_ms);
++			w_step = "WLAN_CFG only (taimenmission=2)";
++			break;
++		}
+ 		if (ok) {
+ 			wm_new(&m, WLFW_WLAN_MODE);
+ 			wm_u32(&m, 0x01, 0);                /* mission */
