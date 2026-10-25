@@ -949,3 +949,6 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   and the RPM drops votes from before scaling (the DDR rate vote, sweet_rpm.c). 0296 votes QDSS, RF_CLK2 and
   RF_CLK2_PIN again in both sets with the WLAN rails, after scaling. Also noted for later (postmarketOS msm8998):
   iwd's ControlPortOverNL80211=false "is required to avoid modem firmware crash".
+- 2026-10-24 boot 128 (r116 = +0263-0296, a plain ROOTFIX + taimenwifi=10, 420 s): QDSS (clk0 1 Enab), RF_CLK2 and
+  RF_CLK2_PIN voted again in both sets after clock scaling (all acked); FW_READY, mission, scan (33 networks);
+  FATAL at +14.19 s as before. The clock votes alone are not mainline's fix here.
