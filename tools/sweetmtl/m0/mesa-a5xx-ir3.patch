@@ -1,0 +1,68 @@
+diff --git a/src/freedreno/ir3/ir3_compiler.c b/src/freedreno/ir3/ir3_compiler.c
+index 2f35c19..2dc2a91 100644
+--- a/src/freedreno/ir3/ir3_compiler.c
++++ b/src/freedreno/ir3/ir3_compiler.c
+@@ -373,7 +373,10 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
+ 
+    compiler->bool_type = (compiler->gen >= 5) ? TYPE_U16 : TYPE_U32;
+    compiler->has_shared_regfile = compiler->gen >= 5;
+-   compiler->has_bitwise_triops = compiler->gen >= 5;
++   /* The a5xx ISA is not known to have the cat3-alt encodings (isa/ir3-cat3.xml:
++    * gen min 600): keep sh[lr][gm]/andg for a6xx and later.
++    */
++   compiler->has_bitwise_triops = compiler->gen >= 6;
+    compiler->cat3_rel_offset_0_quirk = compiler->gen <= 5;
+ 
+    /* The driver can't request this unless preambles are supported. */
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index ac29692..3d7b25e 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1214,6 +1214,10 @@ ir3_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes,
+    if (intrin == nir_intrinsic_load_ubo)
+       bit_size = 32;
+ 
++   const struct ir3_compiler *compiler = cb_data;
++   if (intrin == nir_intrinsic_load_ssbo && compiler && compiler->gen < 6)
++      bit_size = 32;
++
+    return (nir_mem_access_size_align){
+       .num_components = MAX2(1, MIN2(bytes / (bit_size / 8), 4)),
+       .bit_size = bit_size,
+@@ -1585,6 +1589,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+                nir_var_mem_global | nir_var_mem_shared |
+                nir_var_function_temp | nir_var_mem_ssbo | nir_var_mem_global,
+       .callback = ir3_mem_access_size_align,
++      .cb_data = so->compiler,
+    };
+ 
+    progress |= OPT(s, nir_lower_mem_access_bit_sizes, &mem_bit_size_options);
+@@ -1872,7 +1877,7 @@ ir3_nir_scan_driver_consts(struct ir3_compiler *compiler, nir_shader *shader,
+                   /* a4xx gets these supplied by the hw directly (maybe CP?) */
+                   if (compiler->gen == 5 &&
+                      !(intr->intrinsic == nir_intrinsic_image_load &&
+-                        !(nir_intrinsic_access(intr) & ACCESS_COHERENT))) {
++                        (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER))) {
+                      idx = nir_src_as_uint(intr->src[0]);
+                      if (image_dims->mask & (1 << idx))
+                         break;
+diff --git a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+index 3a1a41d..617de06 100644
+--- a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
++++ b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+@@ -706,6 +706,15 @@ ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v)
+          nir_builder builder = nir_builder_create(function->impl);
+          nir_foreach_block (block, function->impl) {
+             nir_foreach_instr_safe (instr, block) {
++               /* A load that stays a load (control flow, no speculation) still
++                * needs its UBO's pointer on a5xx and older (ldg).
++                */
++               if (instr->type == nir_instr_type_intrinsic &&
++                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_ubo &&
++                   !ir3_nir_is_prefetchable(nir_instr_as_intrinsic(instr))) {
++                  track_ubo_use(nir_instr_as_intrinsic(instr), &builder, &num_ubos);
++                  continue;
++               }
+                if (!instr_is_load_ubo(instr))
+                   continue;
+                progress |= lower_ubo_load_to_uniform(

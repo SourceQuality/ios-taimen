@@ -24,6 +24,11 @@ Marked **(unverified)**: inferences that no file in hand confirms.
 - **Two hard blockers, both testable on the PC before the phone (M0):**
   1. **ir3 has no global memory ops on a4xx/a5xx.** `ir3_a4xx.c` sets `.emit_intrinsic_load_global_ir3 = NULL` and `.emit_intrinsic_store_global_ir3 = NULL`, and global atomics are `unreachable("Global atomic are unimplemented on A5xx")`. CA's shaders follow 64-bit `gpuAddress` pointers (flame `HANDOFF.md:697-700`). The translator emits those as buffer-device-address loads, and refuses `DereferenceLoadedPointer` without them (`REFUSALS.md`). a5xx already loads UBOs with `ldg` from 64-bit addresses, so a `load_global_ir3`/`store_global_ir3` for a5xx should be a small Mesa patch **(unverified until it compiles and runs)**.
   2. **No framebuffer fetch on a5xx** (`PIPE_CAP_FBFETCH` is a6xx-only). CA picks the Apple-family `_lph` shaders, which blend in the shader (`fc_framebuffer_fetch=1`, flame `HANDOFF.md:705-706`). We emulate it the way sweetgl already does for GL: sample the render target behind a texture barrier (`eagl.c:298-345, 961-1000` and `mesa.patch` `fd5_texture_barrier`). The translator's profile has to claim `rasterizationOrderColorAttachmentAccess`, which this emulation provides only between draws.
+- **M0 result (2026-10-25, `tools/sweetmtl/m0/README.md`): passed.**
+  - **Translation:** 139 of CA's 141 functions translate. The 2 `inplace_copy` shaders need pixel interlock.
+  - **ir3:** all 232 SPIR-V stages compile with ir3 for gpu 540, with no spills, after four small ir3 fixes (`mesa-a5xx-ir3.patch`).
+  - **Blocker 1 does not arise for CA:** no stage uses buffer-device-address pointers, so no `ldg`/`stg` patch is needed for it.
+  - **Blocker 2:** framebuffer fetch (18 stages) compiles as a texel fetch of the attachment at the fragment coordinate.
 - **Order:**
   - **M0** (PC only): translate and compile CA's shaders for a540, and run the Gallium backend on drm-shim.
   - **M1**: a device in a test tool.
@@ -218,6 +223,12 @@ Verdict: yes, everything CA's compositor needs exists on a5xx, except **global l
 - Then run the Gallium shim (4.2) on the freedreno drm-shim with `FD_GPU_ID=540`: device, buffer, texture, pipeline, a recorded draw (no execution; check it with `cffdump`).
 - **Pass:** a refusal list and an ir3 failure list for CA, with counts comparable to flame's 230/242; the `ldg` patch compiles CA's pointer loads.
 - **Decision gate:** if the translator demands features we cannot fake, read its refusals and choose between profile tweaks, a translator patch, or plan B (c2).
+- **Result (2026-10-25): gate passed**, see `tools/sweetmtl/m0/README.md`.
+  - **Refusals:** 2 of 141, `inplace_copy_lp[fh]` (raster order groups).
+  - **ir3 failures:** none of 232 stages, with `mesa-a5xx-ir3.patch`. It fixes four a5xx ir3 paths GL ES never takes: image dims for non-reorderable image loads, 16-bit SSBO loads, UBO pointers for loads in control flow, and no bitwise triops before a6xx.
+  - **`ldg`:** no patch is needed for CA.
+  - **Not done in M0:** the drm-shim run of the Gallium shim moves to M1.
+  - **Open question:** whether a5xx really lacks the triops. sweetgl runs today with them enabled.
 
 **M0b: a dev loop without reboots** (recommended, small): `tools/phone/devd`, a root launchd daemon on the USB link (192.168.7.2).
 - It takes `put PATH` (file over TCP), `run ARGV`, and `kill NAME`, and lives next to netsvcd. It is enabled by a boot-arg or file only: a dev phone over USB, never Wi-Fi.

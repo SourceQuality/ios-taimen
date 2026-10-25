@@ -1,0 +1,10 @@
+[package]
+name = "m0dump"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+metal2vulkan = { path = "../../../../../research/m0/metal2vulkan/crates/metal2vulkan", features = ["serde"] }
+serde_json = "1"
+
+[workspace]
