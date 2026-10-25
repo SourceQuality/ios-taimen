@@ -1,0 +1,1459 @@
+diff --git a/bsd/dev/taimen_i2c.c b/bsd/dev/taimen_i2c.c
+new file mode 100644
+index 0000000..dee80ab
+--- /dev/null
++++ b/bsd/dev/taimen_i2c.c
+@@ -0,0 +1,409 @@
++/*
++ * Pixel 2 XL (taimen): a polled QUP I2C master for any BLSP QUP, the master taimen_touch.c runs on
++ * BLSP1 QUP5 with its addresses passed in (struct taimen_i2c). First user: the TAS2557 amps on
++ * BLSP2 QUP1 (taimen_tas2557.c, port/docs/taimen-audio-plan.md stage 7).
++ *   init        GCC: the BLSP AHB vote bit (wait for the AHB branch), the QUP's RCGR on XO /1,
++ *               the QUP I2C branch. Pins: function, drive, pull. QUP: SW reset, mini core,
++ *               N = 15, v1 tags (QUP_I2C_MASTER_GEN 0); FIFO sizes from QUP_IO_MODE.
++ *   write       START|addr, DATA.., STOP|last in one run: at most taimen_i2c_max_write() bytes,
++ *               EINVAL above (the FIFO is filled once and not refilled; callers split)
++ *   write_read  START|addr, DATA cmd.., START|addr+r, REC|len (repeated start; the REC tag ends
++ *               with NACK + STOP), len <= taimen_i2c_max_read(); ncmd 0 is a plain read
++ * Returns 0, ENXIO (NACK), EIO (bus error, timeout, QUP state) or EINVAL. After EIO the QUP is
++ * reset. No lock: callers serialize (taimen_tas2557.c holds its own mutex).
++ * The struct is defined here and, identically, in taimen_tas2557.c; .size guards the copies.
++ */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define TAIMEN_I2C_PINS 4
++#define TAIMEN_I2C_TAGS 64u             /* cap on FIFO entries per run (local tag array) */
++
++struct taimen_i2c_pin {
++	uint32_t pa;            /* TLMM tile of the pin: CFG +0, IN_OUT +4 */
++	uint8_t gpio;           /* number, for the logs */
++	uint8_t func;           /* mux function (blsp_i2cN) */
++	uint8_t ma;             /* drive strength, 2..16 mA */
++	uint8_t pull;           /* 0 none, 1 down, 3 up */
++};
++
++struct taimen_i2c {
++	/* set by the caller */
++	uint32_t size;          /* sizeof(struct taimen_i2c) */
++	const char *name;       /* for the logs */
++	uint32_t qup_pa;        /* QUP base */
++	uint32_t vote_pa;       /* GCC APCS_CLOCK_BRANCH_ENA_VOTE */
++	uint32_t vote_bit;      /* the BLSP AHB bit in it */
++	uint32_t ahb_cbcr_pa;   /* BLSPn_AHB_CBCR, polled for CLK_OFF */
++	uint32_t cbcr_pa;       /* BLSPn_QUPm_I2C_APPS_CBCR */
++	uint32_t rcgr_pa;       /* its CMD_RCGR; CFG_RCGR at +4 */
++	uint32_t clk_ctl;       /* QUP_I2C_CLK_CTL for the bus speed */
++	unsigned npins;
++	struct taimen_i2c_pin pin[TAIMEN_I2C_PINS];
++	/* set by taimen_i2c_init */
++	vm_offset_t qup, vote, ahb, cbcr, rcgr, tlmm[TAIMEN_I2C_PINS];
++	unsigned tx_max;        /* FIFO entries (16-bit tags) per run */
++	unsigned rx_max;        /* bytes per read */
++	uint32_t last_status;   /* QUP_I2C_STATUS at the last failure */
++	uint32_t last_flags;    /* QUP_ERROR_FLAGS at the last failure */
++	uint32_t last_op;       /* QUP_OPERATIONAL at the last failure */
++	bool ready;
++};
++
++bool taimen_i2c_init(struct taimen_i2c *b);
++int taimen_i2c_write(struct taimen_i2c *b, uint8_t addr7, const uint8_t *buf, unsigned len);
++int taimen_i2c_write_read(struct taimen_i2c *b, uint8_t addr7, const uint8_t *cmd, unsigned ncmd,
++    uint8_t *buf, unsigned len);
++unsigned taimen_i2c_max_write(const struct taimen_i2c *b);
++unsigned taimen_i2c_max_read(const struct taimen_i2c *b);
++
++/* QUP registers (mainline i2c-qup.c), as taimen_touch.c */
++#define QUP_CONFIG        0x000u
++#define QUP_STATE         0x004u
++#define QUP_IO_MODE       0x008u
++#define QUP_SW_RESET      0x00cu
++#define QUP_OPERATIONAL   0x018u
++#define QUP_ERROR_FLAGS   0x01cu
++#define QUP_HW_VERSION    0x030u
++#define QUP_MX_OUTPUT_CNT 0x100u
++#define QUP_OUT_FIFO      0x110u
++#define QUP_MX_WRITE_CNT  0x150u
++#define QUP_MX_INPUT_CNT  0x200u
++#define QUP_MX_READ_CNT   0x208u
++#define QUP_IN_FIFO       0x218u
++#define QUP_I2C_CLK_CTL   0x400u
++#define QUP_I2C_STATUS    0x404u
++#define QUP_I2C_MASTER_GEN 0x408u
++#define QUP_STATE_RESET   0u
++#define QUP_STATE_RUN     1u
++#define QUP_STATE_PAUSE   3u
++#define QUP_STATE_VALID   (1u << 2)
++#define QUP_STATE_MASTER  (1u << 4)
++#define QUP_IN_NOT_EMPTY  (1u << 5)
++#define QUP_OUT_FULL      (1u << 6)
++#define QUP_OUT_SVC       (1u << 8)
++#define QUP_IN_SVC        (1u << 9)
++#define QUP_MX_OUTPUT_DONE (1u << 10)
++#define QUP_NO_INPUT      (1u << 7)
++#define QUP_MINI_CORE     (2u << 8)
++#define QUP_N_VAL         15u
++#define QUP_REPACK_EN     (3u << 14)
++#define QUP_TAG_START     (1u << 8)
++#define QUP_TAG_DATA      (2u << 8)
++#define QUP_TAG_STOP      (3u << 8)
++#define QUP_TAG_REC       (4u << 8)
++#define QUP_NACK          (1u << 3)
++#define QUP_BUS_ACTIVE    (1u << 8)
++#define QUP_BUS_ERRORS    0x38000fcu
++#define QUP_ERRORS        0x7cu
++#define GCC_CLK_OFF       (1u << 31)
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* One register: map its page, return the register's own address. */
++static vm_offset_t
++map_reg(uint32_t pa)
++{
++	vm_offset_t page = ml_io_map(pa & ~0xfffu, 0x1000);
++	return page ? page + (pa & 0xfffu) : 0;
++}
++
++static bool
++i2c_clocks(struct taimen_i2c *b)
++{
++	wr(b->vote, 0, rd(b->vote, 0) | (1u << b->vote_bit));                  /* BLSP AHB */
++	for (unsigned i = 0; i < 1000 && (rd(b->ahb, 0) & GCC_CLK_OFF); i++) {
++		delay(1);
++	}
++	uint32_t cfg = rd(b->rcgr, 4);
++	if (((cfg >> 8) & 7u) != 0 || (cfg & 0x1fu) != 1u) {
++		wr(b->rcgr, 4, 1u);                                     /* XO, divide by 1 */
++		wr(b->rcgr, 0, rd(b->rcgr, 0) | 1u);                    /* UPDATE */
++		for (unsigned i = 0; i < 1000 && (rd(b->rcgr, 0) & 1u); i++) {
++			delay(1);
++		}
++	}
++	wr(b->cbcr, 0, rd(b->cbcr, 0) | 1u);                            /* CLK_ENABLE */
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(rd(b->cbcr, 0) & GCC_CLK_OFF)) {
++			printf("TAIMEN I2C: %s: clocks on (vote %#x ahb %#x cbcr %#x rcgr %#x/%#x, cfg was %#x)\n",
++			    b->name, rd(b->vote, 0), rd(b->ahb, 0), rd(b->cbcr, 0), rd(b->rcgr, 0), rd(b->rcgr, 4), cfg);
++			return true;
++		}
++		delay(1);
++	}
++	printf("TAIMEN I2C: %s: QUP I2C clock stays off (cbcr %#x ahb %#x vote %#x rcgr %#x/%#x)\n",
++	    b->name, rd(b->cbcr, 0), rd(b->ahb, 0), rd(b->vote, 0), rd(b->rcgr, 0), rd(b->rcgr, 4));
++	return false;
++}
++
++/* TLMM CFG: pull 1:0, function 5:2, drive 8:6 = mA/2 - 1, OE 9 (off: the QUP drives the pins). */
++static void
++i2c_pins(struct taimen_i2c *b)
++{
++	for (unsigned i = 0; i < b->npins; i++) {
++		const struct taimen_i2c_pin *p = &b->pin[i];
++		unsigned ma = p->ma < 2 ? 2u : (p->ma > 16 ? 16u : p->ma);
++		uint32_t was = rd(b->tlmm[i], 0);
++		wr(b->tlmm[i], 0, (p->pull & 3u) | ((uint32_t)(p->func & 0xfu) << 2) | ((ma / 2u - 1u) << 6));
++		printf("TAIMEN I2C: %s: gpio%u cfg %#x -> %#x, in %u\n", b->name, p->gpio, was,
++		    rd(b->tlmm[i], 0), rd(b->tlmm[i], 4) & 1u);
++	}
++}
++
++static bool
++qup_state(struct taimen_i2c *b, uint32_t state)
++{
++	for (unsigned i = 0; i < 100; i++) {
++		uint32_t s = rd(b->qup, QUP_STATE);
++		if ((s & QUP_STATE_VALID) && (s & 3u) == state) {
++			return true;
++		}
++		if (s & QUP_STATE_VALID) {
++			wr(b->qup, QUP_STATE, state);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++qup_reset(struct taimen_i2c *b)
++{
++	wr(b->qup, QUP_SW_RESET, 1);
++	delay(10);
++	if (!qup_state(b, QUP_STATE_RESET)) {
++		printf("TAIMEN I2C: %s: QUP does not reach RESET (state %#x)\n", b->name, rd(b->qup, QUP_STATE));
++		return false;
++	}
++	wr(b->qup, QUP_CONFIG, QUP_MINI_CORE | QUP_N_VAL);
++	wr(b->qup, QUP_I2C_MASTER_GEN, 0);     /* v1 tags */
++	return true;
++}
++
++/* Error bits seen: clear them, keep them for the caller's log, NACK -> ENXIO. */
++static int
++qup_fail(struct taimen_i2c *b, uint32_t bus, uint32_t qerr)
++{
++	b->last_status = rd(b->qup, QUP_I2C_STATUS);
++	b->last_flags = rd(b->qup, QUP_ERROR_FLAGS);
++	b->last_op = rd(b->qup, QUP_OPERATIONAL);
++	wr(b->qup, QUP_ERROR_FLAGS, qerr);
++	wr(b->qup, QUP_I2C_STATUS, bus);
++	return (bus & QUP_NACK) ? ENXIO : EIO;
++}
++
++/*
++ * One QUP run: nt tags (two per FIFO word, low half first), then nin bytes in if nin > 0.
++ * FIFO mode: everything fits the FIFOs, so the output FIFO is filled once in PAUSE.
++ */
++static int
++qup_run(struct taimen_i2c *b, const uint16_t *tag, unsigned nt, uint8_t *in, unsigned nin)
++{
++	vm_offset_t q = b->qup;
++	unsigned pos = 0;
++	int err = EIO;
++	bool bus_err = false;
++	if (!qup_state(b, QUP_STATE_RESET) || !(rd(q, QUP_STATE) & QUP_STATE_MASTER)) {
++		goto out;
++	}
++	wr(q, QUP_MX_OUTPUT_CNT, 0);
++	wr(q, QUP_MX_WRITE_CNT, nt);
++	if (nin) {
++		wr(q, QUP_MX_INPUT_CNT, 0);
++		wr(q, QUP_MX_READ_CNT, nin);
++	}
++	wr(q, QUP_CONFIG, QUP_MINI_CORE | QUP_N_VAL | (nin ? 0u : QUP_NO_INPUT));
++	wr(q, QUP_IO_MODE, QUP_REPACK_EN);
++	if (!qup_state(b, QUP_STATE_RUN)) {
++		goto out;
++	}
++	wr(q, QUP_I2C_CLK_CTL, b->clk_ctl);
++	if (!qup_state(b, QUP_STATE_PAUSE)) {
++		goto out;
++	}
++	for (unsigned i = 0; i < nt; i += 2) {
++		if (rd(q, QUP_OPERATIONAL) & QUP_OUT_FULL) {
++			goto out;
++		}
++		wr(q, QUP_OUT_FIFO, tag[i] | (i + 1 < nt ? (uint32_t)tag[i + 1] << 16 : 0u));
++	}
++	if (!qup_state(b, QUP_STATE_RUN)) {
++		goto out;
++	}
++	for (unsigned t = 0; t < 20000; t++) {
++		uint32_t bus = rd(q, QUP_I2C_STATUS) & QUP_BUS_ERRORS;
++		uint32_t qerr = rd(q, QUP_ERROR_FLAGS) & QUP_ERRORS;
++		uint32_t op = rd(q, QUP_OPERATIONAL);
++		if (bus || qerr) {
++			err = qup_fail(b, bus, qerr);
++			bus_err = true;
++			break;
++		}
++		if (op & (QUP_OUT_SVC | QUP_IN_SVC)) {
++			wr(q, QUP_OPERATIONAL, op & (QUP_OUT_SVC | QUP_IN_SVC));
++		}
++		if (nin) {
++			while (pos < nin && (rd(q, QUP_OPERATIONAL) & QUP_IN_NOT_EMPTY)) {
++				uint32_t v = rd(q, QUP_IN_FIFO);
++				in[pos++] = (uint8_t)v;
++				if (pos < nin) {
++					in[pos++] = (uint8_t)(v >> 16);
++				}
++			}
++			if (pos == nin) {
++				err = 0;
++				break;
++			}
++		} else if (op & QUP_MX_OUTPUT_DONE) {
++			err = 0;
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned t = 0; t < 1000 && (rd(q, QUP_I2C_STATUS) & QUP_BUS_ACTIVE); t++) {
++		delay(1);
++	}
++	if (err == 0) {
++		/* a NACK of the last byte shows only once the bus is idle */
++		uint32_t bus = rd(q, QUP_I2C_STATUS) & QUP_BUS_ERRORS;
++		uint32_t qerr = rd(q, QUP_ERROR_FLAGS) & QUP_ERRORS;
++		if (bus || qerr) {
++			err = qup_fail(b, bus, qerr);
++			bus_err = true;
++		}
++	}
++out:
++	if (err == EIO && !bus_err) {
++		b->last_status = rd(q, QUP_I2C_STATUS);
++		b->last_flags = rd(q, QUP_ERROR_FLAGS);
++		b->last_op = rd(q, QUP_OPERATIONAL) | (1u << 31);   /* bit 31: timeout or QUP state, no bus error */
++	}
++	wr(q, QUP_STATE, QUP_STATE_RESET);
++	if (err == EIO) {
++		(void)qup_reset(b);
++	}
++	return err;
++}
++
++bool
++taimen_i2c_init(struct taimen_i2c *b)
++{
++	if (b == NULL || b->size != sizeof(*b) || b->npins > TAIMEN_I2C_PINS || b->name == NULL) {
++		printf("TAIMEN I2C: bad bus descriptor (size %u, expected %u)\n", b ? b->size : 0,
++		    (unsigned)sizeof(*b));
++		return false;
++	}
++	b->ready = false;
++	if (b->qup == 0) {
++		b->qup = ml_io_map(b->qup_pa, 0x1000);
++		b->vote = map_reg(b->vote_pa);
++		b->ahb = map_reg(b->ahb_cbcr_pa);
++		b->cbcr = map_reg(b->cbcr_pa);
++		b->rcgr = map_reg(b->rcgr_pa);
++		bool mapped = b->qup && b->vote && b->ahb && b->cbcr && b->rcgr;
++		for (unsigned i = 0; i < b->npins; i++) {
++			b->tlmm[i] = ml_io_map(b->pin[i].pa, 0x1000);
++			mapped = mapped && b->tlmm[i];
++		}
++		if (!mapped) {
++			printf("TAIMEN I2C: %s: MMIO mapping failed\n", b->name);
++			b->qup = 0;
++			return false;
++		}
++	}
++	if (!i2c_clocks(b)) {
++		return false;
++	}
++	i2c_pins(b);
++	if (!qup_reset(b)) {
++		return false;
++	}
++	/* QUP_IO_MODE: out block 1:0, out FIFO 4:2, in block 6:5, in FIFO 9:7 (bytes; v1: 2 per entry) */
++	static const unsigned blk[4] = {4, 16, 32, 0};
++	uint32_t io = rd(b->qup, QUP_IO_MODE);
++	unsigned out_fifo = blk[io & 3u] * (2u << ((io >> 2) & 7u));
++	unsigned in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u));
++	b->tx_max = MIN(out_fifo / 2u, TAIMEN_I2C_TAGS);
++	b->rx_max = MIN(in_fifo / 2u, 255u);
++	b->last_status = b->last_flags = b->last_op = 0;
++	printf("TAIMEN I2C: %s: QUP hw %#x io %#x, FIFOs out %u in %u bytes: writes up to %u bytes, reads up to %u, "
++	    "clk_ctl %#x, state %#x\n", b->name, rd(b->qup, QUP_HW_VERSION), io, out_fifo, in_fifo,
++	    b->tx_max ? b->tx_max - 1u : 0u, b->rx_max, b->clk_ctl, rd(b->qup, QUP_STATE));
++	if (b->tx_max < 8u || b->rx_max < 4u) {
++		printf("TAIMEN I2C: %s: FIFOs too small\n", b->name);
++		return false;
++	}
++	b->ready = true;
++	return true;
++}
++
++int
++taimen_i2c_write(struct taimen_i2c *b, uint8_t addr7, const uint8_t *buf, unsigned len)
++{
++	uint16_t tag[TAIMEN_I2C_TAGS];
++	if (b == NULL || !b->ready || buf == NULL || addr7 > 0x7fu || len == 0 || len + 1u > b->tx_max) {
++		return EINVAL;
++	}
++	tag[0] = (uint16_t)(QUP_TAG_START | ((unsigned)addr7 << 1));
++	for (unsigned i = 0; i < len; i++) {
++		tag[1 + i] = (uint16_t)((i == len - 1 ? QUP_TAG_STOP : QUP_TAG_DATA) | buf[i]);
++	}
++	return qup_run(b, tag, len + 1u, NULL, 0);
++}
++
++int
++taimen_i2c_write_read(struct taimen_i2c *b, uint8_t addr7, const uint8_t *cmd, unsigned ncmd,
++    uint8_t *buf, unsigned len)
++{
++	uint16_t tag[TAIMEN_I2C_TAGS];
++	unsigned nt = 0;
++	if (b == NULL || !b->ready || buf == NULL || addr7 > 0x7fu || len == 0 || len > b->rx_max ||
++	    (ncmd && cmd == NULL) || ncmd + 3u > b->tx_max) {
++		return EINVAL;
++	}
++	if (ncmd) {
++		tag[nt++] = (uint16_t)(QUP_TAG_START | ((unsigned)addr7 << 1));
++		for (unsigned i = 0; i < ncmd; i++) {
++			tag[nt++] = (uint16_t)(QUP_TAG_DATA | cmd[i]);
++		}
++	}
++	tag[nt++] = (uint16_t)(QUP_TAG_START | ((unsigned)addr7 << 1) | 1u);
++	tag[nt++] = (uint16_t)(QUP_TAG_REC | len);
++	return qup_run(b, tag, nt, buf, len);
++}
++
++/* Payload bytes of one write (the address takes one FIFO entry); 0 before init. */
++unsigned
++taimen_i2c_max_write(const struct taimen_i2c *b)
++{
++	return (b && b->ready) ? b->tx_max - 1u : 0u;
++}
++
++unsigned
++taimen_i2c_max_read(const struct taimen_i2c *b)
++{
++	return (b && b->ready) ? b->rx_max : 0u;
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/bsd/dev/taimen_tas2557.c b/bsd/dev/taimen_tas2557.c
+new file mode 100644
+index 0000000..2347754
+--- /dev/null
++++ b/bsd/dev/taimen_tas2557.c
+@@ -0,0 +1,928 @@
++/*
++ * Pixel 2 XL (taimen) speakers: two TI TAS2557 smart amps, left 0x4C and right 0x4D on BLSP2 QUP1
++ * (taimen_i2c.c), shared reset PM8998 GPIO 6. Loaded and switched as the wahoo Android driver does
++ * (research/dl/wahoo-tas2557: "core" tas2557-core.c, "regmap" tas2557-regmap.c, tas2557.h and
++ * tas2557-core.h, whose registers are B book, P page, R register); plan: taimen-audio-plan.md stage 7.
++ *   firmware  TI's "5552" format, the same for tas2557s_PG21_uCDSP.bin and tas2557_cal.bin (core.c
++ *             fw_parse*): header, PLLs, programs, configurations, calibrations; blocks of 4-byte
++ *             commands {book, page, offset, value}: offset <= 0x7F writes, 0x81 sleeps
++ *             (book << 8 | page) ms, 0x85 bursts that many bytes to the next command's address.
++ *             Every length is checked against the blob. The loader walks the caller's buffers,
++ *             which only have to live during init (nothing is copied or allocated).
++ *   load      as Android: SW reset, default data, program 0, its first configuration (PLL, pre-power
++ *             and coefficients for each of its devices), calibration 0, ASI1 word length. "Both"
++ *             blocks go to each address in turn (no broadcast). Per block and chip the PRAM CRC
++ *             (B0 P0 R32/R33) and the YRAM sum are checked as core.c tas2557_load_block does; a
++ *             mismatch retries the block, then warns (boot-arg taimentascrc=1: fails). Bursts longer
++ *             than one I2C write go in 4-byte steps (the address auto-increments within a page).
++ *   power     core.c's startup + unmute and shutdown, only while the I2S bit clock runs; then each
++ *             chip's safe guard, flags, power-up state and die temperature are logged.
++ * Call from a thread (it sleeps); a mutex serializes the entry points.
++ */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++/* As in taimen_i2c.c (.size guards the two copies). */
++#define TAIMEN_I2C_PINS 4
++struct taimen_i2c_pin {
++	uint32_t pa;
++	uint8_t gpio, func, ma, pull;
++};
++struct taimen_i2c {
++	uint32_t size;
++	const char *name;
++	uint32_t qup_pa, vote_pa, vote_bit, ahb_cbcr_pa, cbcr_pa, rcgr_pa, clk_ctl;
++	unsigned npins;
++	struct taimen_i2c_pin pin[TAIMEN_I2C_PINS];
++	vm_offset_t qup, vote, ahb, cbcr, rcgr, tlmm[TAIMEN_I2C_PINS];
++	unsigned tx_max, rx_max;
++	uint32_t last_status, last_flags, last_op;
++	bool ready;
++};
++extern bool taimen_i2c_init(struct taimen_i2c *b);
++extern int taimen_i2c_write(struct taimen_i2c *b, uint8_t addr7, const uint8_t *buf, unsigned len);
++extern int taimen_i2c_write_read(struct taimen_i2c *b, uint8_t addr7, const uint8_t *cmd, unsigned ncmd,
++    uint8_t *buf, unsigned len);
++extern unsigned taimen_i2c_max_write(const struct taimen_i2c *b);
++extern unsigned taimen_i2c_max_read(const struct taimen_i2c *b);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++bool taimen_tas2557_init(const uint8_t *fw, uint32_t fw_len, const uint8_t *cal, uint32_t cal_len,
++    unsigned bit_width);
++bool taimen_tas2557_power(bool on);
++void taimen_tas2557_status(void);
++
++/* i2c@c1b5000 (live.dts), 400 kHz from XO (W/clock-gcc-8998.c, the plan's cheat sheet) */
++static struct taimen_i2c tas_bus = {
++	.size = sizeof(struct taimen_i2c), .name = "blsp2 qup1", .qup_pa = 0x0c1b5000u,
++	.vote_pa = 0x00152004u, .vote_bit = 15,         /* APCS_CLOCK_BRANCH_ENA_VOTE: BLSP2 AHB */
++	.ahb_cbcr_pa = 0x00125004u,                     /* BLSP2_AHB_CBCR */
++	.cbcr_pa = 0x00126008u, .rcgr_pa = 0x00126020u, /* BLSP2_QUP1_I2C_APPS_CBCR, its CMD/CFG RCGR */
++	.clk_ctl = (14u << 16) | (3u << 8) | 28u,       /* 400 kHz from 19.2 MHz, as taimen_touch.c */
++	.npins = 2,                                     /* WEST tile, blsp_i2c7, 2 mA, bias-disable */
++	.pin = {{0x03537000u, 55, 3, 2, 0}, {0x03538000u, 56, 3, 2, 0}},
++};
++
++#define TR(b, p, r)             (((uint32_t)(b) << 16) | ((uint32_t)(p) << 8) | (uint32_t)(r))
++#define TB(x)                   ((uint8_t)((x) >> 16))
++#define TP(x)                   ((uint8_t)((x) >> 8))
++#define TRG(x)                  ((uint8_t)(x))
++enum {  /* tas2557.h: page register 0 in every page, book register 127 in page 0 of every book */
++	TAS_PAGE_REG = 0x00, TAS_BOOK_REG = 0x7f, TAS_PG_2P1 = 0xa0, TAS_SAFE_GUARD_PATTERN = 0x5a,
++	TAS_SW_RESET = TR(0, 0, 1), TAS_REV_PGID = TR(0, 0, 3), TAS_POWER_CTRL1 = TR(0, 0, 4),
++	TAS_POWER_CTRL2 = TR(0, 0, 5), TAS_SPK_CTRL = TR(0, 0, 6), TAS_MUTE = TR(0, 0, 7),
++	TAS_SAR_ADC2 = TR(0, 0, 21), TAS_CRC_CHECKSUM = TR(0, 0, 32), TAS_CRC_RESET = TR(0, 0, 33),
++	TAS_SAFE_GUARD = TR(0, 0, 37), TAS_CLK_ERR_CTRL = TR(0, 0, 44), TAS_CLK_ERR_CTRL2 = TR(0, 0, 45),
++	TAS_CLK_ERR_CTRL3 = TR(0, 0, 46), TAS_POWER_UP_FLAG = TR(0, 0, 100), TAS_FLAGS_1 = TR(0, 0, 104),
++	TAS_FLAGS_2 = TR(0, 0, 108), TAS_ASI1_DAC_FORMAT = TR(0, 1, 1), TAS_GPIO1_PIN = TR(0, 1, 61),
++	TAS_GPIO2_PIN = TR(0, 1, 62), TAS_GPIO3_PIN = TR(0, 1, 63), TAS_GPIO4_PIN = TR(0, 1, 64),
++	TAS_GPI_PIN = TR(0, 1, 77), TAS_GPIO_HIZ_CTRL2 = TR(0, 1, 80), TAS_CLK_HALT = TR(0, 1, 106),
++	TAS_INT_GEN1 = TR(0, 1, 108), TAS_INT_GEN2 = TR(0, 1, 109), TAS_INT_GEN3 = TR(0, 1, 110),
++	TAS_INT_GEN4 = TR(0, 1, 111), TAS_INT_MODE = TR(0, 1, 114), TAS_TEST_MODE = TR(0, 253, 13),
++	TAS_BROADCAST = TR(0, 253, 54), TAS_SOFT_MUTE = TR(100, 0, 7),
++	TAS_DIE_TEMP = TR(130, 2, 124),         /* 4 bytes, degrees C << 23 */
++};
++/* SPK_CTRL: DAC gain 6:3. ASI1_DAC_FORMAT: format 7:5, word length 4:3, DOUT tri-state 0. */
++enum {  /* block types (core.c:66-75), app mode (tas2557.h) */
++	BLK_PLL = 0x00, BLK_PGM_A = 0x01, BLK_CFG_COEFF_A = 0x03, BLK_CFG_PRE_A = 0x04, BLK_PGM_B = 0x08,
++	BLK_CFG_COEFF_B = 0x0a, BLK_CFG_PRE_B = 0x0b, BLK_PGM_ALL = 0x0d, APP_TUNINGMODE = 2,
++};
++#define BLK_ANY                 0xffffffffu
++#define TAS_L                   1u              /* device masks, as a configuration's devices */
++#define TAS_R                   2u
++#define TAS_TRIES               3u              /* attempts per block on a CRC mismatch */
++#define TAS_SLEEP_MAX           1000u           /* ms, cap on a firmware sleep */
++#define TAS_ITEMS               16u             /* items of each kind kept */
++#define TAS_RST_PPID            0x0c5u          /* PM8998 GPIO 6, SPMI 0xC500 (live.dts gpio@c500) */
++#define TAS_DELAY               0xffffffffu
++#define NSTEPS(s)               ((unsigned)(sizeof(s) / sizeof((s)[0])))
++#define TRY(e)                  do { int try_ = (e); if (try_ != 0) { return try_; } } while (0)
++
++struct tas_chip {
++	const char *name;
++	uint8_t addr;
++	int16_t book, page;     /* selected, -1 unknown */
++};
++static struct tas_chip tas_chip[2] = {{"L", 0x4c, -1, -1}, {"R", 0x4d, -1, -1}};
++
++struct tas_step {
++	uint32_t reg;           /* TAS_DELAY: sleep val ms */
++	uint16_t val;
++};
++#define TAS_WR_ALL(m, r, v)     tas_seq((m), &(const struct tas_step){(r), (v)}, 1, true)
++
++/* core.c:77-127, p_tas2557_{default,irq_config,startup,unmute,shutdown}_data */
++static const struct tas_step tas_default_seq[] = {
++	{TAS_SAR_ADC2, 0x05}, {TAS_CLK_ERR_CTRL2, 0x21}, {TAS_CLK_ERR_CTRL3, 0x21},
++	{TAS_SAFE_GUARD, TAS_SAFE_GUARD_PATTERN},
++};
++static const struct tas_step tas_irq_seq[] = {
++	{TAS_CLK_HALT, 0x71}, {TAS_INT_GEN1, 0x11}, {TAS_INT_GEN2, 0x11}, {TAS_INT_GEN3, 0x11},
++	{TAS_INT_GEN4, 0x01}, {TAS_GPIO4_PIN, 0x07}, {TAS_INT_MODE, 0x80},
++};
++static const struct tas_step tas_startup_seq[] = {
++	{TAS_GPI_PIN, 0x15}, {TAS_GPIO1_PIN, 0x01}, {TAS_GPIO2_PIN, 0x01}, {TAS_POWER_CTRL2, 0xa0},
++	{TAS_POWER_CTRL2, 0xa3}, {TAS_POWER_CTRL1, 0xf8}, {TAS_DELAY, 2}, {TAS_CLK_ERR_CTRL, 0x2b},
++};
++static const struct tas_step tas_unmute_seq[] = {
++	{TAS_MUTE, 0x00}, {TAS_SOFT_MUTE, 0x00},
++};
++static const struct tas_step tas_shutdown_seq[] = {
++	{TAS_CLK_ERR_CTRL, 0x00}, {TAS_SOFT_MUTE, 0x01}, {TAS_DELAY, 10}, {TAS_MUTE, 0x03},
++	{TAS_POWER_CTRL1, 0x60}, {TAS_DELAY, 2}, {TAS_POWER_CTRL2, 0x00}, {TAS_POWER_CTRL1, 0x00},
++	{TAS_GPIO1_PIN, 0x00}, {TAS_GPIO2_PIN, 0x00}, {TAS_GPI_PIN, 0x00},
++};
++
++/* A parsed blob: offsets into the caller's buffer. */
++enum { K_PLL, K_PROG, K_CONF, K_CAL, K_KINDS };
++static const char *const tas_kind[K_KINDS] = {"PLL", "program", "configuration", "calibration"};
++struct tas_item {
++	const uint8_t *name;    /* 64-byte field */
++	uint32_t data;          /* offset of its first block */
++	uint16_t nblk, devices; /* configuration: device mask */
++	uint8_t a, b;           /* program: mode; configuration: program, PLL; calibration: program, configuration */
++	uint16_t boost;
++	uint32_t rate;
++};
++struct tas_fw {
++	const char *what;
++	const uint8_t *p, *ddc;
++	uint32_t len, size, ppc, fwver, drv;
++	unsigned n[K_KINDS], odd;       /* odd: commands neither write, sleep nor burst (skipped, as core.c) */
++	struct tas_item it[K_KINDS][TAS_ITEMS];
++};
++struct tas_blk {
++	uint32_t type, ncmd;
++	uint8_t pon, pcrc, yon, ycrc;   /* PRAM CRC present, CRC, YRAM sum present, sum */
++	const uint8_t *cmd;
++};
++struct cur {
++	const uint8_t *p;
++	uint32_t len, pos;
++	bool bad;
++};
++
++static struct tas_fw tas_fw, tas_cal;
++static struct {
++	bool loaded, powered;
++	unsigned devices, crc_errors, wchunk;   /* configuration's chips, mismatches, burst bytes per write */
++	int strict;
++} tas;
++static int tas_sleep_chan;
++static LCK_GRP_DECLARE(tas_grp, "taimen_tas2557");
++static LCK_MTX_DECLARE(tas_lock, &tas_grp);
++
++static void
++tas_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	if (ms != 0) {
++		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&tas_sleep_chan, THREAD_UNINT, deadline);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/* ---- the blob: every read is bounds-checked, a failure sticks ---- */
++static uint32_t
++c_get(struct cur *c, unsigned n)        /* big-endian, n <= 4 */
++{
++	uint32_t v = 0;
++	if (c->bad || c->len - c->pos < n) {
++		c->bad = true;
++		return 0;
++	}
++	while (n-- > 0) {
++		v = (v << 8) | c->p[c->pos++];
++	}
++	return v;
++}
++
++static const uint8_t *
++c_skip(struct cur *c, uint32_t n)
++{
++	if (c->bad || c->len - c->pos < n) {
++		c->bad = true;
++		return NULL;
++	}
++	c->pos += n;
++	return c->p + c->pos - n;
++}
++
++static void
++c_str(struct cur *c)                    /* a NUL-terminated description */
++{
++	while (!c->bad && c_get(c, 1) != 0) {
++	}
++}
++
++static bool
++c_block(struct cur *c, uint32_t drv, struct tas_blk *b)        /* core.c:1233-1272 */
++{
++	b->type = c_get(c, 4);
++	uint32_t crc = drv >= 0x200u ? c_get(c, 4) : 0;         /* core.c:1242: driver >= 0x200 */
++	b->pon = (uint8_t)(crc >> 24), b->pcrc = (uint8_t)(crc >> 16);
++	b->yon = (uint8_t)(crc >> 8), b->ycrc = (uint8_t)crc;
++	b->ncmd = c_get(c, 4);
++	c->bad = c->bad || b->ncmd > (c->len - c->pos) / 4u;
++	b->cmd = c_skip(c, b->ncmd * 4u);
++	return !c->bad;
++}
++
++static uint32_t
++burst_cmds(unsigned len)                /* commands one 0x85 burst takes (core.c:2058-2093) */
++{
++	return 2u + (len >= 2 ? (len - 2u) / 4u + 1u : 0u);
++}
++
++/* Every burst ends inside its block and stays in one page (core.c:1886 refuses more). */
++static bool
++blk_check(struct tas_fw *f, const struct tas_blk *b)
++{
++	for (uint32_t i = 0; i < b->ncmd;) {
++		const uint8_t *k = b->cmd + 4u * i;
++		unsigned len = ((unsigned)k[0] << 8) | k[1];
++		if (k[2] != 0x85u) {
++			f->odd += (k[2] > 0x7fu && k[2] != 0x81u);
++			i++;
++		} else if (burst_cmds(len) > b->ncmd - i) {
++			printf("TAIMEN TAS2557: %s: block %#x: burst of %u at command %u of %u runs past the block\n",
++			    f->what, b->type, len, i, b->ncmd);
++			return false;
++		} else if (k[6] + MAX(len, 1u) > 0x80u) {
++			printf("TAIMEN TAS2557: %s: block %#x: burst of %u to B%u P%u R%u leaves the page\n", f->what,
++			    b->type, len, k[4], k[5], k[6]);
++			return false;
++		} else {
++			i += burst_cmds(len);
++		}
++	}
++	return true;
++}
++
++static const char *
++tas_name(const uint8_t *s, char out[64])
++{
++	unsigned i;
++	for (i = 0; s != NULL && i < 63 && s[i] != 0; i++) {
++		out[i] = (s[i] >= 0x20 && s[i] < 0x7f) ? (char)s[i] : '?';
++	}
++	out[i] = 0;
++	return out;
++}
++
++static bool
++fw_parse(struct tas_fw *f, const char *what, const uint8_t *p, uint32_t len)   /* core.c:1157-1618 */
++{
++	struct cur c = {p, len, 0, false};
++	char name[64], attr[64], types[96];
++	unsigned k, i = 0;
++	bzero(f, sizeof(*f));
++	f->what = what, f->p = p, f->len = len;
++	if (p == NULL || len < 104 || c_get(&c, 4) != 0x35353532u) {        /* "5552", core.c:1164-1172 */
++		printf("TAIMEN TAS2557: %s: not a TAS firmware (%u bytes)\n", what, len);
++		return false;
++	}
++	f->size = c_get(&c, 4);
++	(void)c_get(&c, 4);                     /* checksum: core.c does not check it either */
++	f->ppc = c_get(&c, 4), f->fwver = c_get(&c, 4), f->drv = c_get(&c, 4);
++	(void)c_get(&c, 4);                     /* timestamp */
++	f->ddc = c_skip(&c, 64);
++	c_str(&c);
++	uint32_t family = c_get(&c, 4), device = c_get(&c, 4);
++	if (c.bad || family != 0 || device != 3) {
++		printf("TAIMEN TAS2557: %s: bad header (family %u device %u, want 0/3)\n", what, family, device);
++		return false;
++	}
++	for (k = 0; k < K_KINDS; k++) {
++		if (k == K_CAL && c.len - c.pos <= 64) {
++			break;                          /* core.c:1611 */
++		}
++		f->n[k] = c_get(&c, 2);
++		for (i = 0; i < f->n[k] && !c.bad; i++) {
++			struct tas_item spare, *it = i < TAS_ITEMS ? &f->it[k][i] : &spare;
++			bzero(it, sizeof(*it));
++			it->name = c_skip(&c, 64);
++			c_str(&c);
++			it->nblk = 1;                   /* a PLL is one block (core.c:1319-1368) */
++			if (k == K_PROG) {              /* core.c:1370-1425 */
++				it->a = (uint8_t)c_get(&c, 1);
++				it->boost = (uint16_t)c_get(&c, 2);
++			} else if (k == K_CONF) {       /* core.c:1427-1496 */
++				bool dev = f->drv >= 0x300u || (f->drv >= 0x101u && f->drv < 0x200u);
++				it->devices = dev ? (uint16_t)c_get(&c, 2) : (uint16_t)(TAS_L | TAS_R);
++				it->a = (uint8_t)c_get(&c, 1), it->b = (uint8_t)c_get(&c, 1);
++				it->rate = c_get(&c, 4);
++			} else if (k == K_CAL) {        /* core.c:1498-1556 */
++				it->a = (uint8_t)c_get(&c, 1), it->b = (uint8_t)c_get(&c, 1);
++			}
++			if (k != K_PLL) {               /* data: name, description, blocks (core.c:1274-1317) */
++				(void)c_skip(&c, 64);
++				c_str(&c);
++				it->nblk = (uint16_t)c_get(&c, 2);
++			}
++			it->data = c.pos;
++			for (unsigned j = 0; j < it->nblk && !c.bad; j++) {
++				struct tas_blk b;
++				c.bad = !c_block(&c, f->drv, &b) || !blk_check(f, &b);
++			}
++			if (c.bad) {
++				break;
++			}
++		}
++		if (c.bad) {
++			printf("TAIMEN TAS2557: %s: %s %u of %u is cut short or malformed (offset %u of %u)\n", what,
++			    tas_kind[k], i, f->n[k], c.pos, len);
++			return false;
++		}
++	}
++	printf("TAIMEN TAS2557: %s: %u bytes (header %u), PPC %#x, fw %#x, driver %#x, '%s': %u PLLs, %u programs, "
++	    "%u configurations, %u calibrations, %u bytes left, %u odd commands\n", what, len, f->size, f->ppc,
++	    f->fwver, f->drv, tas_name(f->ddc, name), f->n[K_PLL], f->n[K_PROG], f->n[K_CONF], f->n[K_CAL],
++	    c.len - c.pos, f->odd);
++	for (k = 0; k < K_KINDS; k++) {
++		for (i = 0; i < MIN(f->n[k], TAS_ITEMS); i++) {
++			const struct tas_item *it = &f->it[k][i];
++			struct cur bc = {p, len, it->data, false};
++			struct tas_blk b;
++			unsigned o = 0;
++			types[0] = 0;
++			for (unsigned j = 0; j < it->nblk && c_block(&bc, f->drv, &b) && o + 16 < sizeof(types); j++) {
++				o += (unsigned)snprintf(types + o, sizeof(types) - o, "%s%02x(%u)", j ? "/" : "", b.type, b.ncmd);
++			}
++			attr[0] = 0;
++			if (k == K_PROG) {
++				(void)snprintf(attr, sizeof(attr), " mode %u boost %u", it->a, it->boost);
++			} else if (k == K_CONF) {
++				(void)snprintf(attr, sizeof(attr), " program %u PLL %u devices %u %u Hz", it->a, it->b,
++				    it->devices, it->rate);
++			} else if (k == K_CAL) {
++				(void)snprintf(attr, sizeof(attr), " program %u configuration %u", it->a, it->b);
++			}
++			printf("TAIMEN TAS2557: %s: %s %u '%s'%s: %s\n", what, tas_kind[k], i, tas_name(it->name, name),
++			    attr, types);
++		}
++	}
++	return true;
++}
++
++/* ---- registers ---- */
++static int
++tas_fail(struct tas_chip *c, const char *op, uint32_t reg, int err)
++{
++	printf("TAIMEN TAS2557: %s 0x%02x: %s B%u P%u R%u: err %d (i2c status %#x flags %#x op %#x)\n", c->name,
++	    c->addr, op, TB(reg), TP(reg), TRG(reg), err, tas_bus.last_status, tas_bus.last_flags, tas_bus.last_op);
++	c->book = c->page = -1;
++	return err;
++}
++
++static int
++raw_wr(struct tas_chip *c, uint8_t reg, const uint8_t *d, unsigned n)
++{
++	uint8_t buf[64];
++	if (n + 1u > sizeof(buf)) {
++		return EINVAL;
++	}
++	buf[0] = reg;
++	bcopy(d, buf + 1, n);
++	return taimen_i2c_write(&tas_bus, c->addr, buf, n + 1u);
++}
++
++/* regmap.c:246-312: a new book is page 0, the book (R127), then the page */
++static int
++tas_bp(struct tas_chip *c, uint8_t book, uint8_t page)
++{
++	const uint8_t zero = 0;
++	int err;
++	if (c->book != book) {
++		if ((err = raw_wr(c, TAS_PAGE_REG, &zero, 1)) != 0 || (err = raw_wr(c, TAS_BOOK_REG, &book, 1)) != 0) {
++			return tas_fail(c, "book select", TR(book, 0, TAS_BOOK_REG), err);
++		}
++		c->book = book, c->page = 0;
++	}
++	if (c->page != page) {
++		if ((err = raw_wr(c, TAS_PAGE_REG, &page, 1)) != 0) {
++			return tas_fail(c, "page select", TR(book, page, TAS_PAGE_REG), err);
++		}
++		c->page = page;
++	}
++	return 0;
++}
++
++/* n bytes from reg on (auto-increment within the page), in I2C-sized pieces */
++static int
++tas_io(unsigned ci, uint32_t reg, uint8_t *d, unsigned n, bool rd)
++{
++	struct tas_chip *c = &tas_chip[ci];
++	unsigned r = TRG(reg), step = rd ? taimen_i2c_max_read(&tas_bus) : tas.wchunk;
++	int err;
++	if (n == 0 || r + n > 0x80u || step == 0) {
++		return tas_fail(c, "access (bad length)", reg, EINVAL);
++	}
++	TRY(tas_bp(c, TB(reg), TP(reg)));
++	for (unsigned done = 0, k; done < n; done += k) {
++		uint8_t a = (uint8_t)(r + done);
++		k = MIN(n - done, step);
++		err = rd ? taimen_i2c_write_read(&tas_bus, c->addr, &a, 1, d + done, k) : raw_wr(c, a, d + done, k);
++		if (err != 0) {
++			return tas_fail(c, rd ? "read" : "write", TR(TB(reg), TP(reg), a), err);
++		}
++	}
++	return 0;
++}
++
++static int
++tas_wr(unsigned ci, uint32_t reg, uint8_t v)
++{
++	return tas_io(ci, reg, &v, 1, false);
++}
++
++static int
++tas_rd(unsigned ci, uint32_t reg, uint8_t *v)
++{
++	return tas_io(ci, reg, v, 1, true);
++}
++
++/* regmap_update_bits on each chip of mask: read, write only a change */
++static int
++tas_upd(unsigned mask, uint32_t reg, uint8_t m, uint8_t v)
++{
++	for (unsigned ci = 0; ci < 2; ci++) {
++		uint8_t old = 0;
++		if (mask & (1u << ci)) {
++			TRY(tas_rd(ci, reg, &old));
++			if (((old & ~m) | (v & m)) != old) {
++				TRY(tas_wr(ci, reg, (uint8_t)((old & ~m) | (v & m))));
++			}
++		}
++	}
++	return 0;
++}
++
++/* core.c:141-165: each step on each chip of mask (L then R); !stop: try them all, return the first error */
++static int
++tas_seq(unsigned mask, const struct tas_step *s, unsigned n, bool stop)
++{
++	int first = 0;
++	for (unsigned i = 0; i < n; i++) {
++		if (s[i].reg == TAS_DELAY) {
++			tas_msleep(s[i].val);
++			continue;
++		}
++		for (unsigned ci = 0; ci < 2; ci++) {
++			int err = (mask & (1u << ci)) ? tas_wr(ci, s[i].reg, (uint8_t)s[i].val) : 0;
++			if (err != 0 && stop) {
++				return err;
++			}
++			first = first ? first : err;
++		}
++	}
++	return first;
++}
++
++/* ---- blocks (core.c:1972-2192) ---- */
++static uint8_t
++crc8_4d(uint8_t v)                      /* CRC-8 of one byte: polynomial 0x4D, MSB first, initial 0 */
++{
++	for (unsigned i = 0; i < 8; i++) {
++		v = (v & 0x80u) ? (uint8_t)((v << 1) ^ 0x4du) : (uint8_t)(v << 1);
++	}
++	return v;
++}
++
++/* The YRAM part of a write: tas2557-core.h YRAM1..5 (core.c:1640-1775) */
++static bool
++tas_yram(uint8_t bk, uint8_t pg, unsigned r, unsigned n, unsigned *off, unsigned *m)
++{
++	unsigned lo = 8, hi = 127, end = r + n - 1u;
++	if (bk == 140 && pg == 42) {
++		lo = 88;
++	} else if ((bk == 140 && pg == 50) || (bk == 0 && pg == 61)) {
++		hi = 27;
++	} else if (!(bk == 140 && pg >= 43 && pg <= 49) && !(bk == 0 && pg >= 50 && pg <= 60)) {
++		return false;
++	}
++	if (end < lo || r > hi) {
++		return false;
++	}
++	*off = MAX(r, lo);
++	*m = MIN(end, hi) - *off + 1u;
++	return true;
++}
++
++/*
++ * Read back the YRAM bytes of one write and add their CRC-8s (core.c:1794-1970), leaving out
++ * B0 P53 R44-48 (the coefficient swap command). A single write must read back as written (*retry).
++ */
++static int
++tas_ysum(unsigned ci, uint8_t bk, uint8_t pg, unsigned r, const uint8_t *d, unsigned n, uint8_t *sum, bool *retry)
++{
++	bool swap = bk == 0 && pg == 53;
++	unsigned off, m;
++	uint8_t rb[128];
++	if ((swap && n == 1 && r >= 44 && r <= 48) || (swap && n == 4 && r == 44) || !tas_yram(bk, pg, r, n, &off, &m)) {
++		return 0;
++	}
++	TRY(tas_io(ci, TR(bk, pg, off), rb, m, true));
++	if (n == 1 && rb[0] != d[0]) {
++		printf("TAIMEN TAS2557: %s: B%u P%u R%u wrote %#x, reads %#x\n", tas_chip[ci].name, bk, pg, r, d[0], rb[0]);
++		*retry = true;
++		return 0;
++	}
++	for (unsigned i = 0; i < m; i++) {
++		if (!(swap && off + i >= 44 && off + i <= 48)) {
++			*sum = (uint8_t)(*sum + crc8_4d(rb[i]));
++		}
++	}
++	return 0;
++}
++
++/* One block to one chip: CRC reset, the commands, PRAM CRC and YRAM sum; retried on a mismatch. */
++static int
++blk_load(unsigned ci, const struct tas_blk *b, const char *what)
++{
++	for (unsigned attempt = 1; attempt <= TAS_TRIES; attempt++) {
++		uint8_t ysum = 0, pcrc = 0;
++		bool retry = false;
++		if (b->pon) {
++			TRY(tas_wr(ci, TAS_CRC_RESET, 1));
++		}
++		for (uint32_t i = 0; i < b->ncmd && !retry;) {
++			const uint8_t *k = b->cmd + 4u * i, *a = k + 4;
++			unsigned len = ((unsigned)k[0] << 8) | k[1];
++			if (k[2] <= 0x7fu) {
++				TRY(tas_wr(ci, TR(k[0], k[1], k[2]), k[3]));
++				TRY(b->yon ? tas_ysum(ci, k[0], k[1], k[2], &k[3], 1, &ysum, &retry) : 0);
++				i++;
++			} else if (k[2] == 0x85u) {     /* a length of 0 writes one byte, as core.c */
++				TRY(tas_io(ci, TR(a[0], a[1], a[2]), __DECONST(uint8_t *, a + 3), MAX(len, 1u), false));
++				TRY(b->yon ? tas_ysum(ci, a[0], a[1], a[2], a + 3, MAX(len, 1u), &ysum, &retry) : 0);
++				i += burst_cmds(len);
++			} else {
++				if (k[2] == 0x81u) {
++					tas_msleep(MIN(len, TAS_SLEEP_MAX));
++				}
++				i++;
++			}
++		}
++		if (!retry && b->pon) {
++			TRY(tas_rd(ci, TAS_CRC_CHECKSUM, &pcrc));
++			retry = pcrc != b->pcrc;
++		}
++		if (!retry && (!b->yon || ysum == b->ycrc)) {
++			return 0;
++		}
++		printf("TAIMEN TAS2557: %s: %s block %#x (%u commands), try %u: PRAM CRC %#x (fw %#x%s), YRAM sum %#x "
++		    "(fw %#x%s)\n", tas_chip[ci].name, what, b->type, b->ncmd, attempt, pcrc, b->pcrc,
++		    b->pon ? "" : ", unused", ysum, b->ycrc, b->yon ? "" : ", unused");
++	}
++	tas.crc_errors++;
++	return tas.strict ? EIO : 0;
++}
++
++static unsigned
++blk_mask(uint32_t type, unsigned devices)       /* core.c:1991-2009 */
++{
++	return type == BLK_PLL ? devices : type == BLK_PGM_ALL ? (TAS_L | TAS_R) :
++	       (type == BLK_PGM_A || type == BLK_CFG_COEFF_A || type == BLK_CFG_PRE_A) ? TAS_L :
++	       (type == BLK_PGM_B || type == BLK_CFG_COEFF_B || type == BLK_CFG_PRE_B) ? TAS_R : 0;
++}
++
++/* core.c:2173-2192: an item's blocks of this type (BLK_ANY: all), each to its chips among devices */
++static int
++tas_load_item(const struct tas_fw *f, const struct tas_item *it, uint32_t type, unsigned devices, const char *what)
++{
++	struct cur c = {f->p, f->len, it->data, false};
++	for (unsigned i = 0; i < it->nblk; i++) {
++		struct tas_blk b;
++		if (!c_block(&c, f->drv, &b)) {
++			return EINVAL;                  /* parsed before: cannot happen */
++		}
++		if (type != BLK_ANY && b.type != type) {
++			continue;
++		}
++		if (blk_mask(b.type, TAS_L | TAS_R) == 0) {
++			printf("TAIMEN TAS2557: %s: block %u type %#x: no chip for it\n", what, i, b.type);
++			return EINVAL;
++		}
++		for (unsigned ci = 0; ci < 2; ci++) {
++			int err = (blk_mask(b.type, devices) & devices & (1u << ci)) ? blk_load(ci, &b, what) : 0;
++			if (err != 0) {
++				printf("TAIMEN TAS2557: %s: block %u type %#x on %s failed (%d)\n", what, i, b.type,
++				    tas_chip[ci].name, err);
++				return err;
++			}
++		}
++	}
++	return 0;
++}
++
++/* ---- reset ---- */
++/* PM8998 GPIO registers (pinctrl-spmi-gpio, qpnp-pin): subtype, status1, rt, mode, vin, pull, LV/MV source, out, en */
++static const uint8_t pmg_reg[9] = {0x05, 0x08, 0x10, 0x40, 0x41, 0x42, 0x44, 0x45, 0x46};
++
++static bool
++tas_rst_log(const char *when, uint8_t v[9])
++{
++	bool ok = true;
++	for (unsigned i = 0; i < 9; i++) {
++		v[i] = 0;
++		ok = ok && sweet_pmic_read(TAS_RST_PPID, pmg_reg[i], &v[i]);
++	}
++	printf("TAIMEN TAS2557: reset (PM8998 GPIO 6) %s:%s subtype %#x status1 %#x rt %#x mode %#x vin %#x pull %#x "
++	    "src %#x out %#x en %#x\n", when, ok ? "" : " PMIC READ FAILED,", v[0], v[1], v[2], v[3], v[4], v[5], v[6],
++	    v[7], v[8]);
++	return ok;
++}
++
++static bool
++tas_probe(const char *when)
++{
++	const uint8_t reg = TAS_PAGE_REG;
++	uint8_t pg[2] = {0, 0};
++	int e[2];
++	for (unsigned ci = 0; ci < 2; ci++) {
++		e[ci] = taimen_i2c_write_read(&tas_bus, tas_chip[ci].addr, &reg, 1, &pg[ci], 1);
++	}
++	printf("TAIMEN TAS2557: probe %s: L %s (page %u), R %s (page %u)\n", when,
++	    e[0] == 0 ? "ok" : e[0] == ENXIO ? "NACK" : "error", pg[0], e[1] == 0 ? "ok" : e[1] == ENXIO ? "NACK" : "error", pg[1]);
++	return e[0] == 0 && e[1] == 0;
++}
++
++/* Reset released (input, pull-up) is expected; if the amps NACK, pulse it as regmap.c:674-691 does. */
++static bool
++tas_reset(void)
++{
++	uint8_t v[9];
++	bool pm = tas_rst_log("at init", v);
++	if (tas_probe("at init")) {
++		return true;
++	}
++	if (!pm) {
++		printf("TAIMEN TAS2557: amps silent and the reset GPIO unreadable\n");
++		return false;
++	}
++	/* output, constant source: level = MODE bit 0 (invert), on LV/MV subtypes 0x10/0x11 SRC bit 7 */
++	bool lvmv = v[0] == 0x10u || v[0] == 0x11u;
++	bool ok = lvmv ? sweet_pmic_write(TAS_RST_PPID, 0x44, 0x00) && sweet_pmic_write(TAS_RST_PPID, 0x40, 0x01) :
++	    sweet_pmic_write(TAS_RST_PPID, 0x40, 0x10);
++	ok = ok && sweet_pmic_write(TAS_RST_PPID, 0x46, 0x80);
++	tas_msleep(5);
++	ok = ok && (lvmv ? sweet_pmic_write(TAS_RST_PPID, 0x44, 0x80) : sweet_pmic_write(TAS_RST_PPID, 0x40, 0x11));
++	tas_msleep(2);
++	(void)tas_rst_log(ok ? "after the pulse" : "after a FAILED pulse", v);
++	return tas_probe("after the reset pulse");
++}
++
++/* ---- init ---- */
++static bool tas_report(unsigned ci, const char *when, bool up);
++
++static int
++tas_load(unsigned wl, const struct tas_item *prog, const struct tas_item *cfg, const struct tas_item *pll,
++    const struct tas_item *cal)
++{
++	static const unsigned wls[4] = {16, 20, 24, 32};
++	const unsigned d = tas.devices, both = TAS_L | TAS_R;
++	uint8_t v[2] = {0, 0};
++	char name[64], name2[64];
++
++	/* regmap.c:1217-1244: SW reset, 1 ms, revision */
++	tas_chip[0].book = tas_chip[0].page = tas_chip[1].book = tas_chip[1].page = -1;
++	TRY(TAS_WR_ALL(both, TAS_SW_RESET, 0x01));
++	tas_msleep(1);
++	tas_chip[0].book = tas_chip[0].page = tas_chip[1].book = tas_chip[1].page = -1;
++	TRY(tas_rd(0, TAS_REV_PGID, &v[0]));
++	TRY(tas_rd(1, TAS_REV_PGID, &v[1]));
++	printf("TAIMEN TAS2557: revision L %#x R %#x (PG2.1 = %#x)\n", v[0], v[1], TAS_PG_2P1);
++	if (v[0] != TAS_PG_2P1 || v[1] != TAS_PG_2P1) {
++		printf("TAIMEN TAS2557: not two PG2.1 chips: the PG21 firmware does not fit\n");
++		return ENODEV;
++	}
++	/* core.c:721-758 tas2557_load_default, with 697-719 tas2557_load_platdata */
++	TRY(TAS_WR_ALL(both, TAS_TEST_MODE, 0x0d));
++	TRY(tas_rd(0, TAS_BROADCAST, &v[0]));
++	TRY(tas_rd(1, TAS_BROADCAST, &v[1]));
++	printf("TAIMEN TAS2557: broadcast/trim L %#x R %#x\n", v[0], v[1]);
++	TRY(tas_seq(both, tas_default_seq, NSTEPS(tas_default_seq), true));
++	TRY(tas_seq(both, tas_irq_seq, NSTEPS(tas_irq_seq), true));     /* live.dts has the IRQ GPIOs */
++	TRY(tas_upd(both, TAS_ASI1_DAC_FORMAT, 0x18, (uint8_t)(wl << 3)));
++	TRY(tas_wr(1, TAS_GPIO3_PIN, 0x00));    /* ti,echo-ref 0 (core.c:307-313): only L drives DOUT */
++	TRY(tas_wr(0, TAS_GPIO3_PIN, 0x10));
++	TRY(tas_upd(both, TAS_ASI1_DAC_FORMAT, 0x01, 0x01));
++	TRY(tas_upd(both, TAS_GPIO_HIZ_CTRL2, 0x30, 0x30));
++	/* core.c:2710-2719: the program, "both" blocks first, to both chips whatever the devices */
++	TRY(tas_load_item(&tas_fw, prog, BLK_PGM_ALL, both, "program"));
++	TRY(tas_load_item(&tas_fw, prog, BLK_PGM_A, both, "program"));
++	TRY(tas_load_item(&tas_fw, prog, BLK_PGM_B, both, "program"));
++	TRY(tas_rd(0, TAS_SPK_CTRL, &v[0]));
++	printf("TAIMEN TAS2557: program 0 '%s' loaded, DAC gain %u\n", tas_name(prog->name, name), (v[0] >> 3) & 0xfu);
++	/* core.c:864-912: the PLL, then pre-power and coefficient blocks of each device */
++	TRY(tas_load_item(&tas_fw, pll, BLK_ANY, d, "PLL"));
++	TRY(tas_load_item(&tas_fw, cfg, BLK_CFG_PRE_A, d, "configuration"));
++	TRY(tas_load_item(&tas_fw, cfg, BLK_CFG_PRE_B, d, "configuration"));
++	TRY(tas_load_item(&tas_fw, cfg, BLK_CFG_COEFF_A, d, "configuration"));
++	TRY(tas_load_item(&tas_fw, cfg, BLK_CFG_COEFF_B, d, "configuration"));
++	printf("TAIMEN TAS2557: configuration '%s' loaded (PLL '%s', devices %u)\n", tas_name(cfg->name, name),
++	    tas_name(pll->name, name2), d);
++	/* core.c:920-924, 2813-2834: calibration 0's coefficients, only in tuning mode */
++	if (cal == NULL || prog->a != APP_TUNINGMODE) {
++		printf("TAIMEN TAS2557: calibration not applied (%s)\n", cal ? "not tuning mode" : "none");
++	} else {
++		TRY(tas_load_item(&tas_cal, cal, BLK_CFG_COEFF_A, d, "calibration"));
++		TRY(tas_load_item(&tas_cal, cal, BLK_CFG_COEFF_B, d, "calibration"));
++		printf("TAIMEN TAS2557: calibration '%s' loaded\n", tas_name(cal->name, name));
++	}
++	/* the plan's step 5: the AFE's word length over whatever the firmware set */
++	TRY(tas_rd(0, TAS_ASI1_DAC_FORMAT, &v[0]));
++	TRY(tas_rd(1, TAS_ASI1_DAC_FORMAT, &v[1]));
++	TRY(tas_upd(both, TAS_ASI1_DAC_FORMAT, 0x18, (uint8_t)(wl << 3)));
++	printf("TAIMEN TAS2557: ASI1 DAC format after the firmware L %#x R %#x (format %u, %u/%u bits) -> %u bits\n",
++	    v[0], v[1], v[0] >> 5, wls[(v[0] >> 3) & 3u], wls[(v[1] >> 3) & 3u], wls[wl]);
++	TRY(tas_rd(0, TAS_POWER_CTRL1, &v[0]));
++	TRY(tas_rd(1, TAS_POWER_CTRL1, &v[1]));
++	printf("TAIMEN TAS2557: power ctrl1 L %#x R %#x (no startup sequence: the amps stay down)\n", v[0], v[1]);
++	for (unsigned ci = 0; ci < 2; ci++) {   /* reading the flags clears them */
++		(void)tas_report(ci, "loaded", false);
++	}
++	return 0;
++}
++
++static bool
++tas_init_locked(const uint8_t *fw, uint32_t fw_len, const uint8_t *cal, uint32_t cal_len, unsigned bits)
++{
++	static const unsigned wls[4] = {16, 20, 24, 32};
++	uint64_t t0 = mach_absolute_time(), ns;
++	unsigned wl, conf, mw;
++	char name[64];
++	int err;
++	for (wl = 0; wl < 4 && wls[wl] != bits; wl++) {
++	}
++	if (wl == 4) {
++		printf("TAIMEN TAS2557: bad ASI word length %u (16, 20, 24 or 32)\n", bits);
++		return false;
++	}
++	(void)PE_parse_boot_argn("taimentascrc", &tas.strict, sizeof(tas.strict));
++	if (tas.powered) {
++		(void)tas_seq(tas.devices, tas_shutdown_seq, NSTEPS(tas_shutdown_seq), false);
++		tas.powered = false;
++	}
++	tas.loaded = false;
++	tas.crc_errors = 0;
++	if (!fw_parse(&tas_fw, "fw", fw, fw_len)) {
++		return false;
++	}
++	/* tas2557_set_program(0, -1), core.c:2652-2676: the first configuration of program 0 */
++	for (conf = 0; conf < MIN(tas_fw.n[K_CONF], TAS_ITEMS) && tas_fw.it[K_CONF][conf].a != 0; conf++) {
++	}
++	if (tas_fw.n[K_PROG] == 0 || conf >= MIN(tas_fw.n[K_CONF], TAS_ITEMS) ||
++	    tas_fw.it[K_CONF][conf].b >= MIN(tas_fw.n[K_PLL], TAS_ITEMS) ||
++	    (tas_fw.it[K_CONF][conf].devices & (TAS_L | TAS_R)) == 0) {
++		printf("TAIMEN TAS2557: fw: no program 0 with a configuration, a PLL and devices\n");
++		return false;
++	}
++	const struct tas_item *cfg = &tas_fw.it[K_CONF][conf];
++	tas.devices = cfg->devices & (TAS_L | TAS_R);
++	if (cfg->rate != 48000) {
++		printf("TAIMEN TAS2557: configuration %u runs at %u Hz, not 48000\n", conf, cfg->rate);
++	}
++	bool have_cal = cal != NULL && cal_len != 0 && fw_parse(&tas_cal, "cal", cal, cal_len) && tas_cal.n[K_CAL] != 0;
++	if (!taimen_i2c_init(&tas_bus)) {
++		return false;
++	}
++	mw = taimen_i2c_max_write(&tas_bus);
++	tas.wchunk = mw > 4u ? (mw - 1u) & ~3u : 0;     /* the register address takes a byte */
++	if (tas.wchunk == 0 || !tas_reset()) {
++		return false;
++	}
++	err = tas_load(wl, &tas_fw.it[K_PROG][0], cfg, &tas_fw.it[K_PLL][cfg->b], have_cal ? &tas_cal.it[K_CAL][0] : NULL);
++	if (err != 0) {
++		printf("TAIMEN TAS2557: loading failed (%d)\n", err);
++		return false;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	tas.loaded = true;
++	printf("TAIMEN TAS2557: fw %u '%s' P%u/C%u/K%u; prog 0 conf %u cal %s loaded in %llu ms (bursts of %u), ASI1 %u "
++	    "bits, %u CRC mismatches%s; amps powered down\n", fw_len, tas_name(tas_fw.ddc, name), tas_fw.n[K_PROG],
++	    tas_fw.n[K_CONF], have_cal ? tas_cal.n[K_CAL] : 0, conf, have_cal ? "0" : "none",
++	    (unsigned long long)(ns / 1000000u), tas.wchunk, bits, tas.crc_errors, tas.crc_errors ? " (WARNING)" : "");
++	return true;
++}
++
++bool
++taimen_tas2557_init(const uint8_t *fw, uint32_t fw_len, const uint8_t *cal, uint32_t cal_len, unsigned bit_width)
++{
++	lck_mtx_lock(&tas_lock);
++	bool ok = tas_init_locked(fw, fw_len, cal, cal_len, bit_width);
++	lck_mtx_unlock(&tas_lock);
++	if (!ok) {
++		printf("TAIMEN TAS2557: init failed\n");
++	}
++	return ok;
++}
++
++/* ---- power, flags ---- */
++/* Safe guard, FLAGS_1/2 (regmap.c:745-796; reading clears them), power-up 0xc0 (regmap.c:803-826), die temperature */
++static bool
++tas_report(unsigned ci, const char *when, bool up)
++{
++	static const uint32_t regs[4] = {TAS_SAFE_GUARD, TAS_FLAGS_1, TAS_FLAGS_2, TAS_POWER_UP_FLAG};
++	uint8_t v[4] = {0, 0, 0, 0}, t[4];
++	char temp[24] = "";
++	int err = 0;
++	for (unsigned i = 0; i < 4 && err == 0; i++) {
++		err = tas_rd(ci, regs[i], &v[i]);
++	}
++	if (err == 0 && tas.powered && tas_io(ci, TAS_DIE_TEMP, t, 4, true) == 0) {
++		int32_t raw = (int32_t)(((uint32_t)t[0] << 24) | ((uint32_t)t[1] << 16) | ((uint32_t)t[2] << 8) | t[3]);
++		(void)snprintf(temp, sizeof(temp), ", die %d C", (int)(raw >> 23));
++	}
++	uint8_t f1 = v[1], f2 = v[2];
++	bool down = up && (v[3] & 0xc0u) != 0xc0u;
++	bool ok = err == 0 && v[0] == TAS_SAFE_GUARD_PATTERN && (f1 & 0xfcu) == 0 && (f2 & 0x0cu) == 0 && !down;
++	printf("TAIMEN TAS2557: %s %s: %s safe guard %#x, flags %#x/%#x, power-up %#x%s%s%s%s%s%s%s%s%s%s\n",
++	    tas_chip[ci].name, when, err ? "I2C ERROR," : ok ? "ok," : "BAD,", v[0], f1, f2, v[3], temp,
++	    (f1 & 0x80u) ? " OVER-CURRENT" : "", (f1 & 0x40u) ? " UNDER-VOLTAGE" : "", (f1 & 0x20u) ? " CLOCK-HALT" : "",
++	    (f1 & 0x10u) ? " DIE-OVERTEMP" : "", (f1 & 0x08u) ? " BROWNOUT" : "", (f1 & 0x04u) ? " CLOCK-LOST" : "",
++	    (f2 & 0x08u) ? " CLOCK-DET1" : "", (f2 & 0x04u) ? " CLOCK-DET2" : "", down ? " NOT-POWERED" : "");
++	return ok;
++}
++
++/* core.c:968-1052 tas2557_enable(true) */
++static bool
++tas_power_on(void)
++{
++	bool ok[2] = {true, true};
++	int err;
++	for (unsigned ci = 0; ci < 2; ci++) {
++		uint8_t sg = 0, f = 0;
++		if (!(tas.devices & (1u << ci))) {
++			continue;
++		}
++		if (tas_rd(ci, TAS_SAFE_GUARD, &sg) != 0 || sg != TAS_SAFE_GUARD_PATTERN) {   /* core.c:982-1000 */
++			printf("TAIMEN TAS2557: %s safe guard %#x (want %#x): settings lost, init again\n", tas_chip[ci].name,
++			    sg, TAS_SAFE_GUARD_PATTERN);
++			tas.loaded = false;
++			return false;
++		}
++		(void)(tas_rd(ci, TAS_FLAGS_1, &f) || tas_rd(ci, TAS_FLAGS_2, &f));      /* clearIRQ, regmap.c:605-617 */
++	}
++	if ((err = tas_seq(tas.devices, tas_startup_seq, NSTEPS(tas_startup_seq), true)) != 0 ||
++	    (err = tas_seq(tas.devices, tas_unmute_seq, NSTEPS(tas_unmute_seq), true)) != 0) {
++		printf("TAIMEN TAS2557: power up failed (%d): shutting down\n", err);
++		(void)tas_seq(tas.devices, tas_shutdown_seq, NSTEPS(tas_shutdown_seq), false);
++		return false;
++	}
++	tas.powered = true;
++	tas_msleep(20);
++	for (unsigned ci = 0; ci < 2; ci++) {
++		if ((tas.devices & (1u << ci)) && !(ok[ci] = tas_report(ci, "power up", true))) {
++			tas_msleep(10);                 /* regmap.c:809-814: once more after 10 ms */
++			ok[ci] = tas_report(ci, "power up, again", true);
++		}
++	}
++	printf("TAIMEN TAS2557: power up L %s R %s\n", (tas.devices & TAS_L) ? (ok[0] ? "ok" : "BAD") : "unused",
++	    (tas.devices & TAS_R) ? (ok[1] ? "ok" : "BAD") : "unused");
++	return ok[0] && ok[1];
++}
++
++bool
++taimen_tas2557_power(bool on)
++{
++	bool ok = false;
++	lck_mtx_lock(&tas_lock);
++	if (!tas.loaded) {
++		printf("TAIMEN TAS2557: power %s: not loaded\n", on ? "on" : "off");
++	} else if (on) {
++		ok = tas.powered || tas_power_on();
++	} else {                                /* core.c:1054-1071, best effort */
++		ok = tas_seq(tas.devices, tas_shutdown_seq, NSTEPS(tas_shutdown_seq), false) == 0;
++		tas.powered = false;
++		printf("TAIMEN TAS2557: power down %s\n", ok ? "ok" : "with I2C errors");
++	}
++	lck_mtx_unlock(&tas_lock);
++	return ok;
++}
++
++void
++taimen_tas2557_status(void)
++{
++	lck_mtx_lock(&tas_lock);
++	if (!tas.loaded) {
++		printf("TAIMEN TAS2557: status: not loaded\n");
++	}
++	for (unsigned ci = 0; ci < 2 && tas.loaded; ci++) {
++		if (tas.devices & (1u << ci)) {
++			(void)tas_report(ci, tas.powered ? "status (on)" : "status (off)", tas.powered);
++		}
++	}
++	lck_mtx_unlock(&tas_lock);
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index c7a0a0a..253b621 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -15,6 +15,8 @@
+  * 5 (0319, with taimenaudiosmmu=1): the LPASS SMMU powered and clocked (GDSC and clock votes), what
+  *   ABL/TZ left for stream 1 (read only so far: the shared buffer comes with stage 8).
+  * 5 mode A (0321, taimenaudiosmmu=2): stream 1 through an identity context bank of the LPASS SMMU.
++ *   Boot 157: it hung (no line after the census, the GPU never came up). 0322: breadcrumbs, the
++ *   GPU first, and taimenaudiosmmu=3: an SMR with an S2CR bypass only (GR0 page writes).
+  * 8 (0321): ADM COPP (null topology) on 0x1006 + ASM write stream (session 1, PCM v2), routed;
+  *   3 s of 1 kHz at -20 dBFS in 8 x 20 ms periods from the pool; M8 when the DSP wrote back at
+  *   least 100 periods. The DSP address is pa | 1 << 32 (taimenaudioaddr=0) or pa (=1).
+@@ -42,6 +44,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" vm_map_address_t phystokv(uint64_t pa);
+ extern "C" bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
+ extern "C" void taimen_audio_init(void);
++extern "C" bool sweet_gpu_ready(void);       /* bsd/dev/sweet_gpu.c */
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -1709,6 +1712,49 @@ stage5(void)
+ 
+ static volatile uint8_t *lpass_cb;      /* the bank we gave stream 1, for its fault status */
+ 
++/* A log line that gets out before the next access (boot 157 hung in this function, no line) */
++#define CRUMB(fmt, ...) do { LOG("5: smmu: " fmt, ##__VA_ARGS__); IOSleep(30); } while (0)
++
++/*
++ * taimenaudiosmmu=3: stream 1 through an SMR whose S2CR says bypass (type 1): writes only in the
++ * GR0 page, which the census reads fine; no context bank, no GR1.
++ */
++static bool
++lpass_smmu_bypass(void)
++{
++	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(LPASS_SMMU_PA, LPASS_SMMU_SIZE);
++	if (s == NULL) {
++		return false;
++	}
++	uint32_t nsmr = r32(s, 0x20) & 0xFF, slot = ~0u;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = r32(s, 0x800 + 4 * i);
++		if ((smr >> 31) == 0) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot == ~0u) {
++		LOG("5: no free SMR for stream 1");
++		return false;
++	}
++	CRUMB("S2CR%u <- bypass", slot);
++	w32(s, 0xC00 + 4 * slot, 1u << 16);         /* S2CR: type 1, bypass */
++	CRUMB("SMR%u <- stream 1, valid", slot);
++	w32(s, 0x800 + 4 * slot, (1u << 31) | LPASS_SID);
++	CRUMB("sTLBGSYNC");
++	w32(s, 0x70, 0);
++	uint32_t n;
++	for (n = 0; n < 100000 && (r32(s, 0x74) & 1) != 0; n++) {
++		IODelay(1);
++	}
++	uint32_t smr = r32(s, 0x800 + 4 * slot), s2cr = r32(s, 0xC00 + 4 * slot);
++	bool ok = (smr >> 31) != 0 && (smr & 0x7FFF) == LPASS_SID && ((s2cr >> 16) & 3) == 1;
++	LOG("5: M5 stream 1 bypass SMR%u: SMR %08x S2CR %08x, sync %u us -> %s", slot, smr, s2cr, n,
++	    ok ? "OK" : "NOT as written (secure-only?)");
++	return ok;
++}
++
+ static bool
+ lpass_smmu_identity(void)
+ {
+@@ -1746,6 +1792,9 @@ lpass_smmu_identity(void)
+ 		return false;
+ 	}
+ 	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
++	CRUMB("read CB%u SCTLR at %#llx", cb, LPASS_SMMU_PA + (uint64_t)(cbp - s));
++	CRUMB("CB%u SCTLR %08x FSR %08x; GR1 CBAR%u %08x", cb, r32(cbp, 0x0), r32(cbp, 0x58), cb, r32(gr1, 0x000 + 4 * cb));
++	CRUMB("CB%u writes", cb);
+ 	w32(cbp, 0x58, 0xFFFFFFFF);                 /* FSR: clear */
+ 	w32(cbp, 0x20, 0);                          /* TTBR0 */
+ 	w32(cbp, 0x24, 0);
+@@ -1753,9 +1802,11 @@ lpass_smmu_identity(void)
+ 	w32(cbp, 0x10, 0);                          /* TCR2 */
+ 	w32(cbp, 0x38, 0);                          /* MAIR */
+ 	w32(cbp, 0x3C, 0);
++	CRUMB("GR1 CBA2R/CBAR%u", cb);
+ 	w32(gr1, 0x800 + 4 * cb, LPASS_CB_CBA2R);
+ 	w32(gr1, 0x000 + 4 * cb, LPASS_CB_CBAR);
+ 	w32(cbp, 0x0, LPASS_CB_SCTLR);              /* SCTLR last */
++	CRUMB("S2CR%u/SMR%u", slot, slot);
+ 	w32(s, 0xC00 + 4 * slot, cb);               /* S2CR: translate, this bank */
+ 	w32(s, 0x800 + 4 * slot, (1u << 31) | LPASS_SID);   /* SMR: stream 1 exactly, valid last */
+ 	w32(s, 0x70, 0);                            /* sTLBGSYNC */
+@@ -2216,7 +2267,15 @@ audio_thread(void *arg, wait_result_t)
+ 			(void)PE_parse_boot_argn("taimenaudiosmmu", &census, sizeof(census));
+ 			bool m5 = false;
+ 			if (level >= 5 && census != 0 && stage5() && census >= 2) {
+-				m5 = lpass_smmu_identity();
++				/* boot 157: programming it hung the bus and the GPU never came up: GPU first */
++				uint64_t tw = now_ms();
++				while (!sweet_gpu_ready() && now_ms() - tw < 120000) {
++					glink_poll();
++					IOSleep(10);
++				}
++				LOG("t=%u.%03u 5: GPU %s after %llu ms; programming the SMMU (mode %d)", T,
++				    sweet_gpu_ready() ? "ready" : "NOT ready", now_ms() - tw, census);
++				m5 = census == 3 ? lpass_smmu_bypass() : lpass_smmu_identity();
+ 			}
+ 			int addr = 0;
+ 			(void)PE_parse_boot_argn("taimenaudioaddr", &addr, sizeof(addr));
