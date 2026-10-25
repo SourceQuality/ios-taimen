@@ -1,0 +1,425 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 999d171..dd27ebb 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -156,6 +156,7 @@ void sweet_gpu_init(void);
+ #define R_RBBM_AHB_CNTL2        0x0095
+ #define R_RBBM_INT_0_STATUS     0x04e1
+ #define R_RBBM_STATUS           0x04f5
++#define R_RBBM_SW_RESET_CMD     0x0043  /* a5xx (0x37 is a6xx) */
+ #define R_VBIF_RR_QOS_ARB       0x3049
+ #define R_SECVID_TRUST_CNTL     0xf400
+ #define R_SECVID_TSB_BASE       0xf800
+@@ -218,6 +219,7 @@ void sweet_gpu_init(void);
+ #define CP_ME_INIT              0x48
+ #define CP_SET_SECURE_MODE      0x66
+ #define CP_WAIT_FOR_IDLE        0x26
++#define CP_WAIT_REG_MEM         0x3c
+ #define CP_BLIT                 0x2c
+ #define CP_EVENT_WRITE          0x46
+ #define CP_SET_RENDER_MODE      0x6c
+@@ -1525,6 +1527,7 @@ sweet_gpu_ready(void)
+ }
+ 
+ static uint32_t rb_free(void);
++static void gpu_hung(const char *why);
+ 
+ int
+ sweet_gpu_quad(const struct sweet_gpu_quad *q)
+@@ -1625,11 +1628,8 @@ sweet_gpu_quad(const struct sweet_gpu_quad *q)
+ 	if (df >= 0) {
+ 		vm_cache((uint32_t)df, drow, drows);
+ 	}
+-	if (!done) {
+-		g_ready = false;        /* hung: no recovery yet, fail fast from now on */
+-		cp_state(g_gpu, "quad timeout:");
+-		smmu_faults(g_smmu, "quad timeout:");
+-		printf("SWEET GPU: quad timed out, GPU service off until reboot\n");
++	if (!done && g_ready) {
++		gpu_hung("quad timed out");
+ 	}
+ 	lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 	return done ? 0 : ETIMEDOUT;
+@@ -1664,15 +1664,201 @@ fence_now(void)
+ 	return *(volatile uint32_t *)g_fence_va;
+ }
+ 
+-/* VM lock held: declare the GPU hung. */
++/*
++ * 0332: hang recovery, as mainline's a5xx_recover: an RBBM soft reset, then the CP's bring-up
++ * again (cp_test's registers, ring and ME_INIT) with the zap shader resumed through TZ instead
++ * of loaded, CP_SET_SECURE_MODE 0, and the hung submits' fences written as done (their results
++ * are lost; Mesa emits a batch's whole state at its start, so later batches draw). At most
++ * taimengpurecover times a boot (default 4; 0: off until reboot, as before).
++ */
++static uint64_t g_pm4, g_pfp;           /* the CP microcode (cp_test, service mode) */
++static unsigned g_recoveries;
++static void smmu_report(void);
++
++/* a5xx_pm_resume's power islands and the subset of a5xx_hw_init this driver runs */
++static void
++hw_init_regs(vm_offset_t gpu, uint64_t pm4, uint64_t pfp, bool say)
++{
++	/*
++	 * a5xx_pm_resume (A530): power the RB/CCU and SP islands; without them
++	 * the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3).
++	 */
++	gw(gpu, R_GPMU_RBCCU_POWER_CNTL, 0x778000);
++	bool rbccu = poll(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
++	gw(gpu, R_GPMU_SP_POWER_CNTL, 0x778000);
++	bool sp = poll(gpu, R_GPMU_SP_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
++	if (say) {
++		printf("SWEET GPU: RBCCU power %s (%08x), SP power %s (%08x)\n", rbccu ? "on" : "TIMEOUT",
++		    gr(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS), sp ? "on" : "TIMEOUT", gr(gpu, R_GPMU_SP_PWR_CLK_STATUS));
++	}
++
++	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU firmware, CP_PROTECT left out). */
++	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
++	gw(gpu, R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++	gw(gpu, R_RBBM_AHB_CNTL0, 1);
++	gw(gpu, R_UCHE_CACHE_WAYS, 2);
++	gw64(gpu, R_UCHE_TRAP_BASE, 0x0001ffffffff0000ull);
++	gw64(gpu, R_UCHE_WRITE_THRU_BASE, 0x0001ffffffff0000ull);
++	gw64(gpu, R_UCHE_GMEM_RANGE_MIN, 0x00100000);
++	gw64(gpu, R_UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x100000 - 1);   /* 1 MB GMEM */
++	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x40);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	gw(gpu, R_CP_MERCIU_SIZE, 0x400);       /* A540 (mainline a5xx_gpu.c, kgsl a5xx_start) */
++#else
++	gw(gpu, R_CP_MERCIU_SIZE, 0x40);
++#endif
++	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x80000060);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
++	gw(gpu, R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
++	gw(gpu, R_UCHE_MODE_CNTL, 1u << 29);
++	gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
++	gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
++	gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
++	gw(gpu, R_TPL1_MODE_CNTL, 2u << 7);     /* highest bank bit 15 */
++	gw(gpu, R_RB_MODE_CNTL, 2u << 1);
++	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 10));
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* A540 deltas (docs/taimen-gpu-plan.md 2.6, mainline a5xx_hw_init): */
++	gw(gpu, 0x302a, 9);                                             /* VBIF_GATE_OFF_WRREQ_EN */
++	gw(gpu, 0x0e8f, 2);                                             /* UCHE_DBG_ECO_CNTL_2: bank bit 15 */
++	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 23));
++	gw(gpu, 0x0e04, gr(gpu, 0x0e04) & ~(1u << 18));                 /* HLSQ_DBG_ECO_CNTL */
++#endif
++	gw(gpu, R_SECVID_TSB_CNTL, 0);
++	gw64(gpu, R_SECVID_TSB_BASE, 0);
++	gw(gpu, R_SECVID_TSB_SIZE, 0);
++	/*
++	 * Every block in 64-bit mode (the CP alone was not enough: the 0127a
++	 * blit faulted at the source PA's low 32 bits).
++	 */
++	static const uint16_t addr_mode[] = {
++		0x0860 /* CP */, 0x0bc1 /* VSC */, 0x0c81 /* GRAS */, 0x0cc5 /* RB */, 0x0d01 /* PC */,
++		0x0e05 /* HLSQ */, 0x0e41 /* VFD */, 0x0e61 /* VPC */, 0x0e80 /* UCHE */, 0x0ec1 /* SP */,
++		0x0f01 /* TPL1 */, R_SECVID_TSB_ADDR_MODE,
++	};
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		gw(gpu, addr_mode[i], 1);
++	}
++	gw64(gpu, R_CP_ME_INSTR_BASE, pm4);
++	gw64(gpu, R_CP_PFP_INSTR_BASE, pfp);
++	gw64(gpu, R_CP_RB_BASE, rb_pa);
++	/* BUFSZ log2(16 KB / 8) = 11, BLKSZ log2(32 / 8) = 2 (mainline), NO_UPDATE */
++	gw(gpu, R_CP_RB_CNTL, 11u | (2u << 8) | (1u << 27));
++}
++
++static void
++me_init(void)
++{
++	emit(pkt7(CP_ME_INIT, 8));
++	emit(0x2f);
++	emit(0x3);
++	emit(0x20000000);
++	emit(0);
++	emit(0);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	emit(0);                /* A540: no microcode workarounds (a5xx_me_init) */
++#else
++	emit(0xb);              /* A530 token-end-sync workaround */
++#endif
++	emit(0);
++	emit(0);
++}
++
++/* VM lock held, g_ready false. */
++static bool
++gpu_recover(const char *why)
++{
++	int max = 4;
++	(void)PE_parse_boot_argn("taimengpurecover", &max, sizeof(max));
++	if (g_gpu == 0 || g_pm4 == 0 || max <= 0 || g_recoveries >= (unsigned)max) {
++		if (max > 0 && g_recoveries >= (unsigned)max) {
++			printf("SWEET GPU: no recovery: %u done already (taimengpurecover=%d)\n", g_recoveries, max);
++		}
++		return false;
++	}
++	g_recoveries++;
++	uint64_t t0 = mach_absolute_time();
++	vm_offset_t gpu = g_gpu;
++	gw(gpu, R_RBBM_SW_RESET_CMD, 1);
++	(void)gr(gpu, R_RBBM_SW_RESET_CMD);
++	delay(100);
++	gw(gpu, R_RBBM_SW_RESET_CMD, 0);
++	delay(1000);
++	uint32_t rptr = gr(gpu, R_CP_RB_RPTR), st = gr(gpu, R_RBBM_STATUS);
++	hw_init_regs(gpu, g_pm4, g_pfp, false);
++	rb_n = 0;
++	me_init();
++	volatile uint32_t *mark = (volatile uint32_t *)(g_scratch_va + 80);
++	mark[0] = 0;
++	mark[1] = 0;
++	flush_dcache64((addr64_t)g_scratch + 80, 8, TRUE);
++	emit(pkt7(CP_MEM_WRITE, 3));
++	emit((uint32_t)g_scratch + 80);
++	emit((uint32_t)(g_scratch >> 32));
++	emit(0x7ec0e700u | g_recoveries);
++	gw(gpu, R_CP_PFP_ME_CNTL, 0);   /* clear ME_HALT */
++	bool cp = kick(gpu);
++	delay(1000);
++	flush_dcache64((addr64_t)g_scratch + 80, 8, TRUE);
++	bool landed = mark[0] == (0x7ec0e700u | g_recoveries);
++	uint64_t r1 = 0;
++	int64_t r = -1;
++	bool secure_left = false;
++	if (cp && landed) {
++		/* qcom_scm_set_remote_state(SCM_GPU_ZAP_SHADER_RESUME 0, pas id): svc 1 (boot) cmd 0x0a */
++		r = scm_call(1, 0x0a, 2, 0, GPU_PAS_ID, 0, &r1);
++		if (r == 0) {
++			emit(pkt7(CP_SET_SECURE_MODE, 1));
++			emit(0);
++			emit(pkt7(CP_MEM_WRITE, 3));
++			emit((uint32_t)g_scratch + 84);
++			emit((uint32_t)(g_scratch >> 32));
++			emit(0x5ec0de00u | g_recoveries);
++			bool k = kick(gpu);
++			delay(1000);
++			flush_dcache64((addr64_t)g_scratch + 80, 8, TRUE);
++			secure_left = k && mark[1] == (0x5ec0de00u | g_recoveries);
++		}
++	}
++	if (!(cp && landed && secure_left)) {
++		cp_state(gpu, "recovery failed:");
++		printf("SWEET GPU: recovery %u FAILED (%s): RPTR after reset %u, RBBM_STATUS %08x; ring %s, marker %08x, "
++		    "zap resume %lld/%llx, secure mode %s\n", g_recoveries, why, rptr, st, cp ? "read" : "NOT read",
++		    mark[0], r, r1, secure_left ? "left" : "NOT left");
++		return false;
++	}
++	/* the hung submits' fences and the kernel quads' as done, by the CPU and then by the CP */
++	*(volatile uint32_t *)g_fence_va = g_submit_seq;
++	flush_dcache64((addr64_t)g_fence_pa, 64, TRUE);
++	*(volatile uint32_t *)(g_scratch_va + 64) = g_seq;
++	flush_dcache64((addr64_t)g_scratch + 64, 4, TRUE);
++	emit(pkt7(CP_EVENT_WRITE, 4));
++	emit(CACHE_FLUSH_TS);
++	emit((uint32_t)g_fence_pa);
++	emit((uint32_t)(g_fence_pa >> 32));
++	emit(g_submit_seq);
++	(void)kick(gpu);
++	g_fence_seen = g_submit_seq;
++	g_fence_when = 0;
++	smmu_report();
++	g_ready = true;
++	printf("SWEET GPU: recovered (%s) in %llu ms: soft reset (RPTR %u, RBBM_STATUS %08x), CP restarted, zap resumed, "
++	    "secure mode left, fences done up to %u (recovery %u of %d)\n", why, usecs(mach_absolute_time() - t0) / 1000,
++	    rptr, st, g_submit_seq, g_recoveries, max);
++	return true;
++}
++
++/* VM lock held: declare the GPU hung, then recover it if we can. */
+ static void
+ gpu_hung(const char *why)
+ {
+ 	g_ready = false;
+ 	cp_state(g_gpu, why);
+ 	smmu_faults(g_smmu, why);
+-	printf("SWEET GPU: %s: fence %u, submitted %u: GPU service off until reboot\n", why,
+-	    fence_now(), g_submit_seq);
++	printf("SWEET GPU: hung (%s): fence %u, submitted %u\n", why, fence_now(), g_submit_seq);
++	if (!gpu_recover(why)) {
++		printf("SWEET GPU: GPU service off until reboot\n");
++	}
+ }
+ 
+ /* VM lock held: log (rate-limited) and clear a recorded SMMU fault, with the mapping below it. */
+@@ -1732,7 +1918,8 @@ sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
+ 	while (ret == 0 && g_ready && rb_free() < need) {
+ 		if (mach_absolute_time() > deadline) {
+ 			gpu_hung("submit: ring full");
+-			ret = ETIMEDOUT;
++			ret = g_ready ? 0 : ETIMEDOUT;
++			clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
+ 		}
+ 	}
+ 	sweet_gpu_ring_wait += mach_absolute_time() - w0;
+@@ -2150,6 +2337,62 @@ taimen_gfx_set(vm_offset_t gpu, unsigned mhz)
+ #endif
+ 
+ /* Step 2: command processor. */
++/*
++ * 0332: taimengpuhang=S: S seconds after the service is up, hang the CP on purpose (a
++ * CP_WAIT_REG_MEM on a word never written, in the ring), wait for the fence, and check the
++ * GPU again after the recovery.
++ */
++static void
++hang_test(void *arg, wait_result_t result)
++{
++	(void)result;
++	gpu_sleep((unsigned)(uintptr_t)arg);
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	if (!g_ready || rb_free() < 64) {
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		printf("SWEET GPU: hang test: service not up or ring full, not run\n");
++		return;
++	}
++	*(volatile uint32_t *)(g_scratch_va + 88) = 0;
++	flush_dcache64((addr64_t)g_scratch + 88, 4, TRUE);
++	emit(pkt7(CP_WAIT_REG_MEM, 6));
++	emit(3u | (1u << 4));           /* WRITE_EQ, poll memory */
++	emit((uint32_t)g_scratch + 88);
++	emit((uint32_t)(g_scratch >> 32));
++	emit(0xbadc0de1u);
++	emit(0xffffffffu);
++	emit(16);
++	uint32_t seq = ++g_submit_seq;
++	emit(pkt7(CP_EVENT_WRITE, 4));
++	emit(CACHE_FLUSH_TS);
++	emit((uint32_t)g_fence_pa);
++	emit((uint32_t)(g_fence_pa >> 32));
++	emit(seq);
++	flush_dcache64((addr64_t)rb_pa, RB_DWORDS * 4, TRUE);
++	gw(g_gpu, R_CP_RB_WPTR, rb_n);
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	printf("SWEET GPU: hang test: the CP waits for a word never written (fence %u)\n", seq);
++	uint64_t t0 = mach_absolute_time();
++	int r = sweet_gpu_wait(seq, 15000);
++	printf("SWEET GPU: hang test: wait -> %d after %llu ms; service %s, %u recoveries\n", r,
++	    usecs(mach_absolute_time() - t0) / 1000, g_ready ? "up" : "OFF", g_recoveries);
++	if (g_ready) {
++		api_selftest();
++	}
++}
++
++static void
++hang_test_start(void)
++{
++	int secs = 0;
++	thread_t thread;
++	if (PE_parse_boot_argn("taimengpuhang", &secs, sizeof(secs)) && secs > 0 &&
++	    kernel_thread_start(hang_test, (void *)(uintptr_t)secs, &thread) == KERN_SUCCESS) {
++		printf("SWEET GPU: hang test in %d s (taimengpuhang)\n", secs);
++		thread_deallocate(thread);
++	}
++}
++
+ static void
+ cp_test(vm_offset_t gpu, int level)
+ {
+@@ -2232,85 +2475,11 @@ cp_test(vm_offset_t gpu, int level)
+ 	flush_dcache64((addr64_t)pfp, pfp_len, TRUE);
+ 	gpu_wait(11);
+ 
+-	/*
+-	 * a5xx_pm_resume (A530): power the RB/CCU and SP islands; without them
+-	 * the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3).
+-	 */
+-	gw(gpu, R_GPMU_RBCCU_POWER_CNTL, 0x778000);
+-	bool rbccu = poll(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
+-	gw(gpu, R_GPMU_SP_POWER_CNTL, 0x778000);
+-	bool sp = poll(gpu, R_GPMU_SP_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
+-	printf("SWEET GPU: RBCCU power %s (%08x), SP power %s (%08x)\n", rbccu ? "on" : "TIMEOUT",
+-	    gr(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS), sp ? "on" : "TIMEOUT", gr(gpu, R_GPMU_SP_PWR_CLK_STATUS));
+-
+-	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU firmware, CP_PROTECT left out). */
+-	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
+-	gw(gpu, R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+-	gw(gpu, R_RBBM_AHB_CNTL0, 1);
+-	gw(gpu, R_UCHE_CACHE_WAYS, 2);
+-	gw64(gpu, R_UCHE_TRAP_BASE, 0x0001ffffffff0000ull);
+-	gw64(gpu, R_UCHE_WRITE_THRU_BASE, 0x0001ffffffff0000ull);
+-	gw64(gpu, R_UCHE_GMEM_RANGE_MIN, 0x00100000);
+-	gw64(gpu, R_UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x100000 - 1);   /* 1 MB GMEM */
+-	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x40);
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-	gw(gpu, R_CP_MERCIU_SIZE, 0x400);       /* A540 (mainline a5xx_gpu.c, kgsl a5xx_start) */
+-#else
+-	gw(gpu, R_CP_MERCIU_SIZE, 0x40);
+-#endif
+-	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x80000060);
+-	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
+-	gw(gpu, R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
+-	gw(gpu, R_UCHE_MODE_CNTL, 1u << 29);
+-	gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
+-	gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
+-	gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
+-	gw(gpu, R_TPL1_MODE_CNTL, 2u << 7);     /* highest bank bit 15 */
+-	gw(gpu, R_RB_MODE_CNTL, 2u << 1);
+-	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 10));
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-	/* A540 deltas (docs/taimen-gpu-plan.md 2.6, mainline a5xx_hw_init): */
+-	gw(gpu, 0x302a, 9);                                             /* VBIF_GATE_OFF_WRREQ_EN */
+-	gw(gpu, 0x0e8f, 2);                                             /* UCHE_DBG_ECO_CNTL_2: bank bit 15 */
+-	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 23));
+-	gw(gpu, 0x0e04, gr(gpu, 0x0e04) & ~(1u << 18));                 /* HLSQ_DBG_ECO_CNTL */
+-#endif
+-	gw(gpu, R_SECVID_TSB_CNTL, 0);
+-	gw64(gpu, R_SECVID_TSB_BASE, 0);
+-	gw(gpu, R_SECVID_TSB_SIZE, 0);
+-	/*
+-	 * Every block in 64-bit mode (the CP alone was not enough: the 0127a
+-	 * blit faulted at the source PA's low 32 bits).
+-	 */
+-	static const uint16_t addr_mode[] = {
+-		0x0860 /* CP */, 0x0bc1 /* VSC */, 0x0c81 /* GRAS */, 0x0cc5 /* RB */, 0x0d01 /* PC */,
+-		0x0e05 /* HLSQ */, 0x0e41 /* VFD */, 0x0e61 /* VPC */, 0x0e80 /* UCHE */, 0x0ec1 /* SP */,
+-		0x0f01 /* TPL1 */, R_SECVID_TSB_ADDR_MODE,
+-	};
+-	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
+-		gw(gpu, addr_mode[i], 1);
+-	}
+-	gw64(gpu, R_CP_ME_INSTR_BASE, pm4);
+-	gw64(gpu, R_CP_PFP_INSTR_BASE, pfp);
+-	gw64(gpu, R_CP_RB_BASE, rb_pa);
+-	/* BUFSZ log2(16 KB / 8) = 11, BLKSZ log2(32 / 8) = 2 (mainline), NO_UPDATE */
+-	gw(gpu, R_CP_RB_CNTL, 11u | (2u << 8) | (1u << 27));
++	hw_init_regs(gpu, pm4, pfp, true);
+ 	cp_state(gpu, "before ME start:");
+ 
+ 	rb_n = 0;
+-	emit(pkt7(CP_ME_INIT, 8));
+-	emit(0x2f);
+-	emit(0x3);
+-	emit(0x20000000);
+-	emit(0);
+-	emit(0);
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-	emit(0);                /* A540: no microcode workarounds (a5xx_me_init) */
+-#else
+-	emit(0xb);              /* A530 token-end-sync workaround */
+-#endif
+-	emit(0);
+-	emit(0);
++	me_init();
+ 	emit(pkt7(CP_MEM_WRITE, 3));
+ 	emit((uint32_t)scratch);
+ 	emit((uint32_t)(scratch >> 32));
+@@ -2359,6 +2528,8 @@ cp_test(vm_offset_t gpu, int level)
+ 			g_gpu = gpu;
+ 			g_scratch = scratch;
+ 			g_scratch_va = scratch_va;
++			g_pm4 = pm4;
++			g_pfp = pfp;
+ 			g_ready = true;
+ 			printf("SWEET GPU: service ready (300 MHz, GPU VA window 8-16 GB)\n");
+ 			api_selftest();
+@@ -2381,6 +2552,7 @@ cp_test(vm_offset_t gpu, int level)
+ 			} else {
+ 				printf("SWEET GPU: full-screen quad %llu us at 300 MHz\n", us300);
+ 			}
++			hang_test_start();
+ 			return;
+ 		}
+ 		if (level >= 7) {
