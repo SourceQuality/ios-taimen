@@ -1147,3 +1147,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   them out), the plug-in in the default GPU ROOTFIX. AegirPoster: NanoUniverse inserts nil into an array
   (its Metal objects), 40-95 times a boot. sweetgl 316ac75: video frames (420v/420f) as R8/RG8 textures
   (boot 158's GPU renderer showed the MP4 layer green).
+- 2026-10-25 boot 160 (r145 = +0326, a plain ROOT=1 boot): the defaults hold. GPU renderer with sweetgl 316ac75
+  (zap shader loaded, no software fallback); **the MP4 plays in colour** (video frames as R8/RG8 plane
+  textures); sound on by default: ADSP READY 13 ms after reset, amps loaded, the stream 1 bank, the plug-in
+  open at HAL start, the MP4's audio through the feeder (1000448 frames, 0 dropped). 0327: the test tone only
+  on request (it beeped at every boot). Boot 161 (r146): an hour on the defaults with no scripted taps.
+  Merged metal-m1 (the Metal runtime on Gallium, host phase: drm-shim submits for gpu 540, correct values on
+  softpipe; tools/sweetmtl/README.md). 0328: haptics, the motor is a TI DRV2624 on BLSP1 QUP6 (the PMI8998
+  haptics block is disabled in this DT) behind /dev/redwood-haptic. 0329: taimenmtl=NAME puts
+  MetalPluginName/MetalPluginClassName on IOAcceleratorES. 0330: the audio firmware from
+  /usr/standalone/firmware/taimen-audio (mkrootfix.py --audio-fw, once) instead of payload blobs.
