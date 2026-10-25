@@ -111,6 +111,20 @@ if [ "${wifi:-0}" -ge 7 ] && [ -f "$WLANFW/wlanmdsp.mbn" ]; then
 		[ -f "$WLANFW/${f%%:*}" ] && blobs+=(--blob "${f#*:}=$WLANFW/${f%%:*}")
 	done
 fi
+# AUDIOFW=DIR: the ADSP and TAS2557 firmware for taimenaudio>=1 (xnu 0317, docs/taimen-audio-plan.md
+# stage 1; pulled by the log reader as fw-adsp.* / fw-tas2557s_*, the calibration from persist, kept in
+# ../research/taimen/firmware, never in git): ADSP-MDT, ADSP-Bnn, TAS-FW, TAS-CAL, ~9.4 MB of payload.
+audio=$(echo "$cmdline ${TAIMEN_ADT_ARGS:-}" | sed -n 's/.*taimenaudio=\([0-9]*\).*/\1/p')
+AUDIOFW=${AUDIOFW:-$P/../research/taimen/firmware}
+if [ "${audio:-0}" -ge 1 ] && [ -f "$AUDIOFW/adsp.mdt" ]; then
+	blobs+=(--blob "ADSP-MDT=$AUDIOFW/adsp.mdt")
+	for f in "$AUDIOFW"/adsp.b[0-9][0-9]; do
+		n=${f##*.b}
+		[ "$n" = 00 ] || [ "$n" = 01 ] || blobs+=(--blob "ADSP-B$n=$f")
+	done
+	[ -f "$AUDIOFW/tas2557s_PG21_uCDSP.bin" ] && blobs+=(--blob "TAS-FW=$AUDIOFW/tas2557s_PG21_uCDSP.bin")
+	[ -f "$AUDIOFW/audio/tas2557_cal.bin" ] && blobs+=(--blob "TAS-CAL=$AUDIOFW/audio/tas2557_cal.bin")
+fi
 python3 -I "$P/tools/mkpayload.py" "$kernel" "$out/taimen.adt" "$out/payload" --l2block 0x200000 --cmdline "$cmdline" "${blobs[@]}"
 # ABL does not start a boot image whose ramdisk (the payload) is over ~35 MiB: boot 77's 36698688
 # bytes booted, boot 78's 36715104 went straight back to fastboot (shim never ran). The sweetgl
