@@ -966,3 +966,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   soft reset done in 1 ms, then endpoint 0 SETEPCONFIG timed out (1 ms timeout). 0299: GUSB3PIPECTL.SUSPHY
   before the reset (Linux's default; no PIPE clock wait at high speed), 10 ms after it, 50 ms command timeout,
   the PHY registers logged on a timeout.
+- 2026-10-24 boot 131 (r119 = +0298-0299, sweetusb=2 NCM): the same endpoint 0 timeout after 50 ms, DEPCMD
+  0x401 (still active), DSTS 0x00520000 (halted, link U3). The probe's DSTS before the reset was 0x00d3a474:
+  ABL is *connected at SuperSpeed* on this cable/port, and the QUSB2 PHY reads PWR_CTRL1 0x23 (power-down bit
+  set): ABL drives the port over the USB3 PHY with the USB2 PHY off, so at high speed there is no UTMI clock.
+  0300: stay at SuperSpeed (DCFG speed 4) with USB 3.0 descriptors (ep0 2^9, BOS, endpoint companions, 1024-byte
+  bulk), SET_SEL/SET_ISOCH_DELAY accepted, ep0 kept at 512 after connect. sweetusbss=0 forces high speed.

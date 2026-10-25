@@ -1,0 +1,156 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 201c93c..866875b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -44,6 +44,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ static int ud_ncm;                              /* defined with the descriptors (0298) */
++static bool ud_ss;                              /* 0300: run at SuperSpeed, as ABL left the port */
++static bool ud_conn_ss;                         /* the host connected at SuperSpeed */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -392,6 +394,35 @@ static const uint8_t ud_cfg_desc_ncm[86] = {
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+ };
++/*
++ * 0300: at SuperSpeed (taimen: ABL drives this port over the USB3 PHY and leaves the QUSB2 PHY
++ * powered down, PWR_CTRL1 0x23, so high speed has no UTMI clock: boots 129/131 timed out on the
++ * first endpoint command). USB 3.0 device descriptor (ep0 2^9), a BOS (USB 2.0 extension + the
++ * SuperSpeed capability), and the NCM configuration with 1024-byte bulk endpoints, each endpoint
++ * followed by its SuperSpeed companion.
++ */
++static const uint8_t ud_bos_desc[22] = {
++	5, 0x0f, 22, 0, 2,                              /* BOS: 2 capabilities */
++	7, 0x10, 0x02, 0x02, 0, 0, 0,                   /* USB 2.0 extension: LPM */
++	10, 0x10, 0x03, 0x00, 0x0e, 0x00, 0x01, 0x0a, 0xff, 0x07, /* SuperSpeed: FS/HS/SS, U1 10 us, U2 2047 us */
++};
++static const uint8_t ud_cfg_desc_ncm_ss[104] = {
++	9, 2, 104, 0, 2, 1, 0, 0x80, 112,               /* config: 2 interfaces, 896 mA (8 mA units) */
++	9, 4, 0, 0, 1, 0x02, 0x0d, 0x00, 0,             /* comm interface 0: CDC NCM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	6, 0x24, 0x1a, 0x00, 0x01, 0x00,                /* NCM 1.00 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes */
++	6, 0x30, 0, 0, 16, 0,                           /*   companion: no burst, 16 bytes per interval */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x01, 0,             /* data interface 1 alt 0 */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x01, 0,             /* data interface 1 alt 1: NTB */
++	7, 5, 0x81, 0x02, 0x00, 0x04, 0,                /* ep 0x81 bulk IN, 1024 */
++	6, 0x30, 0, 0, 0, 0,                            /*   companion */
++	7, 5, 0x01, 0x02, 0x00, 0x04, 0,                /* ep 0x01 bulk OUT, 1024 */
++	6, 0x30, 0, 0, 0, 0,                            /*   companion */
++};
++
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ static int ud_ncm = 1;
+ #else
+@@ -449,9 +480,11 @@ ud_configure(void)
+ 		return;
+ 	}
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+-	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | ((ud_conn_ss ? 1024u : 512u) << 3),
++	    (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | ((ud_conn_ss ? 1024u : 512u) << 3) | (1u << 17),
++	    (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
+ 	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+ 	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
+ 	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
+@@ -499,9 +532,23 @@ ud_setup(void)
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 1:
++			memcpy(data, ud_dev_desc, sizeof(ud_dev_desc));
++			n = sizeof(ud_dev_desc);
++			if (ud_conn_ss) {
++				data[2] = 0x00; data[3] = 0x03;         /* bcdUSB 3.00 */
++				data[7] = 9;                            /* ep0: 2^9 = 512 */
++			}
++			break;
++		case 15:                        /* BOS */
++			memcpy(data, ud_bos_desc, sizeof(ud_bos_desc));
++			n = sizeof(ud_bos_desc);
++			break;
+ 		case 2:
+-			if (ud_ncm) {
++			if (ud_ncm && ud_conn_ss) {
++				memcpy(data, ud_cfg_desc_ncm_ss, sizeof(ud_cfg_desc_ncm_ss));
++				n = sizeof(ud_cfg_desc_ncm_ss);
++			} else if (ud_ncm) {
+ 				memcpy(data, ud_cfg_desc_ncm, sizeof(ud_cfg_desc_ncm));
+ 				n = sizeof(ud_cfg_desc_ncm);
+ 			} else {
+@@ -534,7 +581,8 @@ ud_setup(void)
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
+-	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
++	} else if (req == 0x30 || req == 0x31) { /* SET_SEL (data read and ignored), SET_ISOCH_DELAY */
++	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup, U1/U2) */
+ 	} else {
+ 		ok = false;
+ 	}
+@@ -553,7 +601,7 @@ ud_setup(void)
+ 		}
+ 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+ 	} else {
+-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++		ud_start(0, UD_DATA, ud_conn_ss ? 512 : 64, TRBCTL_DATA);  /* OUT data is not used here */
+ 	}
+ }
+ 
+@@ -787,10 +835,12 @@ ud_event(uint32_t ev)
+ 			printf("SWEET USB: bus reset\n");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+-			/* ep0 max packet: 64 at high/full speed (modify action) */
+-			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			ud_conn_ss = speed == 4;
++			/* ep0 max packet: 64 at high/full speed, 512 at SuperSpeed (modify action) */
++			uint32_t mps = ud_conn_ss ? 512u : 64u;
++			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (mps << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (0u << 25), 0);
+-			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (mps << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+@@ -945,9 +995,16 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * Linux's default) so that, at high speed, nothing waits for a PIPE clock.
+ 	 */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-	uint32_t pipe = dwc_rd(0xc2c0);
+-	dwc_wr(0xc2c0, pipe | (1u << 17));
+-	printf("SWEET USB: GUSB3PIPECTL 0x%08x -> 0x%08x (SUSPHY)\n", pipe, dwc_rd(0xc2c0));
++	ud_ss = (dwc_rd(DCFG) & 7) == 4;
++	int want_ss = 1;
++	PE_parse_boot_argn("sweetusbss", &want_ss, sizeof(want_ss));
++	ud_ss = ud_ss && want_ss;
++	if (!ud_ss) {
++		uint32_t pipe = dwc_rd(0xc2c0);
++		dwc_wr(0xc2c0, pipe | (1u << 17));
++		printf("SWEET USB: GUSB3PIPECTL 0x%08x -> 0x%08x (SUSPHY)\n", pipe, dwc_rd(0xc2c0));
++	}
++	printf("SWEET USB: %s (ABL's DCFG speed %u)\n", ud_ss ? "SuperSpeed" : "high speed", dwc_rd(DCFG) & 7);
+ #endif
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+@@ -968,9 +1025,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
+ 
+-	/* High speed, address 0 */
++	/* High speed (or SuperSpeed, 0300), address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+-	dwc_wr(DCFG, dcfg | 0);
++	dwc_wr(DCFG, dcfg | (ud_ss ? 4u : 0u));
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 
