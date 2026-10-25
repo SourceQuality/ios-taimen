@@ -1133,3 +1133,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   TAS2557 amps (stage 7; parser checked on the PC against this phone's firmware), /dev/redwood-audio and the
   feeder (stage 9), and runs the port at S24_LE / 3.072 MHz as Android's mixer paths do; the RedwoodAudio HAL
   plug-in builds on the phone-tools CI (mkrootfix.py --hal-plugin).
+- 2026-10-25 **boot 159 (r144 = +0323-0325): iOS plays through the speakers.** taimenaudio=9 with the
+  RedwoodAudio plug-in in the ROOTFIX. M7: both TAS2557 answered PG2.1 (0xa0) on BLSP2 QUP1 and took program
+  0 Tuning Mode, configuration 0 (48 kHz) and calibration 0 in 2.1 s without a CRC mismatch, ASI 24-bit.
+  M5: TZ refused MP_RESTORE_SEC_CFG (-2), but the lowest free bank (CB1) took stream 1 as an identity bank
+  without hanging (boot 157 had taken CB12). M8: the 3 s 1 kHz tone at -20 dBFS streamed through ASM/ADM
+  to the S24_LE port at 3.072 MHz, 159 periods out and back, 0 underflows; both amps up clean (power-up
+  0xfc, no clock, brownout or over-current flag), the left one 38 -> 51 C. Then the plug-in, loaded on this
+  first boot, opened /dev/redwood-audio, took the volume (1.0) and its frames opened feeder sessions:
+  147456, 754688 and 1596416 frames (Safari's MP4 among them), 0 dropped, 0 DSP underflows, the amps up and
+  down with each session. Level capped at -20 dB (taimenaudiobelow=160) until it is heard. 0326 makes it
+  the default: taimenaudio=9 in the kernel, the blobs in every boot-xnu.sh payload (AUDIO=0 to leave
+  them out), the plug-in in the default GPU ROOTFIX. AegirPoster: NanoUniverse inserts nil into an array
+  (its Metal objects), 40-95 times a boot. sweetgl 316ac75: video frames (420v/420f) as R8/RG8 textures
+  (boot 158's GPU renderer showed the MP4 layer green).
