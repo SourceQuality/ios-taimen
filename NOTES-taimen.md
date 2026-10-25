@@ -1077,3 +1077,30 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Podcasts and Health open since the TCC fix (boot 148) as well. App status, first home screen page: everything
   opens except FaceTime (black). Next steps on the network side: tools/windows/usb-share.ps1 (admin once) for
   full NAT; the PC agent (tools/taimen/usbproxy.py) must run for internet without it.
+- 2026-10-25 boots 150-151 (r133): the relaunch loops of boot 149 (lskdd 546x, bluetoothd 90x, AegirPoster
+  66x). lskdd joins the ROOTFIX "gone" list; `mkrootfix.py --locationd` writes root's
+  com.apple.locationd.plist with Location Services on, `--write /DEST=SRC[:UID]` overwrites a file at every
+  boot. Boot 151: the lskdd loop is gone. bluetoothd keeps relaunching (no Bluetooth hardware behind it) and
+  AegirPoster keeps aborting (it wants a Metal device).
+- 2026-10-25 boot 152 (r133, the one-thread netsvcd): browsing holds up; **YouTube** in Safari loads and
+  searches, but mediaserverd crashes on every video: an uncaught -[__NSCFNumber objectForKey:] in VideoToolbox's
+  FigGetAlignmentForIOSurfaceOutputToDisplayService, which reads AppleCLCD's DisplayPipePlaneBaseAlignment as a
+  dictionary. xnu 0315 publishes {PlaneBaseAlignmentLinear: 64}; boot 153: no mediaserverd crash.
+- 2026-10-25 boot 154 (r134, scripted YouTube): mediaserverd now runs **iOS's software H.264 decoder**
+  (H264SW.videocodec) and died twice with SIGBUS, storing a decoded plane into GRDB's __TEXT ("triggered unnest
+  of the DYLD shared region"): wrong output pixel-buffer geometry. IOSurfaceClientGet*OfPlane read a plane
+  record of the lock result as width +0, height +4, offset +0xc, **bytes per row +0x10**, size +0x14, bpe
+  +0x18, element size +0x1a/+0x1b; SweetSurface wrote bytes per row at +0x8, so every multi-planar surface
+  (420f/420v frames, CMPhoto's YUV) had 0 bytes per row in its planes. xnu 0316 fixes it.
+- 2026-10-25 boot 155 (r135 = +0316): YouTube search, results and thumbnails draw; the video page now says
+  "Sorry, there was an error licensing this video" (a DRM licence: fairplayd, as the App Store needs, is
+  missing). No mediaserverd crash in boot 155; a plain MP4 tests the decoder next (boot 156).
+- 2026-10-25 **Metal M0 passed** (PC only, tools/sweetmtl/m0/README.md): 139/141 CoreAnimation functions
+  translate (inplace_copy needs pixel interlock), all 232 SPIR-V stages compile with ir3 for gpu 540 after
+  four ir3 a5xx fixes (mesa-a5xx-ir3.patch); CA's shaders use no buffer-device-address pointers, so the
+  plan's ldg/stg blocker does not arise. The Metal runtime on Gallium (M1, host part) is in progress on
+  branch metal-m1.
+- 2026-10-25 audio: docs/taimen-audio-plan.md (TAS2557 speakers through the ADSP, HackiOS's RedwoodAudio HAL
+  plug-in). The reader copies adsp.*, the TAS2557 firmware and Android's mixer paths; xnu 0317 (stages 1-2:
+  firmware, the ADSP by PAS, SMP2P READY) and 0318 (stages 3-4: GLINK lpass, QRTR, APR, AVCS ready) are the
+  first steps, boot-arg taimenaudio=N, firmware as payload blobs (boot-xnu.sh AUDIOFW).
