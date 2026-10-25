@@ -952,3 +952,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-24 boot 128 (r116 = +0263-0296, a plain ROOTFIX + taimenwifi=10, 420 s): QDSS (clk0 1 Enab), RF_CLK2 and
   RF_CLK2_PIN voted again in both sets after clock scaling (all acked); FW_READY, mission, scan (33 networks);
   FATAL at +14.19 s as before. The clock votes alone are not mainline's fix here.
+- 2026-10-24 Ubuntu Touch on taimen: a Halium 9 port (manifest halium-devices/manifests/google_walleye_taimen.xml:
+  Flohack74's android_device_google_{wahoo,muskie,taimen} and android_kernel_google_wahoo, TheMuppets vendor
+  blobs). Its Wi-Fi is Android's own stack in a container: the downstream kernel (icnss, qcacld) and the vendor
+  init services of device/google/wahoo init.hardware.rc (cnss-daemon -n -l, pd-mapper, rmt_storage,
+  tftp_server, irsc_util, pm-service/pm-proxy, time_daemon, thermal-engine, wpa_supplicant, init.qcom.wlan.sh,
+  among others). No separate recipe to copy: the parts we can reimplement from public protocols (rmtfs, tftp,
+  pd-mapper, the BDF download) already are; the rest are closed vendor binaries.
