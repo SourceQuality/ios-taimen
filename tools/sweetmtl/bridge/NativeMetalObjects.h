@@ -64,6 +64,10 @@ bool nmb_binary_archive_serialize(NmbBinaryArchive *, const char *path);
 NmbBuffer *nmb_buffer_new(NmbDevice *, uint64_t length, uint64_t options, const void *bytes /* NULL: zeroed */);
 /* Wraps page-aligned memory the caller keeps mapped until the buffer is released (an IOSurface's base, host pages). */
 NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, uint64_t options);
+/* taimen (sweetmtl): a buffer over an IOSurface's own pages, imported by the surface's ID (SweetGPU sel 12), no copy and no shadow. base is
+ * the surface's mapping in this process from the page its base address is in; the caller keeps the surface alive until the buffer is
+ * released. The buffer's length is the kernel's (the surface's pages). Refused where there is no SweetGPU (the PC). */
+NmbBuffer *nmb_buffer_new_iosurface(NmbDevice *, uint32_t surface_id, void *base, uint64_t options);
 void nmb_buffer_release(NmbBuffer *);
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);

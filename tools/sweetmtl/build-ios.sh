@@ -17,6 +17,11 @@
 #
 # Output in OUT (default tools/sweetmtl/out/ios): mtlbridgetest and mtlabitest (stripped, signed with
 # test/mtltool-ents.plist), the same unstripped as NAME.unstripped, and the build's intermediate files.
+#
+# M1 (plan 4.1, 4.4 step 3-4): also SweetMetal.bundle, the Metal plug-in (frontend/: SweetMetal.mm, the plug-in class
+# SweetMTLDevice, + NativeBridgeMetalFrontend.mm over the same bridge and shim; executable SweetMetal, Info.plist,
+# _CodeSignature, signed ad hoc), with SweetMetal.unstripped beside it, and mtltest (test/mtltest.m: Metal.framework's
+# device through the plug-in; Apple's frameworks only).
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd)
 P=$(cd "$H/../.." && pwd)
@@ -92,9 +97,43 @@ for t in mtlbridgetest mtlabitest; do
 	codesign -f -s - --entitlements "$H/test/mtltool-ents.plist" "$OUT/$t.unstripped"
 done
 
+echo "== SweetMetal.bundle (the Metal plug-in)"
+CXX="$(xcrun --sdk iphoneos --find clang++) -isysroot $SDK -arch arm64 -miphoneos-version-min=16.0"
+B=$OUT/SweetMetal.bundle
+rm -rf "$B"
+mkdir -p "$B"
+# Nothing exported: Metal finds SweetMTLDevice through the Objective-C runtime (the class list), and -dead_strip may then
+# drop every bridge call the frontend does not make.
+printf '# none: Metal finds SweetMTLDevice through the Objective-C runtime\n' > "$OUT/SweetMetal-exports.txt"
+# _MTLDevice (the plug-in class's superclass) is private: looked up at load (Metal is loaded by then) where the SDK's
+# Metal.tbd does not list it.
+$CXX -x objective-c++ -std=c++17 -fobjc-arc -O2 -Wall -Wno-deprecated-declarations -Wno-unused-function \
+	-fvisibility=hidden -I "$H" -I "$H/frontend" -bundle -o "$OUT/SweetMetal.unstripped" \
+	"$H/frontend/SweetMetal.mm" "$H/frontend/NativeBridgeMetalFrontend.mm" -x none "$BRIDGE" \
+	"$OUT/gallium/libsweetgallium.a" $(cat "$OUT/gallium/mesa-libs.txt") \
+	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -lc++ -lz \
+	-Wl,-dead_strip -Wl,-exported_symbols_list,"$OUT/SweetMetal-exports.txt" \
+	-Wl,-U,'_OBJC_CLASS_$__MTLDevice' -Wl,-U,'_OBJC_METACLASS_$__MTLDevice'
+cp "$OUT/SweetMetal.unstripped" "$B/SweetMetal"
+"$(xcrun --sdk iphoneos --find strip)" -x "$B/SweetMetal"
+cp "$H/frontend/Info.plist" "$B/Info.plist"
+plutil -lint "$B/Info.plist"
+codesign -f -s - "$B"
+codesign -f -s - "$OUT/SweetMetal.unstripped"
+codesign -v "$B"
+ls -la "$B" "$B/_CodeSignature"
+
+echo "== mtltest"
+$CC -x objective-c -fobjc-arc -O2 -Wall -I "$H/test" -o "$OUT/mtltest.unstripped" "$H/test/mtltest.m" \
+	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation
+cp "$OUT/mtltest.unstripped" "$OUT/mtltest"
+"$(xcrun --sdk iphoneos --find strip)" -x "$OUT/mtltest"
+codesign -f -s - --entitlements "$H/test/mtltool-ents.plist" "$OUT/mtltest"
+codesign -f -s - --entitlements "$H/test/mtltool-ents.plist" "$OUT/mtltest.unstripped"
+
 echo "== weak imports (iOS 16 lacks what newer SDKs declare: those resolve to NULL there, the strchrnul lesson)"
 BAD=0
-for t in mtlbridgetest mtlabitest; do
+for t in mtlbridgetest mtlabitest SweetMetal.bundle/SweetMetal mtltest; do
 	WEAK=$(nm -m "$OUT/$t" | grep "weak external" | grep -v "dynamically looked up" || true)
 	IMPORTS=$(printf '%s\n' "$WEAK" | grep "(undefined)" || true)
 	echo "$t: $(printf '%s' "$WEAK" | grep -c . || true) weak external symbols," \
@@ -105,4 +144,6 @@ for t in mtlbridgetest mtlabitest; do
 	fi
 done
 [ "$BAD" = 0 ] || { echo "weak imports above: a symbol newer than iOS 16.0"; exit 1; }
-ls -la "$OUT/mtlbridgetest" "$OUT/mtlabitest"
+echo "== the plug-in's lookups at load (flat namespace: resolved in whatever image has them)"
+nm -m "$B/SweetMetal" | grep "dynamically looked up" || true
+ls -la "$OUT/mtlbridgetest" "$OUT/mtlabitest" "$B/SweetMetal" "$OUT/mtltest"

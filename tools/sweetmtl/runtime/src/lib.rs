@@ -19,6 +19,7 @@ pub mod encoder;
 pub mod error;
 pub mod families;
 pub mod ffi;
+pub mod iosurface;
 pub mod library;
 pub mod pipeline;
 pub mod resource;

@@ -578,6 +578,21 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy(device: *mut NmbDevice, pointer:
     })
 }
 
+/// # Safety
+/// taimen (sweetmtl): `base` is the IOSurface's mapping in this process from the page its base address is in, and the caller keeps the
+/// surface alive until the buffer is released (NativeMetalObjects.h).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_buffer_new_iosurface(device: *mut NmbDevice, surface_id: u32, base: *mut c_void, options_word: u64)
+                                                  -> *mut NmbBuffer {
+    guard(std::ptr::null_mut(), || {
+        let device = &get(device)?.0;
+        let modes = options(options_word)?;
+        // SAFETY: the caller's contract.
+        let buffer = unsafe { device.new_buffer_with_iosurface(surface_id, base as *mut u8, modes) };
+        Ok(boxed(NmbBuffer(buffer.map_err(e("IOSurface buffer"))?)))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_release(buffer: *mut NmbBuffer) {
     release(buffer)

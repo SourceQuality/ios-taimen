@@ -1,0 +1,4 @@
+# /private/var/sweetmtl/clients for mtltest boots (tools/sweetmtl/README.md, M1-M2): the processes the SweetMetal
+# plug-in gives a Metal device, one process name per line. mkrootfix --write rewrites it at every boot of the blob.
+# backboardd and SpringBoard are not listed: they stay on GLES (sweetgl) until M5.
+mtltest

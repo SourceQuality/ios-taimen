@@ -52,7 +52,7 @@ if [ -f "$B/src/gallium/drivers/softpipe/libsoftpipe.a" ] && [ -f "$B/src/galliu
 fi
 OBJS=
 for f in "$H/sg_device.c" "$H/sg_resource.c" "$H/sg_shader.c" "$H/sg_replay.c" "$H/sg_format.c" \
-	"$H/sg_map.c" "$@"; do
+	"$H/sg_map.c" "$H/sg_iosurface.c" "$@"; do
 	o=$O/$(basename "$f" .c).o
 	$CC -c -O2 -g -fPIC -Wall -Wno-unused-function -Wno-missing-field-initializers \
 		@"$O/mesa-flags.rsp" $EXTRA $SOFTPIPE -o "$o" "$f"

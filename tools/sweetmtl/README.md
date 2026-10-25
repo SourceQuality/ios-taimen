@@ -15,14 +15,18 @@ bridge's self-test and an ABI test of every bridge call the frontend makes:
   the values are checked.
 
 The GitHub job `.github/workflows/sweetmtl.yml` builds the same two test tools for iOS 16 arm64
-(`build-ios.sh`); they are ready for the phone. Nothing has run on the phone yet. The frontend,
-plugin and bundle (M1) come next (see the iOS build and phone tests sections below).
+(`build-ios.sh`). On the phone, mtlbridgetest passes (compute, render and IOSurface import 0 bad)
+and mtlabitest passes all but one storage-image texel.
+
+**M1 (built, not yet run on the phone):** the job also builds the Metal plug-in
+`SweetMetal.bundle` (`frontend/`) and `mtltest`, which gets its device from Metal.framework's
+`MTLCreateSystemDefaultDevice()` through the plug-in. See "M1-M2: mtltest" below.
 
 ## Layers
 
 ```
 Metal.framework (client process)
-  SweetMetal plugin + NativeBridgeMetalFrontend.mm   flame's ObjC frontend (not in this tree yet: M1)
+  frontend/            SweetMetal.bundle: SweetMetal.mm (the plug-in class) + NativeBridgeMetalFrontend.mm (flame's)
     bridge/            NativeMetalObjects.{h,rs}, NativeMetalBridge.{h,rs}: flame's C ABI (nmb_*), MIT
       runtime/         sweetmtl-runtime (Rust): Metal's object model, recording, binder, sync
         m2v/           metal2vulkan translator (720ef1ce + patches/): AIR -> SPIR-V, layouts, binding plans
@@ -214,15 +218,17 @@ nir_to_tgsi added it to the image index. ir3 does not read it.
 
 | Path | What |
 | --- | --- |
-| `bridge/` | flame's bridge (MIT, `LICENSE`), `build.rs` assembles the two fixtures with `LLVM_AS` (or takes `NMB_FIXTURE_AIR`/`NMB_FC_AIR`) |
-| `runtime/src/` | `device.rs` (device, answers, trace), `families.rs` (families, private selectors, format capabilities), `resource.rs` (buffers, textures, views, heaps), `library.rs`, `pipeline.rs` (pipelines, slots, variants, samplers, depth/stencil, archives), `encoder.rs`, `bind.rs` (binder), `command.rs` (queues, command buffers, replay, completion), `sync.rs`, `ffi.rs` (sg.h by hand), `error.rs` |
-| `gallium/` | `sg.h` (the ABI), `sg_device.c` (screen: sweet_drm on iOS, a render node or softpipe on Linux), `sg_resource.c`, `sg_shader.c`, `sg_replay.c`, `sg_format.c`, `sg_map.c`, `build-host.sh` (the library, for the host or, with the iPhoneOS clang, for iOS) |
+| `frontend/` | the Metal plug-in (M1): `SweetMetal.mm` (class `SweetMTLDevice`, from flame's `SweetMetal2.mm`), `NativeBridgeMetalFrontend.{mm,h}` (flame's frontend with the plan 4.3 changes listed at its top), `Info.plist`, `LICENSE` (MIT: NativeMetal contributors, dipa-studio) |
+| `bridge/` | flame's bridge (MIT, `LICENSE`), `build.rs` assembles the two fixtures with `LLVM_AS` (or takes `NMB_FIXTURE_AIR`/`NMB_FC_AIR`). taimen addition: `nmb_buffer_new_iosurface` |
+| `runtime/src/` | `device.rs` (device, answers, trace), `families.rs` (families, private selectors, format capabilities), `resource.rs` (buffers, textures, views, heaps), `library.rs`, `pipeline.rs` (pipelines, slots, variants, samplers, depth/stencil, archives), `encoder.rs`, `bind.rs` (binder), `command.rs` (queues, command buffers, replay, completion), `sync.rs`, `ffi.rs` (sg.h by hand), `error.rs`, `iosurface.rs` (buffers over IOSurfaces, by ID) |
+| `gallium/` | `sg.h` (the ABI), `sg_device.c` (screen: sweet_drm on iOS, a render node or softpipe on Linux), `sg_resource.c`, `sg_shader.c`, `sg_replay.c`, `sg_format.c`, `sg_map.c`, `sg_iosurface.{c,h}` (IOSurface import by ID: SweetGPU sel 12, iOS only), `build-host.sh` (the library, for the host or, with the iPhoneOS clang, for iOS) |
 | `profile/` | `a540-gallium.json` (the translator's device profile: M0's profile + freedreno's format table), `gen-formats.c`, `make-profile.py` |
-| `test/` | `mtlbridgetest.c` (runs `nmb_selftest`, like flame's `m2vtest.c`), `mtlabitest.c` (the ABI test), `oneshot.h` (their `--daemon` mode), `mtltool-ents.plist` (their entitlements on iOS) |
+| `test/` | `mtlbridgetest.c` (runs `nmb_selftest`, like flame's `m2vtest.c`), `mtlabitest.c` (the ABI test), `mtltest.m` (M1-M2 through Metal.framework), `mtltest.clients` (the plug-in's clients file for mtltest boots), `oneshot.h` (their `--daemon` mode), `mtltool-ents.plist` (their entitlements on iOS) |
 | `m0/` | M0: the CA shader qualification and `mesa-a5xx-ir3.patch` (`m0/README.md`) |
 | `m2v-fetch.sh`, `patches/` | the translator checkout at 720ef1ce with flame's patches 0001, 0004, 0005 (`m2v/`, not in git) |
 | `host-check.sh` | the PC check above |
-| `build-ios.sh` | the iOS build of the test tools (macOS; run by `.github/workflows/sweetmtl.yml`) |
+| `build-ios.sh` | the iOS build of the test tools, the plug-in bundle and mtltest (macOS; run by `.github/workflows/sweetmtl.yml`) |
+| `../taimen/sweetmtl-install.sh` | a CI build into `../out/sweetmtl/run-ID/` and the ROOTFIX blob for one phone test |
 
 ## iOS build (plan 4.4)
 
@@ -264,25 +270,51 @@ link IOKit, CoreFoundation, IOSurface, libc++, libz and libSystem, carry an ad h
 `platform-application`, and have no weak imports. On the PC, the same tools peak at 34 MB resident
 with the QuartzCore step included.
 
-Left for M1:
+### M1: the plug-in bundle and mtltest
 
-- **Bundle.**
-  - Copy `NativeBridgeMetalFrontend.{mm,h}`, `SweetMetal2.mm` (as `SweetMetal.mm`) and
-    `Info.plist` from flame (MIT) into `tools/sweetmtl/frontend/`, with the plan 4.3 deltas:
-    - ignore `loader`;
-    - `sys_dcache_flush` only for no-copy host memory;
-    - import IOSurfaces by ID;
-    - a client list in `/private/var/sweetmtl/clients`;
-    - a bounded wait for the GPU service, like `oneshot.h`'s.
-  - Link it with `xcrun -sdk iphoneos clang++ -bundle` and the libraries `build-ios.sh` links.
-  - Add `SweetMetal.bundle` to the artifact.
-- **IOSurface import by ID** (plan 4.3).
-  - In the shim, add `sg_buffer_import_iosurface(dev, surface_id)`: a `PIPE_BUFFER` imported with
-    `resource_from_handle` over the GEM handle from `sweet_drm_import_iosurface`.
-  - In the bridge, add `nmb_buffer_new_iosurface`.
+- **`SweetMetal.bundle`.** `xcrun -sdk iphoneos clang++ -bundle` links `frontend/SweetMetal.mm` and
+  `NativeBridgeMetalFrontend.mm` (ObjC++, ARC, hidden visibility) with the libraries the tools
+  link, plus Foundation and Metal.
+  - Nothing is exported (`-exported_symbols_list` with no names), so `-dead_strip` drops the
+    bridge calls the frontend does not make. Metal finds the class `SweetMTLDevice` through the
+    Objective-C runtime.
+  - `_MTLDevice`, the class's private superclass, is linked with `-U` (looked up at load) in case
+    the SDK's Metal.tbd does not list it.
+  - The bundle holds the executable `SweetMetal`, stripped, plus `Info.plist`
+    (`NSPrincipalClass` `SweetMTLDevice`) and `_CodeSignature/CodeResources`. It is signed ad hoc
+    as a bundle, and the same weak-import check runs on it.
+- **`mtltest`.** `test/mtltest.m`, Objective-C. It links only Foundation, Metal, IOSurface, IOKit
+  and CoreFoundation, and is signed like the other tools.
+- **Artifacts.** `sweetmtl` also holds `SweetMetal.bundle/`, `mtltest` and `clients` (a copy of
+  `test/mtltest.clients`). `sweetmtl-symbols` also holds `SweetMetal.unstripped` and
+  `mtltest.unstripped`. BUILDINFO prints the mtltest install with this build's hashes.
 
-  Until then, the frontend's host-pointer import goes through the no-copy shadow, which is correct
-  but copies.
+What the plug-in does (`frontend/SweetMetal.mm`; plan 4.3):
+
+- **Clients.** It gives a device only to processes named in `/private/var/sweetmtl/clients`:
+  one name per line, `#` starts a comment. Any other process gets nil, and Metal skips the plug-in
+  there. backboardd is never listed before M5, so it stays on GLES.
+- **GPU wait.** It waits for SweetGPU for `SWEETMTL_GPU_WAIT` seconds (default 20). If the GPU does
+  not come up, it returns nil.
+- **Environment.** It applies the `KEY=VALUE` lines of `/private/var/sweetmtl/env`.
+- **Shader cache.** The cache is `/private/var/sweetmtl/cache/<process>`. A sandboxed process uses
+  its own caches directory instead.
+- **Log.** It logs `SweetMetal[pid]: ...` lines to stderr.
+
+What changed in the frontend compared with flame's:
+
+- **No Turnip.** The loader argument is ignored.
+- **IOSurfaces are imported by ID.** `nmb_buffer_new_iosurface` goes through
+  `runtime/src/iosurface.rs` and `gallium/sg_iosurface.c`, SweetGPU sel 12, and freedreno's
+  `resource_from_handle` makes a `PIPE_BUFFER` over the surface's bo. The texture over that buffer
+  is the surface itself, so there are no copies.
+  - If the import by ID is refused, the frontend falls back to the host-pointer import (the
+    shadowed no-copy buffer).
+  - `SWEETMTL_IOSURFACE=host` forces the host-pointer import.
+- **Plane 0 of 'b3a8' surfaces** is accepted.
+- **No cache maintenance of surfaces.** The kernel cleans surfaces at each submit (xnu 0242), and
+  shadowed pages are never touched by the GPU. `SWEETMTL_SURFACE_FLUSH=1` brings flame's
+  `dc civac` back for debugging.
 
 ## Phone tests (M1-M3)
 
@@ -400,19 +432,85 @@ execution of the shim on the A540. The other outcomes and what they mean:
    - the CPU texture paths after `sync_all`;
    - the triops question;
    - GPU timestamps, which are taken on the host today.
-2. **M1 proper.**
-   - The kernel patch `taimenmtl=SweetMetal-<hash>` sets `MetalPluginName/ClassName` on the
-     `IOAcceleratorES`.
-   - The bundle installs through `tools/taimen/sweetmtl-install.sh`.
-   - `mtltest` (ObjC) checks `MTLCreateSystemDefaultDevice`: name, registryID, `supportsFamily`,
-     `newBuffer`, `contents`, `gpuAddress`.
-   - **Pass:** backboardd stays on GLES at ~60 frames/s.
-3. **M2.** `mtltest` clears a BGRA8 texture over an IOSurface and reads it back. This needs the
-   IOSurface import by ID from the iOS build section.
-4. **M3.** The self-test's 0x6506 with full descriptors (M0's `m0drive.py` pairing) instead of
+2. **M1 and M2: mtltest.** See the next section.
+3. **M3.** The self-test's 0x6506 with full descriptors (M0's `m0drive.py` pairing) instead of
    the minimal ones, and the compositor pair (`fixed_vert_lph_spc` + `fixed_frag_lph_cph`) drawn
    with CA-like buffers. The pipeline cache on disk (`binary_archive_serialize`, the translator's
    `to_bytes`) is the M3 runtime work left.
+
+### M1-M2: mtltest
+
+`mtltest` gets its device the way an app does: `MTLCreateSystemDefaultDevice()` in Metal.framework.
+That takes three pieces, all installed by one ROOTFIX blob:
+
+- **The kernel.** Boot-arg `taimenmtl=SweetMetal-<hash8>` (xnu 0329) names the plug-in on the
+  `IOAcceleratorES`: `MetalPluginName` is the bundle's name, and `MetalPluginClassName` is
+  `SweetMTLDevice` (the default).
+- **The bundle.** It goes to `/System/Library/Extensions/SweetMetal-<hash8>.bundle/`, where
+  `<hash8>` is the first 8 hex digits of the executable's SHA-256. ROOTFIX writes only absent
+  files, so each build gets its own path.
+- **The clients file.** mkrootfix `--write` (written even if present) puts the artifact's
+  `clients` file at `/private/var/sweetmtl/clients` at every boot of the blob. It lists `mtltest`
+  only, so backboardd and SpringBoard get nil and stay on GLES. `sweetmtl-install.sh` refuses a
+  clients file that lists either of them, and mtltest FAILs on one.
+
+  Other ways to install it were considered and not taken. With mkrootfix `--file`, a stale list
+  would survive. mtltest writing the file itself would make a test tool change the system's
+  configuration.
+
+From the port checkout in WSL:
+
+```bash
+tools/taimen/sweetmtl-install.sh -r RUN mtltest     # or no -r: the newest green run on taimen
+ROOT=1 ROOTFIX=../research/taimen/rootfix-sweetmtl-mtltest.bin ROOTFIX_KEEP=1 \
+  tools/taimen/boot-xnu.sh KERNEL OUTDIR taimenmtl=SweetMetal-<hash8> sweetlogp=mtltest
+```
+
+The script prints the exact boot-args, and `../out/sweetmtl/current.env` records them. BUILDINFO
+lists the same mkrootfix arguments:
+
+- 3 `--zfile` for the bundle;
+- `--mkdir /private/var/sweetmtl`;
+- `--write /private/var/sweetmtl/clients=...`;
+- `--zfile` and `--daemon` for mtltest.
+
+What mtltest checks. Each check prints one line, `ok`, `info` or `FAIL`. The run ends with
+`mtltest: done, status N; idling`, where N is the number of FAIL lines.
+
+- **M1.**
+  - The clients file.
+  - The `IOAcceleratorES`: its registry ID and plug-in names.
+  - That the bundle is installed.
+  - `MTLCreateSystemDefaultDevice` and `MTLCopyAllDevices`.
+  - The device's class chain (`NativeBridgeMetalDevice < _MTLDevice < ...`), its name, and that
+    its registryID equals the accelerator's.
+  - Its limits and `supportsFamily:` answers.
+  - `newBufferWithLength:` (zeroed, `contents` read back, `gpuAddress`) and `newBufferWithBytes:`.
+- **M2.**
+  - An empty command buffer.
+  - `fillBuffer` and `copyFromBuffer`.
+  - A render pass clearing a 64x64 BGRA8 texture (load Clear, store), read with `getBytes` and
+    a texture-to-buffer blit.
+  - The same clear into BGRA8 textures over new IOSurfaces (`newTextureWithDescriptor:iosurface:plane:`),
+    read back through `IOSurfaceGetBaseAddress` and through `getBytes`:
+    - 64x64 and 1125x48 (backboardd's 4544-byte rows) with the default import, by ID;
+    - 64x64 with `SWEETMTL_IOSURFACE=host`.
+
+  The plug-in logs the import each surface got ("imported by ID" or "imported as host pages").
+
+The plug-in's own lines (`SweetMetal[pid]: ...` and the frontend's `native-metal: ...`) go to
+stderr, so they appear among mtltest's `|mtltest|` lines. backboardd's line ("not in
+/private/var/sweetmtl/clients, so no Metal device") appears under the GPU boot's `sweetnull=backboardd`.
+
+**Pass:**
+
+- every line `ok` (status 0);
+- backboardd still drawing with sweetgl at about 60 frames/s;
+- no GPU hang.
+
+If the clear is right only with `SWEETMTL_IOSURFACE=host`, the import by ID is at fault. Try a
+boot with `SWEETMTL_SURFACE_FLUSH=1` in `/private/var/sweetmtl/env` (mkrootfix `--write`): it
+tells CPU cache trouble apart from a wrong bo.
 
 ## Known gaps and risks
 
