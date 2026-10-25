@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Phase-1 host check of the taimen Metal stack (docs/taimen-metal-plan.md M0/M1, tools/sweetmtl/README.md):
-# builds the Gallium shim, the runtime and flame's bridge for Linux x86_64 against a host Mesa build, links the
-# bridge's self-test (test/mtlbridgetest.c) and runs it on Mesa's freedreno drm-shim as an Adreno 540. drm-shim
-# executes nothing: the run checks that every step records, compiles its shaders with ir3 and submits, and decodes
-# the submits with cffdump. Result values (what the GPU would have written) are reported as not checkable.
+# Phase-1 host check of the taimen Metal stack (docs/taimen-metal-plan.md M0/M1, tools/sweetmtl/README.md).
+# Builds the Gallium shim, the runtime and flame's bridge for Linux x86_64 against a host Mesa build, links the test
+# tools (test/mtlbridgetest.c: the bridge's self-test; test/mtlabitest.c: the frontend's object ABI) and runs them
+# twice:
+#   1. on Mesa's freedreno drm-shim as an Adreno 540: what the phone's driver records. Every step records, compiles
+#      its shaders with ir3 for gpu 540 and submits; the submits are decoded with cffdump. drm-shim executes nothing,
+#      so values the GPU would write are reported as not checkable.
+#   2. on softpipe (SG_DRIVER=softpipe), Mesa's CPU driver: the same runtime, translator and NIR lowering, executed,
+#      so the computed values are checked. What only freedreno has (textures over a buffer's bo, ir3) is left out.
+# It also checks that profile/a540-gallium.json still matches what freedreno says about the a540's formats.
 #
 #   tools/sweetmtl/host-check.sh [--qc METALLIB] [--no-build]
 #
@@ -11,11 +16,11 @@
 #   RESEARCH     ../research (private: Mesa, the metal2vulkan checkout, QuartzCore's metallib)
 #   MESA_SRC     $RESEARCH/m0/mesa: Mesa 26.3.0-rc2 + tools/sweetgl/mesa.patch + tools/sweetmtl/m0/mesa-a5xx-ir3.patch
 #                (made by tools/sweetmtl/m0/build.sh when missing)
-#   MESA_BUILD   $RESEARCH/m1/mesa-host: configured here with drm-shim and the freedreno tools
+#   MESA_BUILD   $RESEARCH/m1/mesa-host: configured here with freedreno and softpipe, drm-shim, the freedreno tools
 #   M2V_SRC      the metal2vulkan checkout (720ef1ce + flame's patches) that tools/sweetmtl/m2v links to
 #                (default $RESEARCH/m0/metal2vulkan; tools/sweetmtl/m2v-fetch.sh makes one)
-#   LLVM_AS      LLVM 21+ llvm-as for the bridge's fixtures (default: llvm-as on PATH, then ~/tools/mamba/root/envs/llvm21)
-#   OUT          $RESEARCH/m1/host-check (build outputs, submit dumps)
+#   LLVM_AS      LLVM 21+ llvm-as for the fixtures (default: llvm-as on PATH, then ~/tools/mamba/root/envs/llvm21)
+#   OUT          $RESEARCH/m1/host-check (build outputs, submit dumps, logs)
 # Toolchain: ~/tools/m0env.sh when present (gcc, meson, ninja, cargo, python3 with mako).
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd)
@@ -42,6 +47,11 @@ fi
 export LLVM_AS
 CC=${CC:-cc}
 mkdir -p "$OUT"
+LIBPATH="${CONDA_PREFIX:-$HOME/tools/mamba/root/envs/m0}/lib:${LD_LIBRARY_PATH:-}"
+LINK_MESA() {
+	echo "$OUT/gallium/libsweetgallium.a" -Wl,--start-group $(cat "$OUT/gallium/mesa-libs.txt") -Wl,--end-group \
+		$(pkg-config --libs libdrm zlib) -lexpat -lstdc++ -lpthread -ldl -lm -Wl,--build-id=sha1
+}
 
 if [ "$BUILD" = 1 ]; then
 	# 1. Mesa: the M0 tree, a host build with drm-shim, the freedreno tools and the static libraries the shim links
@@ -51,16 +61,18 @@ if [ "$BUILD" = 1 ]; then
 	fi
 	if [ ! -f "$MESA_BUILD/build.ninja" ]; then
 		echo "== configuring $MESA_BUILD"
-		meson setup "$MESA_BUILD" "$MESA_SRC" -Dbuildtype=debugoptimized -Dplatforms= -Dgallium-drivers=freedreno \
-			-Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dgles1=disabled \
-			-Dgles2=disabled -Dopengl=true -Dllvm=disabled -Dvalgrind=disabled -Dlibunwind=disabled \
-			-Dlmsensors=disabled -Dzstd=disabled -Dxmlconfig=disabled -Dshader-cache=disabled -Dexpat=disabled \
-			-Dperfetto=false -Dspirv-tools=disabled -Dtools=drm-shim,freedreno -Dbuild-tests=false \
-			-Dgallium-va=disabled -Dgallium-rusticl=false -Dteflon=false -Dhtml-docs=disabled \
-			-Ddisplay-info=disabled > "$OUT/meson-setup.log"
+		# opengl=true: with no GL, Vulkan or CL driver Mesa builds NIR as headers only (src/compiler/nir/meson.build)
+		meson setup "$MESA_BUILD" "$MESA_SRC" -Dbuildtype=debugoptimized -Dplatforms= \
+			-Dgallium-drivers=freedreno,softpipe -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled \
+			-Degl=disabled -Dgbm=disabled -Dgles1=disabled -Dgles2=disabled -Dopengl=true -Dllvm=disabled \
+			-Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dzstd=disabled -Dxmlconfig=disabled \
+			-Dshader-cache=disabled -Dexpat=disabled -Dperfetto=false -Dspirv-tools=disabled \
+			-Dtools=drm-shim,freedreno -Dbuild-tests=false -Dgallium-va=disabled -Dgallium-rusticl=false \
+			-Dteflon=false -Dhtml-docs=disabled -Ddisplay-info=disabled > "$OUT/meson-setup.log"
 	fi
 	echo "== Mesa libraries, drm-shim, cffdump"
 	ninja -C "$MESA_BUILD" src/gallium/drivers/freedreno/libfreedreno.a src/gallium/winsys/freedreno/drm/libfreedrenowinsys.a \
+		src/gallium/drivers/softpipe/libsoftpipe.a src/gallium/winsys/sw/null/libws_null.a \
 		src/gallium/auxiliary/libgallium.a src/compiler/spirv/libvtn.a src/compiler/nir/libnir.a \
 		src/util/libxmlconfig.a src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so \
 		src/freedreno/decode/cffdump > "$OUT/ninja.log" || { tail -20 "$OUT/ninja.log"; exit 1; }
@@ -85,12 +97,12 @@ if [ "$BUILD" = 1 ]; then
 	# 4. the test tools: bridge + runtime + translator, the shim, Mesa
 	for t in mtlbridgetest mtlabitest; do
 		echo "== $t"
-		$CC -O1 -g -Wall -I "$H/bridge" -o "$OUT/$t" "$H/test/$t.c" \
-			"$OUT/target/release/libnative_metal_bridge.a" "$OUT/gallium/libsweetgallium.a" \
-			-Wl,--start-group $(cat "$OUT/gallium/mesa-libs.txt") -Wl,--end-group \
-			$(pkg-config --libs libdrm zlib) -lexpat -lstdc++ $(cat "$OUT/native-static-libs.txt") \
-			-Wl,--build-id=sha1 > "$OUT/link-$t.log" 2>&1 || { tail -30 "$OUT/link-$t.log"; exit 1; }
+		$CC -O1 -g -Wall -I "$H/bridge" -o "$OUT/$t" "$H/test/$t.c" "$OUT/target/release/libnative_metal_bridge.a" \
+			$(LINK_MESA) $(cat "$OUT/native-static-libs.txt") > "$OUT/link-$t.log" 2>&1 ||
+			{ tail -30 "$OUT/link-$t.log"; exit 1; }
 	done
+	$CC -O1 -g -Wall -I "$H/gallium" -o "$OUT/gen-formats" "$H/profile/gen-formats.c" $(LINK_MESA) \
+		> "$OUT/link-gen-formats.log" 2>&1 || { tail -30 "$OUT/link-gen-formats.log"; exit 1; }
 	# mtlabitest's extra fixtures, from metal2vulkan's validation fixtures
 	F=$H/m2v/crates/metal2vulkan-validation/fixtures/public
 	mkdir -p "$OUT/air"
@@ -98,49 +110,69 @@ if [ "$BUILD" = 1 ]; then
 	"$LLVM_AS" -o "$OUT/air/sampling.air" "$F/engine/sampling.ll"
 	"$LLVM_AS" -o "$OUT/air/threadgroup_word.air" "$F/kernel_threadgroup_word.ll"
 fi
-SHIM_ENV="LD_PRELOAD=$MESA_BUILD/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so FD_GPU_ID=540 SWEETMTL_DRM_SHIM=1
-	LD_LIBRARY_PATH=${CONDA_PREFIX:-$HOME/tools/mamba/root/envs/m0}/lib:${LD_LIBRARY_PATH:-}"
-
-# 5. run on drm-shim as an Adreno 540, dumping every submit
-echo "== running on freedreno drm-shim, FD_GPU_ID=540"
-rm -rf "$OUT/rd" "$OUT/cache" && mkdir -p "$OUT/rd"
+SHIM="LD_PRELOAD=$MESA_BUILD/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so FD_GPU_ID=540 SWEETMTL_DRM_SHIM=1
+	LD_LIBRARY_PATH=$LIBPATH"
+SOFT="SG_DRIVER=softpipe LD_LIBRARY_PATH=$LIBPATH"
 set +e
-env $SHIM_ENV FD_RD_DUMP=combine FD_RD_DUMP_PATH="$OUT/rd" SWEETMTL_TRACE=1 \
+
+# 5. the device profile's format table against freedreno's answers for the a540
+echo "== profile: format table"
+env $SHIM "$OUT/gen-formats" > "$OUT/formats.txt" &&
+	python3 -I "$H/profile/make-profile.py" "$H/m0/a540-gallium.json" "$OUT/formats.txt" \
+		"$MESA_SRC/include/vulkan/vulkan_core.h" "$OUT/a540-gallium.json" > /dev/null &&
+	if cmp -s "$OUT/a540-gallium.json" "$H/profile/a540-gallium.json"; then
+		echo "profile/a540-gallium.json matches freedreno's format answers"
+	else
+		echo "profile/a540-gallium.json differs from freedreno's answers ($OUT/a540-gallium.json): regenerate it"
+	fi
+
+# 6. drm-shim: the self-test, every submit dumped
+echo "== mtlbridgetest on freedreno drm-shim, FD_GPU_ID=540"
+rm -rf "$OUT/rd" "$OUT/cache" && mkdir -p "$OUT/rd"
+env $SHIM FD_RD_DUMP=combine FD_RD_DUMP_PATH="$OUT/rd" SWEETMTL_TRACE=1 \
 	"$OUT/mtlbridgetest" "$OUT/cache" $QC > "$OUT/run.log" 2>&1
 RC=$?
-set -e
 cat "$OUT/run.log"
-
-# 6. what was submitted: one .rd file per submit, decoded
-echo "== submits (cffdump)"
-# drm-shim leaves every submit's fence 0, which names the per-submit dumps alike, so they are combined in one
+echo "-- submits (cffdump)"
+# drm-shim leaves every submit's fence 0, which names per-submit dumps alike: they are combined in one
 DUMP=$(ls "$OUT"/rd/*.rd* 2>/dev/null | head -1)
 if [ -z "$DUMP" ]; then
 	echo "no submit was dumped"
-	exit 1
+	RC=1
+else
+	LD_LIBRARY_PATH=$LIBPATH "$MESA_BUILD/src/freedreno/decode/cffdump" --no-color "$DUMP" > "$OUT/rd/submits.txt" 2>&1
+	awk '
+		/^cmdstream\[/ { n++; ib[n] = $0 }
+		/opcode: CP_EXEC_CS/ { cs[n]++ }
+		/opcode: CP_DRAW_INDX/ { dr[n]++ }
+		/write RB_BLIT_CNTL/ { bl[n]++ }
+		/opcode: CP_LOAD_STATE4/ { ls[n]++ }
+		/RB_MRT\[0\]\.BASE:/ { rt[n] = $2 }
+		END {
+			for (i = 1; i <= n; i++)
+				printf "%-28s exec_cs %d, draws %d, blits/clears %d, load_state %d%s\n", ib[i], cs[i], dr[i], bl[i],
+				       ls[i], rt[i] ? ", MRT0 at " rt[i] : ""
+			printf "submits: %d (decoded in %s)\n", n, FILENAME
+		}' "$OUT/rd/submits.txt"
 fi
-LD_LIBRARY_PATH="${CONDA_PREFIX:-$HOME/tools/mamba/root/envs/m0}/lib:${LD_LIBRARY_PATH:-}" \
-	"$MESA_BUILD/src/freedreno/decode/cffdump" --no-color "$DUMP" > "$OUT/rd/submits.txt" 2>&1 || true
-awk '
-	/^cmdstream\[/ { n++; ib[n] = $0 }
-	/opcode: CP_EXEC_CS/ { cs[n]++ }
-	/opcode: CP_DRAW_INDX/ { dr[n]++ }
-	/write RB_BLIT_CNTL/ { bl[n]++ }
-	/opcode: CP_LOAD_STATE4/ { ls[n]++ }
-	/RB_MRT\[0\]\.BASE:/ { rt[n] = $2 }
-	END {
-		for (i = 1; i <= n; i++)
-			printf "%-28s exec_cs %d, draws %d, blits/clears %d, load_state %d%s\n", ib[i], cs[i], dr[i], bl[i], ls[i],
-			       rt[i] ? ", MRT0 at " rt[i] : ""
-		printf "submits: %d (decoded in %s)\n", n, FILENAME
-	}' "$OUT/rd/submits.txt"
-echo "self-test exit: $RC (0 = every step ran)"
+echo "-- mtlabitest on drm-shim"
+env $SHIM "$OUT/mtlabitest" "$OUT/air" > "$OUT/abi-shim.log" 2>&1
+ABI_SHIM=$?
+cat "$OUT/abi-shim.log"
 
-# 7. the object ABI beyond the self-test (the frontend's calls)
-echo "== mtlabitest"
-set +e
-env $SHIM_ENV SWEETMTL_TRACE=${SWEETMTL_TRACE:-0} "$OUT/mtlabitest" "$OUT/air" > "$OUT/abi.log" 2>&1
-ABI=$?
-set -e
-cat "$OUT/abi.log"
-[ "$RC" = 0 ] && [ "$ABI" = 0 ]
+# 7. softpipe: the same tools, executed
+echo "== mtlbridgetest on softpipe (executed: values checked; the import step needs freedreno)"
+env $SOFT "$OUT/mtlbridgetest" "$OUT/cache" > "$OUT/run-softpipe.log" 2>&1
+SP=$?
+cat "$OUT/run-softpipe.log"
+grep -q '^compute bad 0/1000' "$OUT/run-softpipe.log" && grep -q '^render bad 0/64' "$OUT/run-softpipe.log"
+SP_VALUES=$?
+echo "-- mtlabitest on softpipe"
+env $SOFT "$OUT/mtlabitest" "$OUT/air" > "$OUT/abi-softpipe.log" 2>&1
+ABI_SP=$?
+cat "$OUT/abi-softpipe.log"
+
+echo "== summary"
+echo "drm-shim: self-test exit $RC (0: every step ran), mtlabitest FAIL lines $ABI_SHIM"
+echo "softpipe: self-test exit $SP (stops at 0x6505 by design), compute and render values $([ $SP_VALUES = 0 ] && echo right || echo WRONG), mtlabitest FAIL lines $ABI_SP"
+[ "$RC" = 0 ] && [ "$ABI_SHIM" = 0 ] && [ "$SP_VALUES" = 0 ] && [ "$ABI_SP" = 0 ]

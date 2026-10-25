@@ -317,7 +317,12 @@ impl Device {
             sample_counts: m.raster_sample_counts.as_raw() as u32,
             description,
         };
-        let name = format!("Adreno (TM) {gpu_id} (sweetmtl)");
+        // gpu id 0: not freedreno (the PC's softpipe validation mode, SG_DRIVER=softpipe)
+        let name = if gpu_id != 0 {
+            format!("Adreno (TM) {gpu_id} (sweetmtl)")
+        } else {
+            "softpipe (sweetmtl validation)".to_string()
+        };
         let completion = crate::command::Completion::start(gpu.clone());
         Ok(Device(Arc::new(DeviceInner {
             gpu,

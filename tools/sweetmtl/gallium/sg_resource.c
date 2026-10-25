@@ -60,6 +60,35 @@ sg_buffer_new(struct sg_device *dev, uint64_t size)
       sg_set_error("buffer of %llu bytes: resource_create failed", (unsigned long long)size);
       return NULL;
    }
+   if (!dev->freedreno) {
+      /* softpipe: the buffer's memory is the CPU's and never moves; one map gives the pointer,
+       * a made-up address stands for its iova */
+      struct pipe_box box;
+      u_box_1d(0, (int)size, &box);
+      struct pipe_transfer *xfer = NULL;
+      simple_mtx_lock(&dev->lock);
+      void *map = dev->pipe->buffer_map(dev->pipe, res, 0,
+                                        PIPE_MAP_READ_WRITE | PIPE_MAP_UNSYNCHRONIZED |
+                                           PIPE_MAP_PERSISTENT | PIPE_MAP_COHERENT,
+                                        &box, &xfer);
+      simple_mtx_unlock(&dev->lock);
+      if (!map) {
+         sg_set_error("buffer map failed");
+         pipe_resource_reference(&res, NULL);
+         return NULL;
+      }
+      struct sg_buffer *buf = calloc(1, sizeof(*buf));
+      buf->dev = dev;
+      buf->res = res;
+      buf->map = map;
+      buf->xfer = xfer;
+      buf->size = size;
+      simple_mtx_lock(&dev->lock);
+      buf->iova = dev->next_fake_iova;
+      dev->next_fake_iova += (size + 0xffff) & ~0xffffull;
+      simple_mtx_unlock(&dev->lock);
+      return buf;
+   }
    struct fd_resource *rsc = fd_resource(res);
    void *map = fd_bo_map(rsc->bo);
    if (!map) {
@@ -83,6 +112,11 @@ sg_buffer_free(struct sg_buffer *buf)
 {
    if (!buf)
       return;
+   if (buf->xfer) {
+      simple_mtx_lock(&buf->dev->lock);
+      buf->dev->pipe->buffer_unmap(buf->dev->pipe, buf->xfer);
+      simple_mtx_unlock(&buf->dev->lock);
+   }
    pipe_resource_reference(&buf->res, NULL);
    free(buf);
 }
@@ -184,6 +218,11 @@ sg_texture_new_on_buffer(struct sg_device *dev, const struct sg_texture_desc *de
                          struct sg_buffer *buf, uint64_t offset, uint32_t stride)
 {
    struct pipe_resource templ;
+   if (!dev->freedreno) {
+      sg_set_error("a texture over a buffer's memory is freedreno's (a bo shared by two "
+                   "resources); softpipe has none");
+      return NULL;
+   }
    if (!texture_template(desc, &templ))
       return NULL;
    if (templ.target != PIPE_TEXTURE_2D || templ.last_level || templ.array_size > 1 ||
@@ -238,7 +277,7 @@ sg_texture_free(struct sg_texture *tex)
 uint32_t
 sg_texture_pitch(struct sg_texture *tex, uint32_t level)
 {
-   if (level > tex->res->last_level)
+   if (level > tex->res->last_level || !tex->dev->freedreno)
       return 0;
    return fd_resource_pitch(fd_resource(tex->res), level);
 }

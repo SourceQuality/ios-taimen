@@ -22,6 +22,10 @@ struct sg_device {
    struct pipe_context *pipe;
    struct cso_context *cso;
    int fd;
+   /* freedreno (the a540, or drm-shim); false: softpipe, the PC's validation driver that runs
+    * the commands on the CPU (SG_DRIVER=softpipe, hosts built with SG_WITH_SOFTPIPE) */
+   bool freedreno;
+   uint64_t next_fake_iova;
    uint32_t gpu_id;
    char name[64];
    simple_mtx_t lock;
@@ -35,6 +39,7 @@ struct sg_device {
 struct sg_buffer {
    struct sg_device *dev;
    struct pipe_resource *res;
+   struct pipe_transfer *xfer; /* softpipe: the mapping kept for the buffer's life */
    void *map;
    uint64_t size;
    uint64_t iova;

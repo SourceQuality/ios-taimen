@@ -1,22 +1,22 @@
 /*
  * mtlabitest: the bridge's object ABI (NativeMetalObjects.h, what the Objective-C frontend calls) on sweetmtl-runtime,
- * beyond the self-test: device answers, textures (CPU access, sampling, storage), samplers, blits, indexed draws,
- * function constants, threadgroup memory, vertex attributes, events, shared events and listeners, fences, handlers and
- * resource tracking.
+ * beyond the self-test: device answers, textures (CPU access, sampling, storage), samplers, blits, indexed draws with
+ * depth, viewport, scissor and culling, function constants, threadgroup memory, vertex attributes, events, shared
+ * events and listeners, fences, handlers and resource tracking.
  *
  *   mtlabitest [AIR_DIR]
  *
  * AIR_DIR holds extra fixtures assembled from metal2vulkan's validation fixtures (host-check.sh makes them):
  * stage_io.air, sampling.air, threadgroup_word.air. Each check prints one line:
- *   ok        it ran and what it computed is right (CPU-visible results are checkable on drm-shim too)
- *   ran       it ran (recorded, compiled, submitted); its GPU-written result is not checkable here (drm-shim)
+ *   ok        it ran and what it computed is right
+ *   ran       it ran (recorded, compiled, submitted); its GPU-written result is not checkable (SWEETMTL_DRM_SHIM=1:
+ *             freedreno drm-shim executes nothing)
  *   not yet   the runtime refused it as not yet implemented (the reason follows)
  *   FAIL      anything else
- * The exit status counts FAIL lines.
+ * On softpipe (SG_DRIVER=softpipe) and on the phone every result is checked. The exit status counts FAIL lines.
  *
  * SPDX-License-Identifier: MIT
  */
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +50,7 @@ static void refused(const char *what)
 	line(strstr(why, "not yet") || strstr(why, "NotYet") ? "not yet" : "FAIL", what, why);
 }
 
+/* a GPU-computed result: checked where something executes */
 static void gpu_result(const char *what, int bad, const char *detail)
 {
 	if (shim)
@@ -67,6 +68,7 @@ enum {
 	PRIM_TRIANGLE = 3,
 	IDX_U16 = 0,
 	CMP_LESS = 1, CMP_ALWAYS = 7,
+	CULL_BACK = 2, WIND_CW = 0, WIND_CCW = 1,
 	VF_FLOAT3 = 30, VF_HALF2 = 25, VF_USHORT2 = 13, VF_UCHAR4 = 3,
 	DT_INT = 29,
 };
@@ -97,6 +99,29 @@ static NmbTexture *texture(uint64_t format, uint64_t w, uint64_t h, uint64_t lev
 {
 	struct NmbTextureDescriptor d = {TT_2D, format, w, h, 1, levels, 1, 1, usage, options};
 	return nmb_texture_new(dev, &d);
+}
+
+/* every texel of a w x h RGBA8 level is `px` */
+static bool fill_rgba8(NmbTexture *t, int w, int h, int level, const uint8_t px[4])
+{
+	uint8_t *bytes = malloc((size_t)w * h * 4);
+	for (int i = 0; i < w * h; i++)
+		memcpy(bytes + 4 * i, px, 4);
+	uint64_t region[6] = {0, 0, 0, (uint64_t)w, (uint64_t)h, 1};
+	bool ok = nmb_texture_replace(t, region, level, 0, bytes, (uint64_t)w * 4, 0, (uint64_t)w * h * 4);
+	free(bytes);
+	return ok;
+}
+
+static bool read_rgba8(NmbTexture *t, int w, int h, int level, uint8_t *out)
+{
+	uint64_t region[6] = {0, 0, 0, (uint64_t)w, (uint64_t)h, 1};
+	return nmb_texture_get_bytes(t, out, (uint64_t)w * 4, 0, (uint64_t)w * h * 4, region, level, 0);
+}
+
+static int off_by(int a, int b)
+{
+	return a > b ? a - b : b - a;
 }
 
 static bool finish(NmbCommandBuffer *cb, const char *what)
@@ -171,27 +196,40 @@ static void texture_cpu(void)
 	nmb_texture_release(t);
 }
 
-static void sampled_render(NmbLibrary *lib)
+static NmbRenderPipeline *colored_pipeline(NmbLibrary *lib, const char *fragment, uint64_t depth)
 {
-	NmbFunction *v = nmb_function_new(lib, "colored_vertex"), *f = nmb_function_new(lib, "sampled_fragment");
+	NmbFunction *v = nmb_function_new(lib, "colored_vertex"), *f = nmb_function_new(lib, fragment);
 	struct NmbRenderPipelineDescriptor d;
 	memset(&d, 0, sizeof(d));
 	d.vertex = v;
 	d.fragment = f;
 	d.colors[0].format = PF_RGBA8;
 	d.colors[0].write_mask = 0xf;
+	d.depth_format = depth;
 	d.topology = 3; /* MTLPrimitiveTopologyClassTriangle */
 	d.rasterization = 1;
 	NmbRenderPipeline *p = v && f ? nmb_render_pipeline_new(dev, &d) : NULL;
+	if (v)
+		nmb_function_release(v);
+	if (f)
+		nmb_function_release(f);
+	return p;
+}
+
+static void sampled_render(NmbLibrary *lib)
+{
+	NmbRenderPipeline *p = colored_pipeline(lib, "sampled_fragment", 0);
 	if (!p) {
 		refused("render with a sampled texture: pipeline");
-		goto out;
+		return;
 	}
+	static const uint8_t px[4] = {40, 80, 120, 255};
 	NmbTexture *src = texture(PF_RGBA8, 8, 8, 1, TU_READ, SM_SHARED);
-	NmbTexture *dst = texture(PF_RGBA8, 8, 8, 1, TU_RT | TU_READ, SM_PRIVATE);
+	NmbTexture *dst = texture(PF_RGBA8, 8, 8, 1, TU_RT | TU_READ, SM_SHARED);
+	fill_rgba8(src, 8, 8, 0, px);
 	float pos[6][2] = {{-1, 1}, {1, 1}, {-1, -1}, {1, 1}, {1, -1}, {-1, -1}};
 	float col[6][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}};
-	NmbBuffer *pb = nmb_buffer_new(dev, sizeof(pos), SM_SHARED, pos), *cb_ = nmb_buffer_new(dev, sizeof(col), SM_SHARED, col);
+	NmbBuffer *pb = nmb_buffer_new(dev, sizeof(pos), SM_SHARED, pos), *cbuf = nmb_buffer_new(dev, sizeof(col), SM_SHARED, col);
 	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
 	struct NmbRenderPassDescriptor rp;
 	memset(&rp, 0, sizeof(rp));
@@ -200,55 +238,83 @@ static void sampled_render(NmbLibrary *lib)
 	rp.colors[0].store = STORE_STORE;
 	NmbEncoder *e = nmb_render_encoder_new(cb, &rp);
 	if (!e || !nmb_render_set_pipeline(e, p) || !nmb_encoder_set_buffer(e, 1, pb, 0, 0) ||
-	    !nmb_encoder_set_buffer(e, 1, cb_, 0, 1) || !nmb_encoder_set_texture(e, 2, src, 0) ||
+	    !nmb_encoder_set_buffer(e, 1, cbuf, 0, 1) || !nmb_encoder_set_texture(e, 2, src, 0) ||
 	    !nmb_render_draw(e, PRIM_TRIANGLE, 0, 6, 1, 0)) {
 		refused("render with a sampled texture");
 		if (e)
 			nmb_encoder_discard(e);
 	} else if (nmb_encoder_end(e) && finish(cb, "render with a sampled texture")) {
-		gpu_result("render with a sampled texture (constexpr linear sampler)", 0, NULL);
+		uint8_t out[8 * 8 * 4];
+		int bad = 0;
+		if (!read_rgba8(dst, 8, 8, 0, out))
+			bad = 64;
+		for (int i = 0; i < 64 && !bad; i++)
+			for (int c = 0; c < 4; c++)
+				bad += off_by(out[4 * i + c], px[c]) > 1;
+		char detail[64];
+		snprintf(detail, sizeof(detail), "%d of 256 channels off", bad);
+		gpu_result("render with a sampled texture (constexpr linear sampler)", bad, detail);
 	}
 	nmb_command_buffer_release(cb);
 	nmb_buffer_release(pb);
-	nmb_buffer_release(cb_);
+	nmb_buffer_release(cbuf);
 	nmb_texture_release(src);
 	nmb_texture_release(dst);
 	nmb_render_pipeline_release(p);
-out:
-	if (v)
-		nmb_function_release(v);
-	if (f)
-		nmb_function_release(f);
 }
 
 static void storage_compute(NmbLibrary *lib)
 {
 	NmbFunction *k = nmb_function_new(lib, "invert_texels");
 	NmbComputePipeline *p = k ? nmb_compute_pipeline_new(dev, k) : NULL;
+	if (k)
+		nmb_function_release(k);
 	if (!p) {
 		refused("compute on storage textures: pipeline");
-		goto out;
+		return;
 	}
 	NmbTexture *src = texture(PF_RGBA8, 8, 8, 1, TU_READ, SM_SHARED);
 	NmbTexture *dst = texture(PF_RGBA8, 8, 8, 1, TU_WRITE | TU_READ, SM_SHARED);
+	uint8_t in[8 * 8 * 4];
+	for (int y = 0; y < 8; y++)
+		for (int x = 0; x < 8; x++) {
+			uint8_t *t = in + 4 * (y * 8 + x);
+			t[0] = (uint8_t)(x * 30);
+			t[1] = (uint8_t)(y * 30);
+			t[2] = 100;
+			t[3] = 200;
+		}
+	uint64_t region[6] = {0, 0, 0, 8, 8, 1};
+	nmb_texture_replace(src, region, 0, 0, in, 32, 0, sizeof(in));
+	uint8_t junk[8 * 8 * 4];
+	memset(junk, 0x5a, sizeof(junk)); /* a texel the kernel misses stays 0x5a */
+	nmb_texture_replace(dst, region, 0, 0, junk, 32, 0, sizeof(junk));
 	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
 	NmbEncoder *e = nmb_compute_encoder_new(cb);
-	uint64_t grid[3] = {8, 8, 1}, group[3] = {8, 8, 1};
+	uint64_t grid[3] = {8, 8, 1}, group[3] = {4, 4, 1};
 	if (!e || !nmb_compute_set_pipeline(e, p) || !nmb_encoder_set_texture(e, 0, src, 0) ||
 	    !nmb_encoder_set_texture(e, 0, dst, 1) || !nmb_compute_dispatch(e, grid, group, true)) {
 		refused("compute on storage textures");
 		if (e)
 			nmb_encoder_discard(e);
 	} else if (nmb_encoder_end(e) && finish(cb, "compute on storage textures")) {
-		gpu_result("compute on storage textures (read + write images)", 0, NULL);
+		uint8_t out[8 * 8 * 4];
+		int bad = read_rgba8(dst, 8, 8, 0, out) ? 0 : 256;
+		for (int i = 0; i < 64 && !bad; i++)
+			for (int c = 0; c < 4; c++)
+				if (off_by(out[4 * i + c], c < 3 ? 255 - in[4 * i + c] : in[4 * i + c]) > 1) {
+					if (bad++ < 4 && !shim)
+						printf("  texel %d channel %d: %u, want %u\n", i, c, out[4 * i + c],
+						       c < 3 ? 255 - in[4 * i + c] : in[4 * i + c]);
+				}
+		char detail[64];
+		snprintf(detail, sizeof(detail), "%d of 256 channels off", bad);
+		gpu_result("compute on storage textures (read + write images)", bad, detail);
 	}
 	nmb_command_buffer_release(cb);
 	nmb_texture_release(src);
 	nmb_texture_release(dst);
 	nmb_compute_pipeline_release(p);
-out:
-	if (k)
-		nmb_function_release(k);
 }
 
 static void blits(void)
@@ -257,11 +323,13 @@ static void blits(void)
 	uint8_t *pattern = malloc(N);
 	for (int i = 0; i < N; i++)
 		pattern[i] = (uint8_t)(i * 13 + 1);
+	static const uint8_t base[4] = {10, 20, 30, 40};
 	NmbBuffer *a = nmb_buffer_new(dev, N, SM_SHARED, pattern), *b = nmb_buffer_new(dev, N, SM_SHARED, NULL),
 	          *c = nmb_buffer_new(dev, N, SM_SHARED, NULL), *fill = nmb_buffer_new(dev, N, SM_SHARED, NULL);
 	NmbTexture *t = texture(PF_RGBA8, 32, 32, 1, TU_READ, SM_SHARED);
-	NmbTexture *mip = texture(PF_RGBA8, 16, 16, 5, TU_READ | TU_RT, SM_PRIVATE);
+	NmbTexture *mip = texture(PF_RGBA8, 16, 16, 5, TU_READ | TU_RT, SM_SHARED);
 	NmbTexture *t2 = texture(PF_RGBA8, 32, 32, 1, TU_READ, SM_SHARED);
+	fill_rgba8(mip, 16, 16, 0, base);
 	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
 	NmbEncoder *e = nmb_blit_encoder_new(cb);
 	uint64_t zero[3] = {0, 0, 0}, size[3] = {32, 32, 1};
@@ -281,7 +349,15 @@ static void blits(void)
 		line(bad ? "FAIL" : "ok", "fill buffer (a5xx: on the CPU after a wait)", NULL);
 		line(memcmp(cc, pattern, N) ? "FAIL" : "ok", "buffer -> texture -> buffer (CPU paths)", NULL);
 		gpu_result("buffer copy (GPU blit)", memcmp(nmb_buffer_contents(b), pattern, N) != 0, NULL);
-		gpu_result("texture copy and mipmap generation (GPU)", 0, NULL);
+		uint8_t *copy = malloc(N);
+		gpu_result("texture copy (GPU blit)", !read_rgba8(t2, 32, 32, 0, copy) || memcmp(copy, pattern, N), NULL);
+		uint8_t level1[8 * 8 * 4];
+		int mbad = read_rgba8(mip, 8, 8, 1, level1) ? 0 : 256;
+		for (int i = 0; i < 64 && !mbad; i++)
+			for (int k = 0; k < 4; k++)
+				mbad += off_by(level1[4 * i + k], base[k]) > 1;
+		gpu_result("mipmap generation (level 1 of a uniform 16x16)", mbad, NULL);
+		free(copy);
 	}
 	nmb_command_buffer_release(cb);
 	nmb_buffer_release(a);
@@ -294,19 +370,12 @@ static void blits(void)
 	free(pattern);
 }
 
+/* A quad of two clockwise triangles (in Metal's y-down window coordinates), indexed, culling back faces with depth,
+ * a viewport and a scissor. Front faces counter-clockwise: both are back faces, nothing draws. Front faces clockwise:
+ * green inside the scissor, the clear color outside. */
 static void indexed_and_depth(NmbLibrary *lib)
 {
-	NmbFunction *v = nmb_function_new(lib, "colored_vertex"), *f = nmb_function_new(lib, "colored_fragment");
-	struct NmbRenderPipelineDescriptor d;
-	memset(&d, 0, sizeof(d));
-	d.vertex = v;
-	d.fragment = f;
-	d.colors[0].format = PF_RGBA8;
-	d.colors[0].write_mask = 0xf;
-	d.depth_format = PF_D32F;
-	d.topology = 3;
-	d.rasterization = 1;
-	NmbRenderPipeline *p = nmb_render_pipeline_new(dev, &d);
+	NmbRenderPipeline *p = colored_pipeline(lib, "colored_fragment", PF_D32F);
 	struct NmbDepthStencilDescriptor ds;
 	memset(&ds, 0, sizeof(ds));
 	ds.compare = CMP_LESS;
@@ -316,51 +385,68 @@ static void indexed_and_depth(NmbLibrary *lib)
 	NmbDepthStencil *dss = nmb_depth_stencil_new(dev, &ds);
 	if (!p || !dss) {
 		refused("indexed draw with depth: pipeline");
-		goto out;
+		if (p)
+			nmb_render_pipeline_release(p);
+		if (dss)
+			nmb_depth_stencil_release(dss);
+		return;
 	}
 	float pos[4][2] = {{-1, 1}, {1, 1}, {-1, -1}, {1, -1}};
 	float col[4][4] = {{0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}};
 	uint16_t idx[6] = {0, 1, 2, 1, 3, 2};
 	NmbBuffer *pb = nmb_buffer_new(dev, sizeof(pos), SM_SHARED, pos), *cbuf = nmb_buffer_new(dev, sizeof(col), SM_SHARED, col),
 	          *ib = nmb_buffer_new(dev, sizeof(idx), SM_SHARED, idx);
-	NmbTexture *rt = texture(PF_RGBA8, 16, 16, 1, TU_RT, SM_PRIVATE), *depth = texture(PF_D32F, 16, 16, 1, TU_RT, SM_PRIVATE);
-	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
-	struct NmbRenderPassDescriptor rp;
-	memset(&rp, 0, sizeof(rp));
-	rp.colors[0].texture = rt;
-	rp.colors[0].load = LOAD_CLEAR;
-	rp.colors[0].store = STORE_STORE;
-	rp.depth.texture = depth;
-	rp.depth.load = LOAD_CLEAR;
-	rp.depth.clear[0] = 1.0;
-	NmbEncoder *e = rt && depth ? nmb_render_encoder_new(cb, &rp) : NULL;
-	double vp[6] = {0, 0, 16, 16, 0, 1};
-	uint64_t sc[4] = {2, 2, 12, 12};
-	if (!e || !nmb_render_set_pipeline(e, p) || !nmb_render_set_depth_stencil(e, dss) || !nmb_render_set_viewport(e, vp) ||
-	    !nmb_render_set_scissor(e, sc) || !nmb_render_set_raster(e, 2, 1, 0) || !nmb_encoder_set_buffer(e, 1, pb, 0, 0) ||
-	    !nmb_encoder_set_buffer(e, 1, cbuf, 0, 1) ||
-	    !nmb_render_draw_indexed(e, PRIM_TRIANGLE, 6, IDX_U16, ib, 0, 1, 0, 0)) {
-		refused("indexed draw with depth, viewport, scissor, back culling");
-		if (e)
-			nmb_encoder_discard(e);
-	} else if (nmb_encoder_end(e) && finish(cb, "indexed draw with depth")) {
-		gpu_result("indexed draw with depth, viewport, scissor, back culling", 0, NULL);
+	for (int winding = WIND_CCW; winding >= WIND_CW; winding--) {
+		NmbTexture *rt = texture(PF_RGBA8, 16, 16, 1, TU_RT | TU_READ, SM_SHARED),
+		           *depth = texture(PF_D32F, 16, 16, 1, TU_RT, SM_PRIVATE);
+		NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
+		struct NmbRenderPassDescriptor rp;
+		memset(&rp, 0, sizeof(rp));
+		rp.colors[0].texture = rt;
+		rp.colors[0].load = LOAD_CLEAR;
+		rp.colors[0].store = STORE_STORE;
+		rp.colors[0].clear[2] = 1.0; /* blue */
+		rp.colors[0].clear[3] = 1.0;
+		rp.depth.texture = depth;
+		rp.depth.load = LOAD_CLEAR;
+		rp.depth.clear[0] = 1.0;
+		NmbEncoder *e = rt && depth ? nmb_render_encoder_new(cb, &rp) : NULL;
+		double vp[6] = {0, 0, 16, 16, 0, 1};
+		uint64_t sc[4] = {2, 2, 12, 12};
+		const char *what = winding == WIND_CCW ? "indexed draw, back faces culled (counter-clockwise front): nothing drawn"
+		                                       : "indexed draw with depth, viewport, scissor (clockwise front): drawn";
+		if (!e || !nmb_render_set_pipeline(e, p) || !nmb_render_set_depth_stencil(e, dss) ||
+		    !nmb_render_set_viewport(e, vp) || !nmb_render_set_scissor(e, sc) ||
+		    !nmb_render_set_raster(e, CULL_BACK, (uint64_t)winding, 0) || !nmb_encoder_set_buffer(e, 1, pb, 0, 0) ||
+		    !nmb_encoder_set_buffer(e, 1, cbuf, 0, 1) ||
+		    !nmb_render_draw_indexed(e, PRIM_TRIANGLE, 6, IDX_U16, ib, 0, 1, 0, 0)) {
+			refused(what);
+			if (e)
+				nmb_encoder_discard(e);
+		} else if (nmb_encoder_end(e) && finish(cb, what)) {
+			uint8_t out[16 * 16 * 4];
+			int bad = read_rgba8(rt, 16, 16, 0, out) ? 0 : 256;
+			for (int y = 0; y < 16 && !bad; y++)
+				for (int x = 0; x < 16; x++) {
+					bool in = winding == WIND_CW && x >= 2 && x < 14 && y >= 2 && y < 14;
+					const uint8_t want[4] = {0, (uint8_t)(in ? 255 : 0), (uint8_t)(in ? 0 : 255), 255};
+					bad += memcmp(out + 4 * (y * 16 + x), want, 4) != 0;
+				}
+			char detail[64];
+			snprintf(detail, sizeof(detail), "%d of 256 texels off", bad);
+			gpu_result(what, bad, detail);
+		}
+		nmb_command_buffer_release(cb);
+		if (rt)
+			nmb_texture_release(rt);
+		if (depth)
+			nmb_texture_release(depth);
 	}
-	nmb_command_buffer_release(cb);
 	nmb_buffer_release(pb);
 	nmb_buffer_release(cbuf);
 	nmb_buffer_release(ib);
-	if (rt)
-		nmb_texture_release(rt);
-	if (depth)
-		nmb_texture_release(depth);
-out:
-	if (p)
-		nmb_render_pipeline_release(p);
-	if (dss)
-		nmb_depth_stencil_release(dss);
-	nmb_function_release(v);
-	nmb_function_release(f);
+	nmb_render_pipeline_release(p);
+	nmb_depth_stencil_release(dss);
 }
 
 static void function_constants(void)
@@ -379,21 +465,28 @@ static void function_constants(void)
 	if (!p) {
 		refused("function constants");
 	} else {
-		NmbBuffer *in = nmb_buffer_new(dev, 64 * 4, SM_SHARED, NULL), *out = nmb_buffer_new(dev, 64 * 4, SM_SHARED, NULL);
+		float in[64] = {0};
+		for (int i = 0; i < 8; i++)
+			in[i] = (float)i;
+		NmbBuffer *ib = nmb_buffer_new(dev, sizeof(in), SM_SHARED, in), *ob = nmb_buffer_new(dev, sizeof(in), SM_SHARED, NULL);
 		NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
 		NmbEncoder *e = nmb_compute_encoder_new(cb);
 		uint64_t grid[3] = {8, 1, 1}, group[3] = {8, 1, 1};
-		if (!e || !nmb_compute_set_pipeline(e, p) || !nmb_encoder_set_buffer(e, 0, in, 0, 0) ||
-		    !nmb_encoder_set_buffer(e, 0, out, 0, 1) || !nmb_compute_dispatch(e, grid, group, true)) {
+		if (!e || !nmb_compute_set_pipeline(e, p) || !nmb_encoder_set_buffer(e, 0, ib, 0, 0) ||
+		    !nmb_encoder_set_buffer(e, 0, ob, 0, 1) || !nmb_compute_dispatch(e, grid, group, true)) {
 			refused("function constants: dispatch");
 			if (e)
 				nmb_encoder_discard(e);
 		} else if (nmb_encoder_end(e) && finish(cb, "function constants")) {
-			gpu_result("function constants (fcfold, mode = 0)", 0, NULL);
+			const float *o = nmb_buffer_contents(ob);
+			int bad = 0;
+			for (int i = 0; i < 8; i++)
+				bad += o[i] != i + 1.0f || o[i + 8] != 0.0f || o[i + 16] != i - 1.0f || o[i + 24] != (float)i;
+			gpu_result("function constants (fcfold, mode = 0)", bad, NULL);
 		}
 		nmb_command_buffer_release(cb);
-		nmb_buffer_release(in);
-		nmb_buffer_release(out);
+		nmb_buffer_release(ib);
+		nmb_buffer_release(ob);
 		nmb_compute_pipeline_release(p);
 	}
 	if (k)
@@ -420,7 +513,7 @@ static void threadgroup_memory(void)
 		if (e)
 			nmb_encoder_discard(e);
 	} else if (nmb_encoder_end(e) && finish(cb, "threadgroup memory")) {
-		gpu_result("threadgroup memory (setThreadgroupMemoryLength 16)", 0, NULL);
+		gpu_result("threadgroup memory (setThreadgroupMemoryLength 16)", *(uint32_t *)nmb_buffer_contents(out) != 42, NULL);
 	}
 	nmb_command_buffer_release(cb);
 	nmb_buffer_release(out);
@@ -447,7 +540,9 @@ static void sampler_kernel(void)
 	sd.max_anisotropy = 1;
 	sd.lod_max = 1000;
 	NmbSampler *s = nmb_sampler_new(dev, &sd);
+	static const uint8_t px[4] = {51, 102, 153, 255};
 	NmbTexture *t = texture(PF_RGBA8, 8, 8, 1, TU_READ, SM_SHARED);
+	fill_rgba8(t, 8, 8, 0, px);
 	NmbBuffer *out = nmb_buffer_new(dev, 256, SM_SHARED, NULL);
 	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
 	NmbEncoder *e = p && s ? nmb_compute_encoder_new(cb) : NULL;
@@ -458,7 +553,11 @@ static void sampler_kernel(void)
 		if (e)
 			nmb_encoder_discard(e);
 	} else if (nmb_encoder_end(e) && finish(cb, "sampler argument")) {
-		gpu_result("sampler argument (sample_level kernel)", 0, NULL);
+		const float *o = nmb_buffer_contents(out);
+		int bad = 0;
+		for (int i = 0; i < 16; i++)
+			bad += off_by((int)(o[i] * 255.0f + 0.5f), px[i % 4]) > 1;
+		gpu_result("sampler argument (sample_level kernel)", bad, NULL);
 	}
 	nmb_command_buffer_release(cb);
 	nmb_buffer_release(out);
@@ -524,7 +623,8 @@ static void vertex_attributes(void)
 			if (e)
 				nmb_encoder_discard(e);
 		} else if (nmb_encoder_end(e) && finish(cb, "vertex attributes")) {
-			gpu_result("vertex attributes (stage_io: 4 formats, set bytes, 2 color attachments, depth)", 0, NULL);
+			line("ran", "vertex attributes (stage_io: 4 formats, set bytes, 2 color attachments, depth)",
+			     "result not checked (a degenerate triangle)");
 		}
 		nmb_command_buffer_release(cb);
 		nmb_buffer_release(vb);
@@ -610,14 +710,18 @@ static void sync_objects(NmbLibrary *lib)
 	NmbEncoder *be = nmb_blit_encoder_new(consumer);
 	ok = ok && be && nmb_encoder_wait_fence(be, fence, 0) && nmb_blit_copy_buffer(be, out, 0, buf, 0, 256) && nmb_encoder_end(be);
 	ok = ok && nmb_command_buffer_commit(producer) && nmb_command_buffer_commit(consumer);
-	if (!ok)
+	if (!ok) {
 		refused("fence across queues");
-	else
-		line(nmb_command_buffer_wait(consumer, 10000) == 0 && nmb_command_buffer_wait(producer, 10000) == 0 &&
-		             nmb_command_buffer_status(consumer) == 4
-		         ? "ok"
-		         : "FAIL",
-		     "fence across queues (compute updates, blit waits)", NULL);
+	} else {
+		bool done = nmb_command_buffer_wait(consumer, 10000) == 0 && nmb_command_buffer_wait(producer, 10000) == 0 &&
+		            nmb_command_buffer_status(consumer) == 4;
+		line(done ? "ok" : "FAIL", "fence across queues (compute updates, blit waits)", NULL);
+		const float *o = nmb_buffer_contents(buf);
+		int bad = 0;
+		for (int i = 0; i < 64; i++)
+			bad += o[i] != (float)i; /* in is zero: out[i] = 0 * 2 + i */
+		gpu_result("fence across queues: the blit saw the kernel's output", bad, NULL);
+	}
 	nmb_command_buffer_release(producer);
 	nmb_command_buffer_release(consumer);
 	nmb_buffer_release(in);

@@ -27,6 +27,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "compiler/spirv/spirv_info.h"
+#include "cso_cache/cso_context.h"
 #include "util/set.h"
 
 #include "ir3/ir3_compiler.h"
@@ -198,6 +199,11 @@ lower_resource(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       if (d->deref_type == nir_deref_type_array)
          idx = nir_iadd(b, idx, d->arr.index.ssa);
       nir_rewrite_image_intrinsic(intr, idx, nir_image_intrinsic_type_default);
+      /* the index-only form has a RANGE_BASE the deref form lacks: its slot keeps whatever index
+       * the deref form had there (image_deref_store's SRC_TYPE, 160 for float32), and backends
+       * add it to the image index (nir_to_tgsi: STORE IMAGE[160]). The slot is in idx already. */
+      if (nir_intrinsic_has_range_base(intr))
+         nir_intrinsic_set_range_base(intr, 0);
       return true;
    }
    default:
@@ -401,17 +407,39 @@ sg_spirv_caps(void)
    return &caps;
 }
 
+/* softpipe (the PC's validation driver): the generic optimization loop ir3_optimize_loop stands
+ * for */
+static void
+generic_optimize(nir_shader *nir)
+{
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_if, 0);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+      NIR_PASS(progress, nir, nir_opt_undef);
+   } while (progress);
+}
+
 static nir_shader *
 translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shader_info *info)
 {
-   struct fd_screen *fds = fd_screen(dev->screen);
+   struct fd_screen *fds = dev->freedreno ? fd_screen(dev->screen) : NULL;
    mesa_shader_stage stage = sg_mesa_stage(d->stage);
-   const nir_shader_compiler_options *nopts = ir3_get_compiler_options(fds->compiler);
+   const nir_shader_compiler_options *nopts =
+      fds ? ir3_get_compiler_options(fds->compiler) : dev->screen->nir_options[stage];
 
    struct spirv_to_nir_options sopts = {
       .environment = NIR_SPIRV_VULKAN,
       .capabilities = sg_spirv_caps(),
-      .mediump_16bit_alu = true,
+      .mediump_16bit_alu = fds != NULL,
       .ubo_addr_format = nir_address_format_32bit_index_offset,
       .ssbo_addr_format = nir_address_format_32bit_index_offset,
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
@@ -483,8 +511,12 @@ translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shade
    NIR_PASS(_, nir, nir_opt_combine_stores, nir_var_all);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_is_helper_invocation);
-   struct ir3_optimize_options oo = {0};
-   ir3_optimize_loop(fds->compiler, &oo, nir);
+   if (fds) {
+      struct ir3_optimize_options oo = {0};
+      ir3_optimize_loop(fds->compiler, &oo, nir);
+   } else {
+      generic_optimize(nir);
+   }
 
    /* tu_lower_nir, bindful */
    const nir_opt_access_options ao = {.is_vulkan = true};
@@ -495,7 +527,8 @@ translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shade
       const nir_lower_sysvals_to_varyings_options sv = {.point_coord = true};
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sv);
    }
-   ir3_nir_lower_io_vars_to_temporaries(nir);
+   if (fds)
+      ir3_nir_lower_io_vars_to_temporaries(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
@@ -538,12 +571,19 @@ translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shade
    nir_assign_io_var_locations(nir, nir_var_shader_out);
    if (stage == MESA_SHADER_VERTEX)
       vertex_inputs(nir, info);
-   ir3_nir_lower_io(nir);
+   if (fds) {
+      ir3_nir_lower_io(nir);
+   } else {
+      generic_optimize(nir);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   }
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    if (getenv("SG_PRINT_NIR"))
       nir_print_shader(nir, stderr);
-   /* ir3_screen_finalize_nir: what the state tracker runs before making a CSO */
-   dev->screen->finalize_nir(dev->screen, nir, true);
+   /* ir3_screen_finalize_nir: what the state tracker runs before making a CSO (softpipe has
+    * none: nir_to_tgsi lowers what it needs) */
+   if (dev->screen->finalize_nir)
+      dev->screen->finalize_nir(dev->screen, nir, true);
    if (stage == MESA_SHADER_COMPUTE) {
       info->workgroup[0] = nir->info.workgroup_size[0];
       info->workgroup[1] = nir->info.workgroup_size[1];
@@ -587,6 +627,15 @@ sg_shader_new(struct sg_device *dev, const struct sg_shader_desc *d)
    }
    if (!cso)
       return NULL;
+   if (!dev->freedreno) {
+      struct sg_shader *s = calloc(1, sizeof(*s));
+      s->dev = dev;
+      s->stage = d->stage;
+      s->cso = cso;
+      s->info = info;
+      dev->stats.shaders++;
+      return s;
+   }
    /* The default variant (compiled synchronously at creation: sg_device.c's debug callback). */
    struct ir3_shader *shader = ir3_get_shader(cso);
    struct ir3_shader_key key;
@@ -628,12 +677,17 @@ sg_shader_free(struct sg_shader *s)
       return;
    struct sg_device *dev = s->dev;
    simple_mtx_lock(&dev->lock);
-   if (s->stage == SG_COMPUTE)
+   /* unbind first: a CSO is not deleted while bound (the next command binds its own) */
+   if (s->stage == SG_COMPUTE) {
+      cso_set_compute_shader_handle(dev->cso, NULL);
       dev->pipe->delete_compute_state(dev->pipe, s->cso);
-   else if (s->stage == SG_VERTEX)
+   } else if (s->stage == SG_VERTEX) {
+      cso_set_vertex_shader_handle(dev->cso, NULL);
       dev->pipe->delete_vs_state(dev->pipe, s->cso);
-   else
+   } else {
+      cso_set_fragment_shader_handle(dev->cso, NULL);
       dev->pipe->delete_fs_state(dev->pipe, s->cso);
+   }
    simple_mtx_unlock(&dev->lock);
    free(s);
 }

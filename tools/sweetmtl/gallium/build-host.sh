@@ -38,16 +38,25 @@ EXTRA="-I$M/src/gallium/drivers/freedreno -I$M/src/freedreno -I$M/src/freedreno/
 	-I$M/src -I$B/src -I$B/src/freedreno/common -I$B/src/compiler/nir -I$B/src/compiler/spirv
 	-I$M/src/compiler/nir -I$M/src/compiler -I$B/src/compiler -I$M/src/vulkan/util
 	-I$M/src/gallium/drivers -I$H/../../sweetgl"
+# softpipe, the PC's validation driver (SG_DRIVER=softpipe), where the Mesa build has it
+SOFTPIPE=
+SOFTPIPE_LIBS=
+if [ -f "$B/src/gallium/drivers/softpipe/libsoftpipe.a" ] && [ -f "$B/src/gallium/winsys/sw/null/libws_null.a" ]; then
+	SOFTPIPE=-DSG_WITH_SOFTPIPE
+	SOFTPIPE_LIBS="$B/src/gallium/drivers/softpipe/libsoftpipe.a
+$B/src/gallium/winsys/sw/null/libws_null.a"
+fi
 OBJS=
 for f in sg_device sg_resource sg_shader sg_replay sg_format sg_map; do
 	$CC -c -O2 -g -fPIC -Wall -Wno-unused-function -Wno-missing-field-initializers \
-		@"$O/mesa-flags.rsp" $EXTRA -o "$O/$f.o" "$H/$f.c"
+		@"$O/mesa-flags.rsp" $EXTRA $SOFTPIPE -o "$O/$f.o" "$H/$f.c"
 	OBJS="$OBJS $O/$f.o"
 done
 rm -f "$O/libsweetgallium.a"
 ar rcs "$O/libsweetgallium.a" $OBJS
-# Mesa's static libraries for the shim, in link order (the gallium driver first).
+# Mesa's static libraries for the shim, in link order (the gallium drivers first).
 cat > "$O/mesa-libs.txt" <<EOF
+$SOFTPIPE_LIBS
 $B/src/gallium/winsys/freedreno/drm/libfreedrenowinsys.a
 $B/src/gallium/drivers/freedreno/libfreedreno.a
 $B/src/freedreno/drm/libfreedreno_drm.a
