@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index dd27ebb..d25f95a 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -77,6 +77,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/proc.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -1644,6 +1645,13 @@ sweet_gpu_quad(const struct sweet_gpu_quad *q)
+ static vm_offset_t g_fence_va;
+ static uint64_t g_fence_pa;
+ static uint32_t g_submit_seq;           /* last submitted */
++/* 0334: who submitted the last fences, for the hang report (kernel submits are not recorded) */
++#define SUBMITTERS 64
++static struct {
++	uint32_t seq;
++	int pid;
++	char name[20];
++} g_subm[SUBMITTERS];
+ static uint32_t g_fence_seen;           /* fence value at g_fence_when */
+ static uint64_t g_fence_when;
+ static int g_max_mhz = 300;
+@@ -1855,7 +1863,14 @@ gpu_hung(const char *why)
+ 	g_ready = false;
+ 	cp_state(g_gpu, why);
+ 	smmu_faults(g_smmu, why);
+-	printf("SWEET GPU: hung (%s): fence %u, submitted %u\n", why, fence_now(), g_submit_seq);
++	uint32_t f = fence_now(), first = f + 1;
++	if (g_subm[first % SUBMITTERS].seq == first) {
++		printf("SWEET GPU: hung (%s): fence %u, submitted %u; the first unfinished submit (%u) is %s's [%d]\n", why,
++		    f, g_submit_seq, first, g_subm[first % SUBMITTERS].name, g_subm[first % SUBMITTERS].pid);
++	} else {
++		printf("SWEET GPU: hung (%s): fence %u, submitted %u; the first unfinished submit (%u) is the kernel's\n",
++		    why, f, g_submit_seq, first);
++	}
+ 	if (!gpu_recover(why)) {
+ 		printf("SWEET GPU: GPU service off until reboot\n");
+ 	}
+@@ -1935,6 +1950,9 @@ sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
+ 		}
+ 		emit(pkt7(CP_SET_RENDER_MODE, 5)); emit(0); emit(0); emit(0); emit(0); emit(0);
+ 		uint32_t seq = ++g_submit_seq;
++		g_subm[seq % SUBMITTERS].seq = seq;
++		g_subm[seq % SUBMITTERS].pid = proc_selfpid();
++		proc_selfname(g_subm[seq % SUBMITTERS].name, sizeof(g_subm[0].name));
+ 		emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
+ 		emit((uint32_t)g_fence_pa); emit((uint32_t)(g_fence_pa >> 32)); emit(seq);
+ 		flush_dcache64((addr64_t)rb_pa, RB_DWORDS * 4, TRUE);
