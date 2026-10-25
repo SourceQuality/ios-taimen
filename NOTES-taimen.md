@@ -1023,3 +1023,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (out/shots137, shot137-apple.png). On the way: after the phone resets, the agent's idle connections stay
   half open and nothing reaches the phone; usbproxy.py now sets TCP keepalive (10 s idle, 5 s x 3) so a rebooted
   phone's RST ends them; and a tab that failed while the agent was down needs a new tab, not a reload.
+- 2026-10-25 **boot 138 (r126 = +0263-0307, netsvcd v4): typing and DNS.** The remote keyboard (0307,
+  SweetHIDKeyboard registers on its first key) typed "en.wikipedia.org" + Enter into Safari's address bar
+  (phonectl.py tapc 562 2128, type, enter): Wikipedia's front page drew in full. Safari restored apple.com
+  after the reboot and drew it too. DNS through the agent (netsvcd 127.0.0.1:53 -> CONNECT 1.1.1.1:53):
+  74 queries, 0 failed in the first two minutes; 103 app connections spliced, 0 without an agent.
