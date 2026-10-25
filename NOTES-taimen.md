@@ -1070,3 +1070,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   true; assetsd runs; **Photos** shows What's New, the notification prompt, then its Library ("No Photos or
   Videos"); **Music** opens (Listen Now: "An Error Occurred" without an Apple Music account, the mini player) -
   its NULL databasePath was the media library refused by TCC too. sweettcc.dylib is no longer needed.
+- 2026-10-25 **boot 149 (r133 = +0263-0314): USB networking is the default.** A plain `ROOT=1 autoboot.sh KERNEL OUT
+  taimenreboot=900` (no sweetusb, no ROOTFIX_KEEP: the default GPU ROOTFIX, rebuilt with --phone-tools) came up
+  with the gadget (0314), DHCP, netsvcd (netsvcd-HASH from the ROOTFIX) and the agent: 94 app connections
+  spliced and 123 DNS queries through the PC, none failed; Safari restored en.wikipedia.org and drew it.
+  Podcasts and Health open since the TCC fix (boot 148) as well. App status, first home screen page: everything
+  opens except FaceTime (black). Next steps on the network side: tools/windows/usb-share.ps1 (admin once) for
+  full NAT; the PC agent (tools/taimen/usbproxy.py) must run for internet without it.
