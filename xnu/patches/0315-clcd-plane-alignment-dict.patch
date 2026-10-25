@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 742d378..b1ecbf9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -563,7 +563,21 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * 0315: a dictionary, as VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService reads it
++	 * (CFDictionaryGetValue(DisplayPipePlaneBaseAlignment, PlaneBaseAlignmentLinear)): as a number it
++	 * crashed mediaserverd on every video (boot 152: 16 times, -[__NSCFNumber objectForKey:]).
++	 */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++		if (align != NULL && linear != NULL) {
++			align->setObject("PlaneBaseAlignmentLinear", linear);
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(align);
++	}
+ 	registerService();
+ 	int accel = 1;
+ 	PE_parse_boot_argn("sweetaccel", &accel, sizeof(accel));
