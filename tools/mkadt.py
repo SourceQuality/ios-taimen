@@ -309,7 +309,10 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
     ])
 
     product_props = d22ap_product(D20AP_ADT if pixel1 else D22AP_ADT)
-    if pixel1 and product_props:
+    # taimen too since boot 137 (TAIMEN_GAMUT=P3 keeps the iPhone X's): with P3, WebKit's GPU
+    # process draws Safari's pages into 'w30r' / 'b3a8' wide-colour tiles, which sweetgl has no
+    # texture format for, so every page stayed black (boot 136).
+    if (pixel1 or (taimen and os.environ.get('TAIMEN_GAMUT', 'sRGB') != 'P3')) and product_props:
         # The Pixel panel is sRGB, and with "P3" iOS picks deep-color snapshot
         # surfaces (MaterialKit b3a8, CA w30r) that CoreAnimation's CPU renderer
         # cannot draw into: the dock / App Library backgrounds stayed white.
