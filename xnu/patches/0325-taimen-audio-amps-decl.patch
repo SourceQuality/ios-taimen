@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index e32a9d4..e2cd650 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -1525,6 +1525,7 @@ struct apr_hdr {
+ 
+ static uint32_t apr_token = 1, apr_rx_pkts, apr_tx_pkts;
+ static int apr_next_dst = -1;           /* the next packet's destination port, if not its source */
++static bool amps;                       /* stage 7 loaded the TAS2557 firmware */
+ static int adsp_core_state = -1;        /* AVCS state: 1 = ready */
+ static bool apr_versions_done;
+ static unsigned apr_last_ask, apr_asks;
+@@ -2499,7 +2500,6 @@ stream_close(void)
+ }
+ 
+ static bool sess_on, sess_failed, feeder_ok;
+-static bool amps;                       /* stage 7 loaded the TAS2557 firmware */
+ static uint32_t sess_seen_done, sess_next, sess_count, sess_underruns;
+ static uint64_t sess_frames;
+ 
