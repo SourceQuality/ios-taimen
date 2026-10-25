@@ -587,14 +587,14 @@ sgl_tgt(GLenum target)
  */
 struct copied {
 	IOSurfaceRef surface;
-	uint32_t seed;
+	uint32_t seed, plane;
 	GLenum format, type;
 };
 static struct copied copies[TEXSZ_MAX];
 /* texture swizzle of the bound texture: identity, or A,B,G,R bytes read as RGBA */
 static uint8_t tex_argb[TEXSZ_MAX];
-static bool copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w, size_t h,
-    size_t pitch, const char *why);
+static bool copy_surface(IOSurfaceRef s, uint32_t plane, GLenum target, GLenum format, GLenum type, size_t w,
+    size_t h, size_t pitch, const char *why);
 static void set_swizzle(GLenum target, bool argb);
 
 static void
@@ -619,8 +619,13 @@ copy_refresh(int u, int *active)
 	}
 	glActiveTexture(GL_TEXTURE0 + u);
 	IOSurfaceRef s = c->surface;
-	copy_surface(s, GL_TEXTURE_2D, c->format, c->type, IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
-	    IOSurfaceGetBytesPerRow(s), "refresh");
+	if (IOSurfaceGetPlaneCount(s) > 0) {
+		copy_surface(s, c->plane, GL_TEXTURE_2D, c->format, c->type, IOSurfaceGetWidthOfPlane(s, c->plane),
+		    IOSurfaceGetHeightOfPlane(s, c->plane), IOSurfaceGetBytesPerRowOfPlane(s, c->plane), "refresh");
+	} else {
+		copy_surface(s, 0, GL_TEXTURE_2D, c->format, c->type, IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+		    IOSurfaceGetBytesPerRow(s), "refresh");
+	}
 }
 
 /*
@@ -1560,6 +1565,10 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 	case 'L016':
 		*internalformat = GL_RG8;
 		return PIPE_FORMAT_R8G8_UNORM;
+	case '420v':            /* video: plane 0 Y (bpe 1), plane 1 CbCr (bpe 2) */
+	case '420f':
+		*internalformat = bpe == 2 ? GL_RG8 : GL_R8;
+		return bpe == 2 ? PIPE_FORMAT_R8G8_UNORM : bpe == 1 ? PIPE_FORMAT_R8_UNORM : PIPE_FORMAT_NONE;
 	default:
 		return PIPE_FORMAT_NONE;
 	}
@@ -1680,6 +1689,8 @@ upload_format(uint32_t fourcc, size_t bpe, GLenum *format, GLenum *type)
 	case 'RGhA': *format = GL_RGBA; *type = GL_HALF_FLOAT; break;
 	case 'L008': *format = GL_RED; break;
 	case 'L016': *format = GL_RG; break;
+	case '420v':
+	case '420f': *format = bpe == 2 ? GL_RG : GL_RED; break;
 	default: *format = 0;
 	}
 }
@@ -1691,11 +1702,12 @@ upload_format(uint32_t fourcc, size_t bpe, GLenum *format, GLenum *type)
  * images are immutable).
  */
 static bool
-copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w, size_t h, size_t pitch,
-    const char *why)
+copy_surface(IOSurfaceRef s, uint32_t plane, GLenum target, GLenum format, GLenum type, size_t w, size_t h,
+    size_t pitch, const char *why)
 {
-	size_t bpe = IOSurfaceGetBytesPerElement(s);
-	const void *base = IOSurfaceGetBaseAddress(s);
+	bool planes = IOSurfaceGetPlaneCount(s) > 0;
+	size_t bpe = planes ? IOSurfaceGetBytesPerElementOfPlane(s, plane) : IOSurfaceGetBytesPerElement(s);
+	const void *base = planes ? IOSurfaceGetBaseAddressOfPlane(s, plane) : IOSurfaceGetBaseAddress(s);
 	if (base == NULL || bpe == 0 || pitch % bpe != 0) {
 		sweet_drm_log("sweetgl: %s: surface %u %zux%zu pitch %zu: cannot copy", why, IOSurfaceGetID(s), w, h, pitch);
 		return false;
@@ -1728,6 +1740,7 @@ copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w
 			c->surface = s;
 		}
 		c->seed = seed;
+		c->plane = plane;
 		c->format = format;
 		c->type = type;
 	}
@@ -1768,7 +1781,9 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	if (b3a8 && pitch == 0) {
 		pitch = IOSurfaceGetBytesPerRow(s);
 	}
-	bool multi = !b3a8 && (IOSurfaceGetPlaneCount(s) > 1 || plane != 0);   /* ponytail: YUV surfaces not yet */
+	/* video frames: each plane of a bi-planar 4:2:0 surface is its own texture (R8 Y, RG8 CbCr) */
+	bool yuv = (fourcc == '420v' || fourcc == '420f') && plane < 2;
+	bool multi = !b3a8 && !yuv && (IOSurfaceGetPlaneCount(s) > 1 || plane != 0);   /* other planar: not yet */
 	img.format = format && !multi ? gl_format(format, type, &img.internalformat) : PIPE_FORMAT_NONE;
 	if (img.format == PIPE_FORMAT_NONE && !multi) {
 		img.format = surface_format(fourcc, IOSurfaceGetBytesPerElementOfPlane(s, plane), &img.internalformat);
@@ -1787,10 +1802,11 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	set_swizzle(target, argb);
 	if (!multi && pitch % 64 != 0) {
 		if (format == 0) {
-			upload_format(fourcc, IOSurfaceGetBytesPerElement(s), &format, &type);
+			upload_format(fourcc, yuv ? IOSurfaceGetBytesPerElementOfPlane(s, plane) : IOSurfaceGetBytesPerElement(s),
+			    &format, &type);
 		}
 		if (format != 0) {
-			return copy_surface(s, target, format, type, w, h, pitch, why);
+			return copy_surface(s, yuv ? plane : 0, target, format, type, w, h, pitch, why);
 		}
 	}
 	uint32_t handle = 0;
@@ -1826,8 +1842,11 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 			.type = WINSYS_HANDLE_TYPE_KMS,
 			.handle = handle,
 			.stride = (unsigned)pitch,
-			/* client-memory surfaces start inside their first page (kernel 0157) */
-			.offset = (unsigned)(pbase & vm_page_mask),
+			/*
+			 * client-memory surfaces start inside their first page (kernel 0157); a later
+			 * plane starts at its offset into the surface's pages
+			 */
+			.offset = (unsigned)(pbase - ((uintptr_t)IOSurfaceGetBaseAddress(s) & ~(uintptr_t)vm_page_mask)),
 			.format = img.format,
 			.modifier = DRM_FORMAT_MOD_LINEAR,
 		};
