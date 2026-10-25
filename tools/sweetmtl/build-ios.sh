@@ -105,15 +105,13 @@ mkdir -p "$B"
 # Nothing exported: Metal finds SweetMTLDevice through the Objective-C runtime (the class list), and -dead_strip may then
 # drop every bridge call the frontend does not make.
 printf '# none: Metal finds SweetMTLDevice through the Objective-C runtime\n' > "$OUT/SweetMetal-exports.txt"
-# _MTLDevice (the plug-in class's superclass) is private: looked up at load (Metal is loaded by then) where the SDK's
-# Metal.tbd does not list it.
+# clang++ adds libc++ itself. _MTLDevice, the plug-in class's private superclass, is in the SDK's Metal.tbd.
 $CXX -x objective-c++ -std=c++17 -fobjc-arc -O2 -Wall -Wno-deprecated-declarations -Wno-unused-function \
 	-fvisibility=hidden -I "$H" -I "$H/frontend" -bundle -o "$OUT/SweetMetal.unstripped" \
 	"$H/frontend/SweetMetal.mm" "$H/frontend/NativeBridgeMetalFrontend.mm" -x none "$BRIDGE" \
 	"$OUT/gallium/libsweetgallium.a" $(cat "$OUT/gallium/mesa-libs.txt") \
-	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -lc++ -lz \
-	-Wl,-dead_strip -Wl,-exported_symbols_list,"$OUT/SweetMetal-exports.txt" \
-	-Wl,-U,'_OBJC_CLASS_$__MTLDevice' -Wl,-U,'_OBJC_METACLASS_$__MTLDevice'
+	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -lz \
+	-Wl,-dead_strip -Wl,-exported_symbols_list,"$OUT/SweetMetal-exports.txt"
 cp "$OUT/SweetMetal.unstripped" "$B/SweetMetal"
 "$(xcrun --sdk iphoneos --find strip)" -x "$B/SweetMetal"
 cp "$H/frontend/Info.plist" "$B/Info.plist"
@@ -144,6 +142,12 @@ for t in mtlbridgetest mtlabitest SweetMetal.bundle/SweetMetal mtltest; do
 	fi
 done
 [ "$BAD" = 0 ] || { echo "weak imports above: a symbol newer than iOS 16.0"; exit 1; }
-echo "== the plug-in's lookups at load (flat namespace: resolved in whatever image has them)"
-nm -m "$B/SweetMetal" | grep "dynamically looked up" || true
+echo "== the plug-in's superclass: _MTLDevice from Metal, nothing looked up in the flat namespace"
+nm -m "$B/SweetMetal" | grep -F '_OBJC_CLASS_$__MTLDevice'
+nm -m "$B/SweetMetal" | grep -F '_OBJC_CLASS_$__MTLDevice' | grep -q "(from Metal)" ||
+	{ echo "SweetMetal does not take _MTLDevice from Metal"; exit 1; }
+if nm -m "$B/SweetMetal" | grep "dynamically looked up"; then
+	echo "SweetMetal looks the symbols above up at load"
+	exit 1
+fi
 ls -la "$OUT/mtlbridgetest" "$OUT/mtlabitest" "$B/SweetMetal" "$OUT/mtltest"

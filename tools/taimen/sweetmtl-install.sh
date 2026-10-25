@@ -19,6 +19,7 @@
 # blob (it is on the phone already): boot with ROOTFIX_KEEP=1.
 set -euo pipefail
 P=$(cd "$(dirname "$0")/../.." && pwd)
+T=$(cd "$P/.." && pwd) # the project directory: out/, research/
 R=SourceQuality/ios-taimen
 # Windows' gh.exe (signed in; WSL's gh is not), as tools/windows/ci-kernel.sh uses it
 gh=${GH_EXE:-/mnt/c/Program Files/GitHub CLI/gh.exe}
@@ -57,7 +58,7 @@ elif [ -z "$run" ]; then
 	[ -n "$run" ] || { echo "no successful sweetmtl.yml run on taimen" >&2; exit 2; }
 fi
 
-d=$P/../out/sweetmtl/run-$run
+d=$T/out/sweetmtl/run-$run
 if ! (cd "$d" 2>/dev/null && sha256sum -c --quiet SHA256SUMS > /dev/null 2>&1); then
 	rm -rf "$d"
 	mkdir -p "$d"
@@ -109,10 +110,10 @@ mtlabitest)
 esac
 
 tools=()
-[ -f "$P/../out/phone-tools/netsvcd" ] && tools=(--phone-tools "$P/../out/phone-tools")
-[ -f "$P/../out/phone-tools/RedwoodAudio" ] && tools+=(--hal-plugin "$P/../out/phone-tools")
-img=$P/../research/ipsw-x/ios16-root.img
-fix=$P/../research/taimen/rootfix-sweetmtl-$tool.bin
+[ -f "$T/out/phone-tools/netsvcd" ] && tools=(--phone-tools "$T/out/phone-tools")
+[ -f "$T/out/phone-tools/RedwoodAudio" ] && tools+=(--hal-plugin "$T/out/phone-tools")
+img=$T/research/ipsw-x/ios16-root.img
+fix=$T/research/taimen/rootfix-sweetmtl-$tool.bin
 cmd=(python3 -I "$P/tools/taimen/mkrootfix.py" "$img" "$fix" "${tools[@]}" "${args[@]}")
 printf '%q ' "${cmd[@]}"
 echo
@@ -126,8 +127,8 @@ size=$(stat -c %s "$fix")
 echo "$fix: $((size / 1024)) KiB"
 # the boot payload holds the kernel (~17 MB for a development one) and this blob: ABL stops near 35 MiB
 [ "$size" -lt $((17 * 1024 * 1024)) ] || echo "WARNING: a blob this size may push the payload past ABL's ~35 MiB" >&2
-mkdir -p "$P/../out/sweetmtl"
-cat > "$P/../out/sweetmtl/current.env" << EOF
+mkdir -p "$T/out/sweetmtl"
+cat > "$T/out/sweetmtl/current.env" << EOF
 SWEETMTL_RUN=$run
 SWEETMTL_TOOL=$tool
 SWEETMTL_BUNDLE=$bundle

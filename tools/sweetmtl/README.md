@@ -278,8 +278,8 @@ with the QuartzCore step included.
   - Nothing is exported (`-exported_symbols_list` with no names), so `-dead_strip` drops the
     bridge calls the frontend does not make. Metal finds the class `SweetMTLDevice` through the
     Objective-C runtime.
-  - `_MTLDevice`, the class's private superclass, is linked with `-U` (looked up at load) in case
-    the SDK's Metal.tbd does not list it.
+  - `_MTLDevice`, the class's private superclass, is in the SDK's Metal.tbd. The build checks that
+    the bundle binds it to Metal and looks nothing up in the flat namespace.
   - The bundle holds the executable `SweetMetal`, stripped, plus `Info.plist`
     (`NSPrincipalClass` `SweetMTLDevice`) and `_CodeSignature/CodeResources`. It is signed ad hoc
     as a bundle, and the same weak-import check runs on it.
