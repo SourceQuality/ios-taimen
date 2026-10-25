@@ -13,6 +13,26 @@ Not stored locally (read online on 2026-10-25, cite by file name):
   `sound/soc/msm/msm8998.c`, `sound/soc/codecs/tas2557/tas2557-core.c`, `drivers/soc/qcom/qdsp6v2/{apr_tal_glink,msm_audio_ion}.c`.
 - `L/` = Linux v6.1: `sound/soc/qcom/qdsp6/{q6afe,q6asm,q6adm}.c`, `q6afe.h`, `drivers/pinctrl/qcom/pinctrl-msm8998.c`.
 
+## Status (2026-10-25, boots 156-160): the speakers play iOS's audio, on by default
+
+| Stage | Patch | Result |
+|---|---|---|
+| 1 firmware | reader init, boot-xnu.sh AUDIOFW | adsp.mdt + 8 segments, TAS2557 firmware and calibration as payload blobs (~9.4 MB) |
+| 2 ADSP by PAS | xnu 0317 | READY 12-13 ms after AUTH_AND_RESET (relocatable image into the 0x8B200000 carve-out) |
+| 3 GLINK, QRTR, APR | xnu 0318 | lpass edge up; the ADSP opens apr_audio_svc and five more channels; pd-mapper answers no domains |
+| 4 AVCS ready | xnu 0318 | core state 1; AFE 0x260000, ASM 0x70002, ADM 0x70000 |
+| 5 LPASS SMMU | xnu 0319-0324 | no non-secure bypass (S2CR bypass reads back as fault); the top bank (CB12) hung the bus; the lowest free bank (CB1) as an identity bank works; TZ MP_RESTORE_SEC_CFG answers -2 and is not needed |
+| 6 AFE port 0x1006 | xnu 0319, 0323 | S24_LE in 32-bit slots at 3.072 MHz as Android's mixer paths; SCK/WS toggle |
+| 7 TAS2557 | xnu 0323 (taimen_i2c.c, taimen_tas2557.c) | PG2.1 on both, program 0 / configuration 0 / calibration 0 in 2.1 s, no CRC mismatch; up only while the clock runs |
+| 8 ADM + ASM stream | xnu 0321 | the 3 s tone: 159 periods out and back, 0 underflows (now only with taimenaudiotone=1, 0327) |
+| 9 /dev/redwood-audio, feeder | xnu 0323 | sessions open on frames and close after 3 s; 0 dropped, 0 DSP underflows |
+| 10 RedwoodAudio plug-in | tools/phone/RedwoodAudio, mkrootfix --hal-plugin | loads in mediaserverd on the install boot; Safari's MP4 audible |
+
+Defaults since xnu 0326: taimenaudio=9 with the stream 1 bank; boot-xnu.sh adds the blobs unless AUDIO=0; the
+default GPU ROOTFIX carries the plug-in. Level cap taimenaudiobelow=160 (-20 dB) until it has been heard.
+Not yet: microphones (WCD9340 over SLIMbus), haptics (PMI8998, in progress), firmware from the root instead of
+the payload, earpiece routing for calls.
+
 ## 0. Verdict in one paragraph
 
 This is feasible, and both halves have been done before.
