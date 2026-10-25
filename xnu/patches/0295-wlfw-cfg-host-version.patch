@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index e189b88..d4fd64b 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2950,6 +2950,12 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 				w_rails();
+ 			}
+ 			wm_new(&m, WLFW_WLAN_CFG);
++			/*
++			 * 0295: host_version, as icnss_wlan_enable always sends it (valid = 1; Android's qcacld
++			 * passes QWLAN_VERSIONSTR, logged as "wlan: probing driver v5.2.1.1L"); at most 16 bytes.
++			 * Boots 116-126: the modem dies 9.5 s after the mission mode that follows this message.
++			 */
++			wm_tlv(&m, 0x10, "5.2.1.1L", 8);
+ 			wm_array(&m, 0x11, 12, w_tgt_ce, sizeof(w_tgt_ce));
+ 			wm_array(&m, 0x12, (uint8_t)(sizeof(w_svc_ce) / sizeof(w_svc_ce[0])), w_svc_ce, sizeof(w_svc_ce));
+ 			wm_array(&m, 0x13, 12, w_shadow, sizeof(w_shadow));
