@@ -1,0 +1,499 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a9d1424..e8f21e1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,8 @@ bsd/dev/sweet_perf.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/taimen_touch.c			standard
++bsd/dev/taimen_i2c.c			standard
++bsd/dev/taimen_tas2557.c		standard
+ bsd/dev/sailfish_wlan.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/taimen_tas2557.c b/bsd/dev/taimen_tas2557.c
+index 2347754..11621e3 100644
+--- a/bsd/dev/taimen_tas2557.c
++++ b/bsd/dev/taimen_tas2557.c
+@@ -846,7 +846,8 @@ tas_report(unsigned ci, const char *when, bool up)
+ 	}
+ 	uint8_t f1 = v[1], f2 = v[2];
+ 	bool down = up && (v[3] & 0xc0u) != 0xc0u;
+-	bool ok = err == 0 && v[0] == TAS_SAFE_GUARD_PATTERN && (f1 & 0xfcu) == 0 && (f2 & 0x0cu) == 0 && !down;
++	/* powered down there is no bit clock and the clock flags may be set: then only the safe guard counts */
++	bool ok =err == 0 && v[0] == TAS_SAFE_GUARD_PATTERN && (!up || ((f1 & 0xfcu) == 0 && (f2 & 0x0cu) == 0 && !down));
+ 	printf("TAIMEN TAS2557: %s %s: %s safe guard %#x, flags %#x/%#x, power-up %#x%s%s%s%s%s%s%s%s%s%s\n",
+ 	    tas_chip[ci].name, when, err ? "I2C ERROR," : ok ? "ok," : "BAD,", v[0], f1, f2, v[3], temp,
+ 	    (f1 & 0x80u) ? " OVER-CURRENT" : "", (f1 & 0x40u) ? " UNDER-VOLTAGE" : "", (f1 & 0x20u) ? " CLOCK-HALT" : "",
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 253b621..ca2920e 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -17,9 +17,17 @@
+  * 5 mode A (0321, taimenaudiosmmu=2): stream 1 through an identity context bank of the LPASS SMMU.
+  *   Boot 157: it hung (no line after the census, the GPU never came up). 0322: breadcrumbs, the
+  *   GPU first, and taimenaudiosmmu=3: an SMR with an S2CR bypass only (GR0 page writes).
++ *   0323: =4 / =5 call TZ's MP_RESTORE_SEC_CFG for the LPASS SMMU first, then identity / bypass.
+  * 8 (0321): ADM COPP (null topology) on 0x1006 + ASM write stream (session 1, PCM v2), routed;
+  *   3 s of 1 kHz at -20 dBFS in 8 x 20 ms periods from the pool; M8 when the DSP wrote back at
+  *   least 100 periods. The DSP address is pa | 1 << 32 (taimenaudioaddr=0) or pa (=1).
++ * 7 (0323): the TAS2557 amps (bsd/dev/taimen_tas2557.c over taimen_i2c.c, BLSP2 QUP1): reset, program
++ *   0, configuration 0, calibration, ASI 24-bit, powered down; up with the bit clock (the tone,
++ *   sessions), down before it stops. The port runs S24_LE in 32-bit slots (3.072 MHz) as Android.
++ * 9 (0323, taimenaudio>=9): /dev/redwood-audio (the HackiOS ABI of tools/phone/RedwoodAudio) into a
++ *   32768-frame ring; the feeder opens the session (AFE port, ADM/ASM stream) when frames come,
++ *   refills each period the DSP returns, closes it after 3 s without frames; level cap
++ *   taimenaudiobelow (eighths of a dB, default 160) plus iOS's volume ioctl.
+  * 6 (0319): AFE quaternary MI2S RX (port 0x1006): pins 58-61 to qua_mi2s, the muxsel to I2S, the
+  *   QUAD_MI2S_IBIT clock at 1.536 MHz, I2S 16-bit stereo on SD1 at 48 kHz, DEVICE_START; then the
+  *   SCK and WS pins must toggle (TLMM IN bits). Stopped and restored again unless taimenaudio > 6.
+@@ -39,12 +47,21 @@
+ #include <pexpert/device_tree.h>
+ #include <sys/errno.h>
+ #include <sys/param.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" vm_map_address_t phystokv(uint64_t pa);
+ extern "C" bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
+ extern "C" void taimen_audio_init(void);
+ extern "C" bool sweet_gpu_ready(void);       /* bsd/dev/sweet_gpu.c */
++extern "C" {                                    /* bsd/dev/taimen_tas2557.c (stage 7) */
++bool taimen_tas2557_init(const uint8_t *fw, uint32_t fw_len, const uint8_t *cal, uint32_t cal_len, unsigned bit_width);
++bool taimen_tas2557_power(bool on);
++void taimen_tas2557_status(void);
++}
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -1929,7 +1946,7 @@ afe_clock(bool on)
+ 	m.p.param_size = sizeof(m.clk);
+ 	m.clk.minor = 1;
+ 	m.clk.clk_id = CLK_ID_QUAD_MI2S_IBIT;
+-	m.clk.freq = 48000 * 2 * 16;            /* 1.536 MHz: 16-bit stereo */
++	m.clk.freq = 48000 * 2 * 32;            /* 3.072 MHz: S24_LE in 32-bit slots, as Android */
+ 	m.clk.attri = CLK_ATTR_COUPLE_NO;
+ 	m.clk.root = 0;
+ 	m.clk.enable = on;
+@@ -1960,7 +1977,7 @@ stage6(void)
+ 	c.p.param_id = AFE_PARAM_ID_I2S_CONFIG;
+ 	c.p.param_size = sizeof(c.cfg);
+ 	c.cfg.minor = 1;
+-	c.cfg.bit_width = 16;
++	c.cfg.bit_width = 24;
+ 	c.cfg.channel_mode = 2;                 /* AFE_PORT_I2S_SD1 */
+ 	c.cfg.mono_stereo = 1;                  /* stereo */
+ 	c.cfg.ws_src = 1;                       /* internal */
+@@ -2147,7 +2164,7 @@ stage8(void)
+ 	ao.endpoint2 = 0xFFFF;
+ 	ao.topology = ADM_NULL_COPP_TOPOLOGY;
+ 	ao.channels = 2;
+-	ao.bit_width = 16;
++	ao.bit_width = 24;
+ 	ao.rate = 48000;
+ 	ao.map[0] = PCM_CHANNEL_FL;
+ 	ao.map[1] = PCM_CHANNEL_FR;
+@@ -2185,6 +2202,9 @@ stage8(void)
+ 	if (rc != 0) {
+ 		return false;
+ 	}
++	if (amps) {
++		(void)taimen_tas2557_power(true);
++	}
+ 	/* 3 s of tone, then silence until every period is back */
+ 	uint64_t t = now_ms();
+ 	unsigned next = 0, sent = 0;
+@@ -2214,6 +2234,10 @@ stage8(void)
+ 	LOG("t=%u.%03u 8: %s: %u periods sent, %u written back, %u underflows, %u still out (%llu ms)", T,
+ 	    writes_done >= 100 ? "M8 the stream ran" : "the stream did NOT run", sent, writes_done, underflows, periods_out,
+ 	    now_ms() - t);
++	if (amps) {
++		taimen_tas2557_status();
++		(void)taimen_tas2557_power(false);
++	}
+ 	apr_call("ASM CLOSE", APR_SVC_ASM, ASM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 1000);
+ 	apr_next_dst = copp_id;                 /* q6adm: src the AFE port, dest the COPP */
+ 	apr_call("ADM DEVICE_CLOSE_V5", APR_SVC_ADM, APR_PORT_QUAT_MI2S_RX, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 1000);
+@@ -2222,6 +2246,311 @@ stage8(void)
+ 	return writes_done >= 100;
+ }
+ 
++/* ---------------------------------------------------------------- stage 9: /dev/redwood-audio */
++
++/*
++ * The HackiOS ABI (tools/phone/RedwoodAudio, sys/redwood_audio.h there): write() whole frames of
++ * 48 kHz 16-bit stereo and never wait; ioctl _IOW('r', 1, {below, muted}) the volume, eighths of
++ * a dB under the loudest. The frames go into a 32768-frame ring (0.68 s); the audio thread's
++ * feeder opens the session (AFE port, ADM/ASM stream, amps) when frames come, refills each period
++ * the DSP gives back from the ring (silence for what is missing) and closes it after 3 s without
++ * frames. The level is capped by the boot-arg taimenaudiobelow (eighths of a dB, default 160:
++ * -20 dB) plus what iOS sets.
++ */
++#define RING_FRAMES             32768u          /* a power of two */
++#define QUIET_MS                3000
++
++struct redwood_audio_volume { uint32_t below, muted; };
++#define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
++
++static int16_t *ring;                   /* RING_FRAMES x 2 */
++static volatile uint32_t ring_w, ring_r;        /* frames, free-running */
++static IOLock *ring_lock;
++static volatile uint64_t last_frames_ms;
++static uint64_t frames_in, frames_dropped;
++static volatile uint32_t vol_below, vol_muted, vol_gen;
++static uint32_t gain_q16 = 65536, gain_gen = ~0u, cap_below = 160;
++
++static int
++ra_open(dev_t, int, int, struct proc *)
++{
++	return 0;
++}
++
++static int
++ra_close(dev_t, int, int, struct proc *)
++{
++	return 0;
++}
++
++static int
++ra_write(dev_t, struct uio *uio, int)
++{
++	int16_t buf[1024 * 2];
++
++	while (uio_resid(uio) >= 4) {
++		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(buf)) & ~3;
++		int err = uiomove((char *)buf, (int)n, uio);
++		if (err != 0) {
++			return err;
++		}
++		uint32_t frames = (uint32_t)(n / 4), took = 0;
++		IOLockLock(ring_lock);
++		uint32_t room = RING_FRAMES - (ring_w - ring_r);
++		took = MIN(frames, room);
++		for (uint32_t i = 0; i < took; i++) {
++			uint32_t at = (ring_w + i) & (RING_FRAMES - 1);
++			ring[2 * at] = buf[2 * i];
++			ring[2 * at + 1] = buf[2 * i + 1];
++		}
++		mb();
++		ring_w += took;
++		IOLockUnlock(ring_lock);
++		frames_in += took;
++		frames_dropped += frames - took;
++		last_frames_ms = now_ms();
++	}
++	return 0;
++}
++
++static int
++ra_ioctl(dev_t, u_long cmd, caddr_t data, int, struct proc *)
++{
++	if (cmd != REDWOOD_AUDIO_SET_VOLUME) {
++		return ENOTTY;
++	}
++	const struct redwood_audio_volume *v = (const struct redwood_audio_volume *)data;
++	vol_below = MIN(v->below, 8u * 120u);
++	vol_muted = v->muted != 0;
++	vol_gen++;
++	return 0;
++}
++
++static const struct cdevsw ra_cdevsw = {
++	.d_open = ra_open, .d_close = ra_close, .d_read = eno_rdwrt, .d_write = ra_write, .d_ioctl = ra_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++static bool
++audio_dev_init(void)
++{
++	ring = (int16_t *)IOMallocZero(RING_FRAMES * 4);
++	ring_lock = IOLockAlloc();
++	(void)PE_parse_boot_argn("taimenaudiobelow", &cap_below, sizeof(cap_below));
++	int major = ring != NULL && ring_lock != NULL ? cdevsw_add(-1, &ra_cdevsw) : -1;
++	if (major < 0) {
++		LOG("9: /dev/redwood-audio: no memory or no major");
++		return false;
++	}
++	void *node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio");
++	LOG("9: /dev/redwood-audio: %s (major %d, level cap %u/8 dB under the loudest)", node != NULL ? "ready" : "devfs failed",
++	    major, cap_below);
++	return node != NULL;
++}
++
++/* Q16 gain for the cap plus iOS's volume: 10^(-below/160), one 1/8 dB step at a time. */
++static void
++gain_update(void)
++{
++	if (gain_gen == vol_gen) {
++		return;
++	}
++	gain_gen = vol_gen;
++	uint32_t below = cap_below + vol_below;
++	uint64_t g = 65536;
++	for (uint32_t i = 0; i < below && g != 0; i++) {
++		g = (g * 64601u + 32768) >> 16;         /* 10^(-1/160) = 0.985712 */
++	}
++	gain_q16 = vol_muted ? 0 : (uint32_t)g;
++	LOG("t=%u.%03u 9: volume %u/8 dB under the loudest%s (cap %u): gain %u/65536", T, vol_below,
++	    vol_muted ? ", muted" : "", cap_below, gain_q16);
++}
++
++/* One period (PERIOD_FRAMES) from the ring into dst, silence for what is missing: frames taken. */
++static uint32_t
++ring_take(int16_t *dst)
++{
++	uint32_t avail = ring_w - ring_r, n = MIN(avail, (uint32_t)PERIOD_FRAMES);
++	mb();
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t at = (ring_r + i) & (RING_FRAMES - 1);
++		dst[2 * i] = (int16_t)(((int32_t)ring[2 * at] * (int32_t)gain_q16) >> 16);
++		dst[2 * i + 1] = (int16_t)(((int32_t)ring[2 * at + 1] * (int32_t)gain_q16) >> 16);
++	}
++	for (uint32_t i = n; i < PERIOD_FRAMES; i++) {
++		dst[2 * i] = dst[2 * i + 1] = 0;
++	}
++	mb();
++	ring_r += n;
++	return n;
++}
++
++/* ---------------------------------------------------------------- stage 9: the session and its feeder */
++
++/* The port: pins, muxsel, bit clock, I2S config, DEVICE_START (stage 6's sequence). */
++static bool
++afe_start(void)
++{
++	if (!pins_mi2s(true)) {
++		return false;
++	}
++	volatile uint32_t *mux = (volatile uint32_t *)ml_io_map(LPAIF_QUAD_MUXSEL_PA, 0x1000);
++	if (mux == NULL) {
++		return false;
++	}
++	*mux = 0;
++	mb();
++	struct afe_port_set_i2s c;
++	bzero(&c, sizeof(c));
++	c.port_id = APR_PORT_QUAT_MI2S_RX;
++	c.payload_size = sizeof(c.p) + sizeof(c.cfg);
++	c.p.module_id = AFE_MODULE_AUDIO_DEV_INTERFACE;
++	c.p.param_id = AFE_PARAM_ID_I2S_CONFIG;
++	c.p.param_size = sizeof(c.cfg);
++	c.cfg.minor = 1;
++	c.cfg.bit_width = 24;
++	c.cfg.channel_mode = 2;                 /* AFE_PORT_I2S_SD1 */
++	c.cfg.mono_stereo = 1;
++	c.cfg.ws_src = 1;
++	c.cfg.sample_rate = 48000;
++	uint16_t start[2] = { APR_PORT_QUAT_MI2S_RX, 0 };
++	return afe_clock(true) == 0 &&
++	       apr_call("AFE I2S config 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, &c, sizeof(c), 1000) == 0 &&
++	       apr_call("AFE DEVICE_START 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 1000) == 0;
++}
++
++static void
++afe_stop(void)
++{
++	uint16_t stop[2] = { APR_PORT_QUAT_MI2S_RX, 0 };
++	apr_call("AFE DEVICE_STOP 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 1000);
++	afe_clock(false);
++	pins_mi2s(false);
++}
++
++/* The DSP side (stage 8's sequence): map the periods, COPP, stream, routing, format, run. */
++static bool
++stream_open(void)
++{
++	if (periods == NULL) {
++		uint64_t pa = 0;
++		periods = (uint8_t *)pool_alloc((uint64_t)PERIODS * 0x1000, &pa);
++		if (periods == NULL) {
++			return false;
++		}
++		periods_pa = pa;
++	}
++	uint64_t a = dsp_addr(periods_pa);
++	struct asm_map_regions mr = { SHMEM8_4K_POOL, 1, 0, { (uint32_t)a, (uint32_t)(a >> 32), PERIODS * 0x1000 } };
++	if (apr_call("ASM map periods", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &mr, sizeof(mr), 1000) != 0 ||
++	    apr_wait_opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS || apr_wait_len < 4) {
++		return false;
++	}
++	asm_handle = apr_wait_payload[0];
++	struct adm_open_v5 ao;
++	bzero(&ao, sizeof(ao));
++	ao.mode = 1;
++	ao.endpoint1 = APR_PORT_QUAT_MI2S_RX;
++	ao.endpoint2 = 0xFFFF;
++	ao.topology = ADM_NULL_COPP_TOPOLOGY;
++	ao.channels = 2;
++	ao.bit_width = 24;
++	ao.rate = 48000;
++	ao.map[0] = PCM_CHANNEL_FL;
++	ao.map[1] = PCM_CHANNEL_FR;
++	(void)apr_call("ADM DEVICE_OPEN_V5 0x1006", APR_SVC_ADM, APR_PORT_QUAT_MI2S_RX, ADM_CMD_DEVICE_OPEN_V5, &ao, sizeof(ao), 1000);
++	if (apr_wait_opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || apr_wait_len < 8 || apr_wait_payload[0] != 0) {
++		return false;
++	}
++	copp_id = (uint16_t)apr_wait_payload[1];
++	struct asm_open_write_v3 ow = { 0, 0, 16, ASM_NULL_POPP_TOPOLOGY, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
++	struct adm_routing_v5 rt = { 0, 1, 1, 1, copp_id, 0 };
++	struct asm_fmt_update_v2 fu;
++	bzero(&fu, sizeof(fu));
++	fu.blk_size = sizeof(fu) - 4;
++	fu.channels = 2;
++	fu.bits = 16;
++	fu.rate = 48000;
++	fu.is_signed = 1;
++	fu.map[0] = PCM_CHANNEL_FL;
++	fu.map[1] = PCM_CHANNEL_FR;
++	uint32_t run[3] = { 0, 0, 0 };
++	return apr_call("ASM OPEN_WRITE_V3", APR_SVC_ASM, ASM_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, &ow, sizeof(ow), 1000) == 0 &&
++	       apr_call("ADM MATRIX_MAP_ROUTINGS_V5", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &rt, sizeof(rt), 1000) == 0 &&
++	       apr_call("ASM MEDIA_FMT_UPDATE_V2", APR_SVC_ASM, ASM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &fu, sizeof(fu), 1000) == 0 &&
++	       apr_call("ASM RUN_V2", APR_SVC_ASM, ASM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 1000) == 0;
++}
++
++static void
++stream_close(void)
++{
++	apr_call("ASM CLOSE", APR_SVC_ASM, ASM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 1000);
++	apr_next_dst = copp_id;
++	apr_call("ADM DEVICE_CLOSE_V5", APR_SVC_ADM, APR_PORT_QUAT_MI2S_RX, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 1000);
++	uint32_t um = asm_handle;
++	apr_call("ASM unmap periods", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &um, sizeof(um), 1000);
++}
++
++static bool sess_on, sess_failed, feeder_ok;
++static bool amps;                       /* stage 7 loaded the TAS2557 firmware */
++static uint32_t sess_seen_done, sess_next, sess_count, sess_underruns;
++static uint64_t sess_frames;
++
++/* The audio thread's feeder: open on frames, refill on write-done, close after QUIET_MS. */
++static void
++feeder_poll(void)
++{
++	if (ring == NULL) {
++		return;
++	}
++	gain_update();
++	uint32_t avail = ring_w - ring_r;
++	if (!sess_on) {
++		if (avail < PERIOD_FRAMES || sess_failed) {
++			return;
++		}
++		sess_count++;
++		LOG("t=%u.%03u 9: frames (%u in the ring): session %u opens", T, avail, sess_count);
++		if (!afe_start() || !stream_open()) {
++			LOG("t=%u.%03u 9: session %u did not open; the feeder stops", T, sess_count);
++			sess_failed = true;
++			afe_stop();
++			return;
++		}
++		if (amps) {
++			(void)taimen_tas2557_power(true);       /* the bit clock runs now */
++		}
++		sess_on = true;
++		sess_seen_done = writes_done;
++		sess_next = 0;
++		for (unsigned i = 0; i < PERIODS; i++) {
++			sess_frames += ring_take((int16_t *)(periods + (uint64_t)i * 0x1000));
++			period_send(i);
++		}
++		return;
++	}
++	while (writes_done != sess_seen_done) {
++		sess_seen_done++;
++		uint32_t got = ring_take((int16_t *)(periods + (uint64_t)sess_next * 0x1000));
++		sess_frames += got;
++		sess_underruns += got < PERIOD_FRAMES && now_ms() - last_frames_ms < 200;
++		period_send(sess_next);
++		sess_next = (sess_next + 1) % PERIODS;
++	}
++	if (now_ms() - last_frames_ms > QUIET_MS && ring_w == ring_r) {
++		if (amps) {
++			(void)taimen_tas2557_power(false);      /* amps down before the clock stops */
++		}
++		stream_close();
++		afe_stop();
++		sess_on = false;
++		LOG("t=%u.%03u 9: session %u closed: %llu frames played, %u short periods, %u DSP underflows; "
++		    "%llu frames in, %llu dropped", T, sess_count, sess_frames, sess_underruns, underflows, frames_in,
++		    frames_dropped);
++	}
++}
++
+ /* ---------------------------------------------------------------- the thread */
+ 
+ static void
+@@ -2230,6 +2559,10 @@ audio_thread(void *arg, wait_result_t)
+ 	int level = (int)(intptr_t)arg;
+ 	unsigned last_status = 0;
+ 	LOG("taimenaudio=%d", level);
++	/* the device first: mediaserverd's plug-in opens it when the HAL starts, long before the ADSP */
++	if (level >= 9) {
++		(void)audio_dev_init();
++	}
+ 	if (level >= 1 && !stage1()) {
+ 		return;
+ 	}
+@@ -2254,6 +2587,9 @@ audio_thread(void *arg, wait_result_t)
+ 		if (level >= 4) {
+ 			apr_poll();
+ 		}
++		if (feeder_ok) {
++			feeder_poll();
++		}
+ 		if (!m3 && glink_chan_up(ACHAN)) {
+ 			m3 = true;
+ 			LOG("t=%u.%03u 3: M3 APR channel up", T);
+@@ -2262,6 +2598,15 @@ audio_thread(void *arg, wait_result_t)
+ 			m4 = true;
+ 			LOG("t=%u.%03u 4: M4 ADSP core ready, service versions read", T);
+ 			bool m6 = level >= 6 && stage6();
++			if (level >= 7 && m6) {
++				const uint8_t *fw = NULL, *cal = NULL;
++				uint32_t fwn = 0, caln = 0;
++				if (blob("TAS-FW", &fw, &fwn)) {
++					(void)blob("TAS-CAL", &cal, &caln);
++					amps = taimen_tas2557_init(fw, fwn, cal, caln, 24);
++				}
++				LOG("t=%u.%03u 7: %s", T, amps ? "M7 TAS2557 amps loaded (powered down)" : "the amps did NOT load");
++			}
+ 			/* SMMU reads can hang an unclocked bus: on request, and after the AFE test */
+ 			int census = 0;
+ 			(void)PE_parse_boot_argn("taimenaudiosmmu", &census, sizeof(census));
+@@ -2275,7 +2620,18 @@ audio_thread(void *arg, wait_result_t)
+ 				}
+ 				LOG("t=%u.%03u 5: GPU %s after %llu ms; programming the SMMU (mode %d)", T,
+ 				    sweet_gpu_ready() ? "ready" : "NOT ready", now_ms() - tw, census);
+-				m5 = census == 3 ? lpass_smmu_bypass() : lpass_smmu_identity();
++				if (census >= 4) {
++					/*
++					 * downstream arm-smmu: an SMMU with qcom,tz-device-id ("LPASS": TZ device 2)
++					 * gets MP_RESTORE_SEC_CFG (SCM 0x0C/0x02) before HLOS programs it
++					 */
++					uint64_t r1 = 0, avail = 0;
++					uint64_t ra = scm(SCM_FN(6, 1), 1, 0x02000C02ull, 0, 0, &avail);
++					uint64_t r = scm(SCM_FN(0x0C, 0x02), 2, 2, 0, 0, &r1);
++					LOG("t=%u.%03u 5: is_call_avail(restore_sec_cfg) -> %lld/%llu; restore_sec_cfg(LPASS) -> %lld/%llu", T,
++					    (int64_t)ra, avail, (int64_t)r, r1);
++				}
++				m5 = (census == 3 || census == 5) ? lpass_smmu_bypass() : lpass_smmu_identity();
+ 			}
+ 			int addr = 0;
+ 			(void)PE_parse_boot_argn("taimenaudioaddr", &addr, sizeof(addr));
+@@ -2283,6 +2639,10 @@ audio_thread(void *arg, wait_result_t)
+ 				(void)stage8();
+ 				lpass_smmu_faults("after the stream");
+ 			}
++			feeder_ok = level >= 9 && m6 && (m5 || addr == 1);
++			if (level >= 9) {
++				LOG("t=%u.%03u 9: the feeder is %s", T, feeder_ok ? "on" : "OFF (no M6 or no SMMU stream)");
++			}
+ 			if (level > 6 && m6) {
+ 				uint16_t stop[2] = { APR_PORT_QUAT_MI2S_RX, 0 };
+ 				apr_call("AFE DEVICE_STOP 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 1000);
