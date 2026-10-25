@@ -1,0 +1,669 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e8f21e1..1e99569 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/taimen_touch.c			standard
+ bsd/dev/taimen_i2c.c			standard
+ bsd/dev/taimen_tas2557.c		standard
++bsd/dev/taimen_haptic.c			standard
+ bsd/dev/sailfish_wlan.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 4e355cf..4a156d6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -58,6 +58,7 @@ extern void taimen_touch_init(void);
+ extern void sailfish_wlan_init(void);
+ extern void taimen_modem_init(void);    /* iokit/Kernel/arm/TaimenModem.cpp */
+ extern void taimen_audio_init(void);    /* iokit/Kernel/arm/TaimenAudio.cpp */
++extern void taimen_haptic_init(void);   /* bsd/dev/taimen_haptic.c */
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -757,6 +758,8 @@ sweet_ufs_init(void)
+ 	taimen_touch_init();
+ 	/* the SPMI arbiter for PMIC reads, and the keys with sweetkeys=1 (0225) */
+ 	sweet_keys_init();
++	/* the motor: DRV2624 on BLSP1 QUP6, iOS's haptics from /dev/redwood-haptic (0328, taimenhaptic=N) */
++	taimen_haptic_init();
+ 	/* and the perf probe without its MSM8996 clock code (0222; boot-arg sweetperf=1) */
+ 	sweet_perf_init();
+ 	/* the Adreno 540 bring-up with sweetgpu=N (0230: power-up and the CP, N <= 2) */
+diff --git a/bsd/dev/taimen_haptic.c b/bsd/dev/taimen_haptic.c
+new file mode 100644
+index 0000000..29e6f4b
+--- /dev/null
++++ b/bsd/dev/taimen_haptic.c
+@@ -0,0 +1,630 @@
++/*
++ * Pixel 2 XL (taimen) vibration motor, for iOS's haptics (/dev/redwood-haptic).
++ *
++ * The motor (an LRA) hangs on a TI DRV2624 at I2C 0x5a on BLSP1 QUP6, not on the PMI8998 haptics
++ * block: this phone's DT has drv2624@5a "ok" (research/taimen/live.dts:14915-14933) and
++ * qcom,haptic@c000 on pmi8998@3 "disabled" (live.dts:1751-1752); Android here probes "drv2624
++ * 6-005a ... ID status (0x3) ... LRA = 155, drive_time=0x1b" and starts vendor.vibrator.drv2624
++ * (hw/dmesg.txt:687-695). The PMI8998 block (SID 3, peripheral 0xc0) is only read, never written.
++ *   chip     registers: wahoo drivers/input/misc/drv2624.h; sequence: its drv2624.c
++ *            (dev_init_platform_data, set_go_bit / poll_go_bit_stop, the probe's reset and ID check)
++ *   I2C      taimen_i2c.c, 400 kHz from XO; SDA 43 / SCL 44, EAST tile, blsp_i2c6 = 3, 2 mA, no
++ *            pull (live.dts:9105-9116; pinctrl-msm8998.c PINGROUP 43/44); GCC BLSP1 AHB vote
++ *            0x152004 bit 17, CBCR 0x117004; QUP6 I2C CBCR 0x123008, RCGR 0x123020 (hwio-8998.h)
++ *   reset    NRST = TLMM GPIO 95, EAST tile 0x3d5f000, high = on (Android: low, 1-2 ms, high,
++ *            1-2 ms). Low = the chip shut down: the motor surely off.
++ *   play     RTP mode: RTP_INPUT 0x0e (signed, 0x7f full scale), GO 0x0c bit 0 on; off = GO 0, then
++ *            GO polled until the chip has braked and cleared it. Taps open loop (overdrive, as
++ *            Android plays short effects), vibrations closed loop (auto-resonance).
++ *
++ * boot-arg taimenhaptic=N (default 3): 0 nothing; 1 the PMI8998 block's and the DRV2624's registers
++ * read (NRST released only if held), then the chip into reset; 2 ... and configured as Android
++ * (every write read back), then into reset; 3 ... and /dev/redwood-haptic (0666) with the player;
++ * 4 ... and one 30 ms buzz before the player.
++ *
++ * The player is one kernel thread; write() only notes when samples were loud or silent, never
++ * waits. The RedwoodAudio plug-in writes iOS's "Actuator" stream there (16-bit signed mono, 48 kHz,
++ * every I/O cycle, silence too). A loud write (peak > SILENT_BELOW) after a silent one or a pause of
++ * ACTIVE_US begins a burst: a tap of TAP_MS. A burst with no silent write for LONG_AFTER_US is a
++ * vibration, on while loud writes keep coming. Limits: a heat budget counts on-time up, off-time
++ * down 1:1; at MAX_ON_US the motor stops and rests until it is 0 (never on for more than 1 s, at
++ * least as long off after). STATUS after every stop and every CHECK_US while on: over-current,
++ * over-temperature, under-voltage, or an I2C failure (after a retry), a write that does not read
++ * back, a GO that does not clear: the chip into reset for the rest of the run.
++ * taimen_haptic_off() (shutdown; any context: no lock, no I2C) drives NRST low.
++ */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++
++/* As in taimen_i2c.c (.size guards the copies). */
++#define TAIMEN_I2C_PINS 4
++struct taimen_i2c_pin {
++	uint32_t pa;
++	uint8_t gpio, func, ma, pull;
++};
++struct taimen_i2c {
++	uint32_t size;
++	const char *name;
++	uint32_t qup_pa, vote_pa, vote_bit, ahb_cbcr_pa, cbcr_pa, rcgr_pa, clk_ctl;
++	unsigned npins;
++	struct taimen_i2c_pin pin[TAIMEN_I2C_PINS];
++	vm_offset_t qup, vote, ahb, cbcr, rcgr, tlmm[TAIMEN_I2C_PINS];
++	unsigned tx_max, rx_max;
++	uint32_t last_status, last_flags, last_op;
++	bool ready;
++};
++extern bool taimen_i2c_init(struct taimen_i2c *b);
++extern int taimen_i2c_write(struct taimen_i2c *b, uint8_t addr7, const uint8_t *buf, unsigned len);
++extern int taimen_i2c_write_read(struct taimen_i2c *b, uint8_t addr7, const uint8_t *cmd, unsigned ncmd,
++    uint8_t *buf, unsigned len);
++void taimen_haptic_init(void);
++void taimen_haptic_off(void);
++
++#define LOG(fmt, ...)           printf("TAIMEN HAPTIC: " fmt "\n", ##__VA_ARGS__)
++
++/* i2c@c17a000 (live.dts:14895-14934) */
++static struct taimen_i2c hap_bus = {
++	.size = sizeof(struct taimen_i2c), .name = "blsp1 qup6", .qup_pa = 0x0c17a000u,
++	.vote_pa = 0x00152004u, .vote_bit = 17,         /* APCS_CLOCK_BRANCH_ENA_VOTE: BLSP1 AHB */
++	.ahb_cbcr_pa = 0x00117004u,                     /* BLSP1_AHB_CBCR */
++	.cbcr_pa = 0x00123008u, .rcgr_pa = 0x00123020u, /* BLSP1_QUP6_I2C_APPS_CBCR, its CMD/CFG RCGR */
++	.clk_ctl = (14u << 16) | (3u << 8) | 28u,       /* 400 kHz from 19.2 MHz, as taimen_tas2557.c */
++	.npins = 2,
++	.pin = {{0x03d2b000u, 43, 3, 2, 0}, {0x03d2c000u, 44, 3, 2, 0}},
++};
++
++#define HAP_ADDR                0x5au
++#define HAP_NRST_PA             0x03d5f000u     /* TLMM GPIO 95: CFG +0, IN_OUT +4 (bit 0 in, 1 out) */
++#define HAP_NRST_GPIO           95u
++#define TLMM_OE                 (1u << 9)       /* CFG: OE, function 0 (GPIO), 2 mA, no pull */
++#define HAP_PMI_PPID            0x3c0u          /* PMI8998 SID 3, peripheral 0xc0: qcom,haptic@c000 */
++
++enum {  /* drv2624.h */
++	R_ID = 0x00, R_STATUS = 0x01, R_INT_MASK = 0x02, R_DIAG_Z = 0x03, R_LRA_PER_H = 0x05,
++	R_LRA_PER_L = 0x06, R_MODE = 0x07, R_CONTROL1 = 0x08, R_GO = 0x0c, R_CONTROL2 = 0x0d,
++	R_RTP = 0x0e, R_RATED = 0x1f, R_OD_CLAMP = 0x20, R_CAL_COMP = 0x21, R_CAL_BEMF = 0x22,
++	R_LOOP_CTL = 0x23, R_DRIVE_TIME = 0x27, R_BLK_IDISS = 0x28, R_ZC_OD = 0x29,
++	R_LRA_OL_CTRL = 0x2c, R_OL_PER_H = 0x2e, R_OL_PER_L = 0x2f, R_DIAG_K = 0x30,
++};
++#define ST_FAULTS               0x07u           /* STATUS: UVLO 2, over-temperature 1, over-current 0 */
++#define ST_PRG_ERR              0x10u
++#define CTL1_OPEN_LOOP          0x40u           /* CONTROL1 bit 6 (LOOP_MASK): 1 open loop */
++#define RTP_FULL                0x7fu
++
++/* {register, mask, value}: dev_init_platform_data's order, live.dts:14919-14932's values */
++struct hap_set {
++	uint8_t reg, mask, val;
++};
++static const struct hap_set hap_config[] = {
++	{R_MODE, 0x0f, 0x08},           /* TRIG/INTZ pin = interrupt out (PINFUNC_INT 2 << 2); mode RTP 0 */
++	{R_CONTROL1, 0xd0, 0x90},       /* LRA (ti,actuator 1) bit 7, closed loop (ti,smart-loop 0), AUTOBRK_OK */
++	{R_RATED, 0xff, 0x4d},          /* ti,rated-voltage */
++	{R_OD_CLAMP, 0xff, 0xa5},       /* ti,odclamp-voltage */
++	{R_DRIVE_TIME, 0x9f, 0x1b},     /* 5 * (1000 - 155) / 155 = 27; 155 Hz >= 125: MINFREQ_SEL 0 */
++	{R_OL_PER_H, 0x03, 0x01},       /* 1e9 / (24619 * 155) = 262 = 0x106 (ti,ol-lra-frequency 155) */
++	{R_OL_PER_L, 0xff, 0x06},
++	{R_LRA_OL_CTRL, 0x01, 0x00},    /* ti,lra-wave-shape 0 */
++	{R_CAL_COMP, 0xff, 0x09},       /* ti,voltage-comp */
++	{R_CAL_BEMF, 0xff, 0xbc},       /* ti,bemf-factor */
++	{R_LOOP_CTL, 0x03, 0x01},       /* ti,bemf-gain */
++	{R_BLK_IDISS, 0xff, 0x22},      /* ti,blanking-time 2 << 4, ti,idiss-time 2 */
++	{R_ZC_OD, 0x03, 0x00},          /* ti,zc-det-time 0 */
++	{R_CONTROL2, 0x20, 0x20},       /* ti,waveform-interval 1 (the sequencer only) */
++	{R_INT_MASK, 0x1f, 0x1f},       /* all masked, as Android between plays (no INT line in the DT) */
++	{R_RTP, 0xff, RTP_FULL},
++};
++static const uint8_t hap_census_regs[] = {
++	R_ID, R_STATUS, R_INT_MASK, R_DIAG_Z, R_LRA_PER_H, R_LRA_PER_L, R_MODE, R_CONTROL1, R_GO,
++	R_CONTROL2, R_RTP, R_RATED, R_OD_CLAMP, R_CAL_COMP, R_CAL_BEMF, R_LOOP_CTL, R_DRIVE_TIME,
++	R_BLK_IDISS, R_ZC_OD, R_LRA_OL_CTRL, R_OL_PER_H, R_OL_PER_L, R_DIAG_K,
++};
++/* qpnp-haptic.c:36-59 (REVISION 00/01, TYPE 04/05, STATUS 0a, EN_CTL 46, CFG1 4c, SEL 4e, VMAX 51, ...) */
++static const uint8_t hap_pmi_regs[] = {
++	0x00, 0x01, 0x04, 0x05, 0x0a, 0x46, 0x4b, 0x4c, 0x4e, 0x4f, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x5c, 0x70,
++};
++
++#define SILENT_BELOW            256u            /* of 32768: a write peaking no higher is silence */
++#define ACTIVE_US               30000ull        /* a loud write counts for this long */
++#define LONG_AFTER_US           60000ull        /* a burst without a silent write this long: a vibration */
++#define MAX_ON_US               1000000ull      /* the heat budget */
++#define HEAT_MARGIN_US          10000ull        /* a poll period and a stop's braking, under the budget */
++#define HEAT_ROOM(us)           (heat_us + (us) + HEAT_MARGIN_US <= MAX_ON_US)
++#define CHECK_US                50000ull        /* STATUS while on */
++#define TAP_MS                  25u
++#define TEST_MS                 30u
++#define POLL_MS                 4u
++#define IDLE_POLL_MS            20u
++#define GO_POLL_MS              2u
++#define GO_POLL_TRIES           50u             /* 100 ms (Android: 11 reads 8-10 ms apart) */
++#define TOLD                    16u             /* the first so many taps and vibrations are logged */
++
++static int hap_level = 3;
++static bool hap_started;
++static volatile vm_offset_t hap_nrst;
++static volatile bool hap_broken, hap_stopped;
++static bool hap_on;                             /* GO set (or the chip still braking) */
++static uint8_t hap_ctl1 = 0x90;                 /* CONTROL1 as configured: closed loop */
++static uint64_t heat_us, heat_at;
++static unsigned taps, longs, capped, skipped;
++static int hap_chan;
++static volatile uint64_t heard_us, quiet_us, onset_us, written_frames;
++static volatile uint32_t heard_peak;
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++static void
++hap_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hap_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* NRST: the level first, then the output enabled (no glitch to the other level). */
++static void
++nrst_set(bool high)
++{
++	vm_offset_t g = hap_nrst;
++	if (g == 0 || (high && hap_stopped)) {
++		return;
++	}
++	*(volatile uint32_t *)(g + 4) = high ? 2u : 0u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)g = TLMM_OE;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Faults and failures end the run: the chip into reset, the motor off for good. */
++static void
++hap_give_up(const char *why)
++{
++	if (!hap_broken && !hap_stopped) {
++		LOG("%s: the chip goes into reset (gpio%u low); the motor stays off for the rest of the run", why,
++		    HAP_NRST_GPIO);
++	}
++	hap_broken = true;
++	hap_on = false;
++	nrst_set(false);
++}
++
++/* One register: read into *out, or (out NULL) written with val; retried once, then the run ends. */
++static bool
++hap_reg(uint8_t reg, uint8_t *out, uint8_t val)
++{
++	uint8_t b[2] = {reg, val};
++	int err = EIO;
++	for (unsigned t = 0; t < 2 && err != 0 && !hap_broken; t++) {
++		err = out != NULL ? taimen_i2c_write_read(&hap_bus, HAP_ADDR, b, 1, out, 1) :
++		    taimen_i2c_write(&hap_bus, HAP_ADDR, b, 2);
++	}
++	if (err != 0 && !hap_broken && !hap_stopped) {
++		LOG("I2C %s of 0x%02x failed twice (%d; QUP i2c status %#x flags %#x op %#x)", out != NULL ? "read" :
++		    "write", reg, err, hap_bus.last_status, hap_bus.last_flags, hap_bus.last_op);
++	}
++	if (err != 0) {
++		hap_give_up("I2C failure");
++	}
++	return err == 0;
++}
++#define hap_get(r, p)           hap_reg((r), (p), 0)
++#define hap_put(r, v)           hap_reg((r), NULL, (v))
++
++/* On-time counts the budget up, off-time down, 1:1. */
++static void
++heat_update(uint64_t now)
++{
++	uint64_t d = now - heat_at;
++	heat_at = now;
++	heat_us = hap_on ? heat_us + d : (heat_us > d ? heat_us - d : 0);
++}
++
++static bool
++hap_status_ok(const char *when)
++{
++	static unsigned prg_told;
++	uint8_t st = 0;
++	if (!hap_get(R_STATUS, &st)) {
++		return false;
++	}
++	if (st & ST_FAULTS) {
++		LOG("STATUS %#04x %s:%s%s%s", st, when, (st & 1u) ? " OVER-CURRENT" : "", (st & 2u) ? " OVER-TEMPERATURE" : "",
++		    (st & 4u) ? " UNDER-VOLTAGE" : "");
++		hap_give_up("a fault");
++		return false;
++	}
++	if ((st & ST_PRG_ERR) && prg_told++ < 4) {
++		LOG("STATUS %#04x %s: PRG_ERROR (the sequencer's), ignored", st, when);
++	}
++	return true;
++}
++
++static bool
++hap_go(bool on)
++{
++	uint8_t go = 1;
++	heat_update(now_us());
++	if (!hap_put(R_GO, on ? 1 : 0)) {
++		return false;
++	}
++	if (on) {
++		hap_on = true;
++		return true;
++	}
++	for (unsigned i = 0; i < GO_POLL_TRIES; i++) {
++		if (!hap_get(R_GO, &go)) {
++			return false;
++		}
++		if (!(go & 1u)) {
++			heat_update(now_us());
++			hap_on = false;
++			return hap_status_ok("after a stop");
++		}
++		delay((int)GO_POLL_MS * 1000);
++	}
++	hap_give_up("GO does not clear");
++	return false;
++}
++
++static bool
++hap_start(bool open_loop, uint8_t rtp)
++{
++	uint8_t ctl1 = open_loop ? (uint8_t)(hap_ctl1 | CTL1_OPEN_LOOP) : (uint8_t)(hap_ctl1 & ~CTL1_OPEN_LOOP);
++	return !hap_broken && !hap_stopped && hap_put(R_CONTROL1, ctl1) && hap_put(R_RTP, rtp) && hap_go(true);
++}
++
++/* A tap: open loop for ms (this thread sleeps; nothing else waits), then stopped and braked. */
++static bool
++hap_pulse(unsigned ms, uint8_t rtp)
++{
++	if (!hap_start(true, rtp)) {
++		return false;
++	}
++	delay((int)ms * 1000);
++	return hap_go(false);
++}
++
++/* Android's full scale from a third of iOS's full scale up, 5/8 of it at the softest (redwood_haptic.c). */
++static uint8_t
++rtp_for(uint32_t peak)
++{
++	const uint32_t third = 32767u / 3u, low = 80u;
++	return (uint8_t)(peak >= third ? RTP_FULL : low + (RTP_FULL - low) * peak / third);
++}
++
++/* ---- the registers: looked at, configured ---------------------------------------------------- */
++
++static void
++hap_pmi_census(void)
++{
++	char line[160];
++	size_t n = 0;
++	uint8_t v = 0;
++	line[0] = 0;
++	for (unsigned i = 0; i < sizeof(hap_pmi_regs) && n < sizeof(line); i++) {
++		if (!sweet_pmic_read(HAP_PMI_PPID, hap_pmi_regs[i], &v)) {
++			LOG("PMI8998 haptics (SPMI ppid %#x): register 0x%02x not readable (sweet_keys_init not run, or no "
++			    "APID): census stopped", HAP_PMI_PPID, hap_pmi_regs[i]);
++			return;
++		}
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " %02x=%02x", hap_pmi_regs[i], v);
++	}
++	LOG("PMI8998 haptics, SPMI ppid %#x (0xc000 of SID 3; disabled in the DT: read only):%s", HAP_PMI_PPID, line);
++}
++
++static bool
++hap_census(const char *when)
++{
++	char line[200];
++	size_t n = 0;
++	uint8_t v = 0;
++	line[0] = 0;
++	for (unsigned i = 0; i < sizeof(hap_census_regs) && n < sizeof(line); i++) {
++		if (!hap_get(hap_census_regs[i], &v)) {
++			return false;
++		}
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " %02x=%02x", hap_census_regs[i], v);
++	}
++	LOG("DRV2624 %s:%s", when, line);
++	return true;
++}
++
++static bool
++hap_configure(void)
++{
++	char line[220];
++	size_t n = 0;
++	uint8_t was = 0, now = 0, want, st0 = 0, st1 = 0;
++	line[0] = 0;
++	if (!hap_put(R_GO, 0)) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(hap_config) / sizeof(hap_config[0]); i++) {
++		const struct hap_set *s = &hap_config[i];
++		if (!hap_get(s->reg, &was)) {
++			return false;
++		}
++		want = (uint8_t)((was & ~s->mask) | s->val);
++		if ((want != was && !hap_put(s->reg, want)) || !hap_get(s->reg, &now)) {
++			return false;
++		}
++		if ((now & s->mask) != s->val) {
++			LOG("0x%02x: %#04x written over %#04x, %#04x read back", s->reg, want, was, now);
++			hap_give_up("a write does not read back");
++			return false;
++		}
++		if (s->reg == R_CONTROL1) {
++			hap_ctl1 = now;
++		}
++		if (n < sizeof(line)) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %02x:%02x>%02x", s->reg, was, now);
++		}
++	}
++	LOG("configured as Android (register:was>now):%s", line);
++	/* flags latched before go with the first read; the second must be clean */
++	if (!hap_get(R_STATUS, &st0) || !hap_get(R_STATUS, &st1)) {
++		return false;
++	}
++	LOG("STATUS %#04x, then %#04x", st0, st1);
++	if (st1 & ST_FAULTS) {
++		hap_give_up("a fault right after the configuration");
++		return false;
++	}
++	return true;
++}
++
++/* ---- /dev/redwood-haptic --------------------------------------------------------------------- */
++
++static int
++hap_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++/* From the audio server's I/O thread: notes when the samples were loud or silent; never waits. */
++static int
++hap_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t s[256];
++	uint32_t peak = 0;
++	uint64_t frames = 0, now;
++	int err = 0;
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(s)) & ~(user_ssize_t)1;
++		if ((err = uiomove((const char *)s, (int)n, uio)) != 0) {
++			break;
++		}
++		for (unsigned i = 0; i < (unsigned)(n / 2); i++) {
++			peak = MAX(peak, s[i] < 0 ? (uint32_t)(-(int32_t)s[i]) : (uint32_t)s[i]);
++		}
++		frames += (uint64_t)(n / 2);
++	}
++	if (frames == 0) {
++		return err;
++	}
++	now = now_us();
++	written_frames += frames;
++	if (peak <= SILENT_BELOW) {
++		quiet_us = now;
++		return err;
++	}
++	bool onset = heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US;
++	if (onset) {
++		heard_peak = 0;
++		onset_us = now;
++	}
++	heard_us = now;
++	heard_peak = MAX(heard_peak, peak);
++	if (onset) {
++		thread_wakeup(&hap_chan);
++	}
++	return err;
++}
++
++static const struct cdevsw hap_cdevsw = {
++	.d_open = hap_open, .d_close = hap_open, .d_read = eno_rdwrt, .d_write = hap_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
++	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++static bool
++hap_dev_init(void)
++{
++	int major = cdevsw_add(-1, &hap_cdevsw);
++	void *node = major < 0 ? NULL :
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
++	LOG("/dev/redwood-haptic: %s (major %d)", node != NULL ? "ready" : "cdevsw_add or devfs failed", major);
++	return node != NULL;
++}
++
++/* ---- the player ------------------------------------------------------------------------------ */
++
++static void
++hap_serve(void)
++{
++	enum { IDLE, TAP, LONG, REST } st = IDLE;
++	uint64_t since = 0, played = 0, checked = 0;
++	LOG("the motor plays iOS's Actuator stream: taps %u ms open loop, vibrations closed loop, at most %llu ms on "
++	    "(then as long off)", TAP_MS, MAX_ON_US / 1000);
++	while (!hap_broken && !hap_stopped) {
++		uint64_t now = now_us(), onset = onset_us;
++		uint32_t peak = heard_peak;
++		heat_update(now);
++		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
++		bool goes_on = active && quiet_us < onset && now - onset >= LONG_AFTER_US;
++		switch (st) {
++		case IDLE:
++			if (!active) {
++				break;
++			}
++			if (onset == played) {
++				/* the burst a rest (or a skipped tap) cut is still going on: a vibration again */
++				if (goes_on && heat_us == 0 && hap_start(false, rtp_for(peak))) {
++					st = LONG;
++					since = checked = now;
++				}
++				break;
++			}
++			played = onset;
++			if (!HEAT_ROOM(TAP_MS * 1000ull)) {
++				skipped++;
++			} else if (hap_pulse(TAP_MS, rtp_for(peak))) {
++				st = TAP;
++				if (++taps <= TOLD) {
++					LOG("tap %u: peak %u of 32768: RTP %#04x for %u ms", taps, peak, rtp_for(peak), TAP_MS);
++				}
++			}
++			break;
++		case TAP:
++			if (onset != played || !active) {
++				st = IDLE;      /* over, or a new burst: a tap of its own */
++				continue;
++			}
++			if (goes_on && HEAT_ROOM(0) && hap_start(false, rtp_for(peak))) {
++				st = LONG;
++				since = checked = now;
++				if (++longs <= TOLD) {
++					LOG("vibration %u: the burst goes on (peak %u): closed loop at RTP %#04x", longs, peak,
++					    rtp_for(peak));
++				}
++			}
++			break;
++		case LONG:
++			played = onset;         /* onsets inside a vibration are part of it */
++			if (!HEAT_ROOM(0) || !active) {
++				bool cut = !HEAT_ROOM(0);
++				uint8_t h = 0, l = 0;
++				if (!hap_go(false)) {
++					break;
++				}
++				if (longs <= TOLD && hap_get(R_LRA_PER_H, &h) && hap_get(R_LRA_PER_L, &l)) {
++					unsigned per = ((h & 3u) << 8) | l;
++					LOG("vibration %u: %s after %llu ms; LRA period %u (~%u Hz)", longs,
++					    cut ? "CUT at the limit, resting" : "stopped with iOS", (now - since) / 1000, per,
++					    per ? 40619u / per : 0u);
++				}
++				capped += cut ? 1u : 0u;
++				st = cut ? REST : IDLE;
++			} else if (now - checked >= CHECK_US) {
++				checked = now;
++				(void)hap_status_ok("while on");
++			}
++			break;
++		case REST:
++			st = heat_us == 0 ? IDLE : REST;
++			break;
++		default:
++			break;
++		}
++		hap_wait(st == IDLE && !active ? IDLE_POLL_MS : POLL_MS);
++	}
++	LOG("player ended (%s): %u taps, %u vibrations (%u cut at the limit), %u taps skipped by the budget, %llu frames "
++	    "written", hap_stopped ? "taimen_haptic_off" : "a fault", taps, longs, capped, skipped, written_frames);
++}
++
++static void
++hap_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static const char *const what[] = {"", "registers read", "configured, then reset", "configured and played",
++		                           "configured, one 30 ms buzz, played"};
++	uint8_t id = 0;
++	uint32_t cfg, io;
++	bool held;
++	LOG("taimenhaptic=%d: %s (TI DRV2624 at %#x on %s; NRST gpio%u)", hap_level, what[hap_level], HAP_ADDR,
++	    hap_bus.name, HAP_NRST_GPIO);
++	hap_pmi_census();
++	hap_nrst = ml_io_map(HAP_NRST_PA, 0x1000);
++	if (hap_nrst == 0 || !taimen_i2c_init(&hap_bus)) {
++		LOG("no mapping for gpio%u or no I2C bus: nothing done", HAP_NRST_GPIO);
++		goto out;
++	}
++	cfg = *(volatile uint32_t *)hap_nrst;
++	io = *(volatile uint32_t *)(hap_nrst + 4);
++	held = !((cfg & TLMM_OE) && (io & 2u));
++	LOG("NRST gpio%u: cfg %#x in/out %#x: the chip %s", HAP_NRST_GPIO, cfg, io,
++	    held ? "is held in reset (or the pin is an input)" : "runs");
++	if (hap_level >= 2 || held) {
++		nrst_set(false);        /* as Android's probe: low 1-2 ms, high, 1-2 ms (t_on 1 ms) */
++		delay(2000);
++		nrst_set(true);
++		delay(2000);
++	}
++	if (hap_stopped || !hap_get(R_ID, &id)) {
++		LOG("the DRV2624 does not answer at %#x", HAP_ADDR);
++		goto out;
++	}
++	if ((id & 0xf0u) != 0) {
++		LOG("ID %#04x: not a DRV2624 (CHIPID 0; Android read 0x03): nothing written", id);
++		goto out;
++	}
++	if (!hap_census("as found") || hap_level == 1 || !hap_configure() || !hap_census("configured") ||
++	    hap_level == 2) {
++		goto out;
++	}
++	heat_at = now_us();
++	if (hap_level >= 4) {
++		LOG("test buzz: %u ms open loop at RTP %#04x: %s", TEST_MS, RTP_FULL, hap_pulse(TEST_MS, RTP_FULL) ?
++		    "done, braked, STATUS clean" : "FAILED");
++	}
++	if (!hap_broken && !hap_stopped && hap_dev_init()) {
++		hap_serve();
++	}
++out:
++	hap_on = false;
++	nrst_set(false);
++	LOG("done: the chip is held in reset (gpio%u low), the motor is off", HAP_NRST_GPIO);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++taimen_haptic_init(void)
++{
++	thread_t thread;
++	if (hap_started) {
++		return;
++	}
++	hap_started = true;
++	(void)PE_parse_boot_argn("taimenhaptic", &hap_level, sizeof(hap_level));
++	if (hap_level <= 0) {
++		LOG("off (taimenhaptic=0)");
++		return;
++	}
++	hap_level = MIN(hap_level, 4);
++	kern_return_t kr = kernel_thread_start(hap_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		LOG("kernel_thread_start failed %d", kr);
++	}
++}
++
++/* Shutdown, or any other context (no lock, no I2C): the chip into reset, so the motor stops. */
++void
++taimen_haptic_off(void)
++{
++	hap_stopped = true;
++	nrst_set(false);
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
