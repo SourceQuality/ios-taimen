@@ -998,3 +998,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   connections onto them; netsvcd status on 5143 (usbproxy.py --status). 0303 logs the first off-link packets
   (proof of the default route). 0304: remote control on TCP 5144 (tools/taimen/phonectl.py tap / swipe /
   unlock / shot OUT.png at 1125x2436 from the last swapped surface).
+- 2026-10-24 **boot 135 (r123 = +0263-0304, netsvcd v3, 900 s): iOS is online through the PC, no admin rights.**
+  netsvcd published ue0 4 s after the PC agent connected: State:/Network/Global/IPv4 PrimaryInterface ue0,
+  router 192.168.7.1, global DNS 1.1.1.1/8.8.8.8 and the global proxy 127.0.0.1:8080 (read back on port 5143).
+  Within a minute iOS's daemons went through usbproxy.py: iCloud gateway, iTunes bag, OCSP, Siri, weather,
+  maps (gspe21-ssl.ls), configuration.apple.com, mesu, amp-api (Music/TV widgets): 317 requests, 2 failed
+  (no DNS for internal Apple names), 73 MB down in 7 minutes. The remote control drove the UI from WSL
+  (tools/taimen/phonectl.py): unlock, home screen, Safari, tap Google. **Safari loads google.com** (lock, the
+  URL, the page's white theme colour in the status bar; CONNECT www.google.com, gstatic, fonts) **but the
+  content area stays black** (as on the Pixel 4 port), two minutes later too; no WebKit crash, the GPU process
+  runs (first IOSurface selector 44). The App Store shows its welcome and ads sheets, then "Cannot Connect to
+  App Store" (fairplayd is removed from launchd). Screenshots: 11 MB in 10-26 s (~1 MB/s: 0305 polls faster).
