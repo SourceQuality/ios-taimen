@@ -1,0 +1,437 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 876a53b..c7a0a0a 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -14,6 +14,10 @@
+  * 4 (0318): the AVCS core says ready (AVCS_CMD_ADSP_EVENT_GET_STATE = 1); its service versions.
+  * 5 (0319, with taimenaudiosmmu=1): the LPASS SMMU powered and clocked (GDSC and clock votes), what
+  *   ABL/TZ left for stream 1 (read only so far: the shared buffer comes with stage 8).
++ * 5 mode A (0321, taimenaudiosmmu=2): stream 1 through an identity context bank of the LPASS SMMU.
++ * 8 (0321): ADM COPP (null topology) on 0x1006 + ASM write stream (session 1, PCM v2), routed;
++ *   3 s of 1 kHz at -20 dBFS in 8 x 20 ms periods from the pool; M8 when the DSP wrote back at
++ *   least 100 periods. The DSP address is pa | 1 << 32 (taimenaudioaddr=0) or pa (=1).
+  * 6 (0319): AFE quaternary MI2S RX (port 0x1006): pins 58-61 to qua_mi2s, the muxsel to I2S, the
+  *   QUAD_MI2S_IBIT clock at 1.536 MHz, I2S 16-bit stereo on SD1 at 48 kHz, DEVICE_START; then the
+  *   SCK and WS pins must toggle (TLMM IN bits). Stopped and restored again unless taimenaudio > 6.
+@@ -639,7 +643,7 @@ stage2(void)
+ 		LOG("2: SMP2P out (item %u) failed", ITEM_SMP2P_OUT);
+ 		return false;
+ 	}
+-	uint64_t t0 = now_ms();
++	uint64_t tstart = now_ms();
+ 	if (!pas_boot()) {
+ 		return false;
+ 	}
+@@ -678,7 +682,7 @@ stage2(void)
+ 		return false;
+ 	}
+ 	LOG("2: M2 ADSP READY %llu ms after AUTH_AND_RESET (%llu ms from the first SCM call)", now_ms() - t1,
+-	    now_ms() - t0);
++	    now_ms() - tstart);
+ 	return true;
+ }
+ 
+@@ -1498,6 +1502,7 @@ struct apr_hdr {
+ } __attribute__((packed));
+ 
+ static uint32_t apr_token = 1, apr_rx_pkts, apr_tx_pkts;
++static int apr_next_dst = -1;           /* the next packet's destination port, if not its source */
+ static int adsp_core_state = -1;        /* AVCS state: 1 = ready */
+ static bool apr_versions_done;
+ static unsigned apr_last_ask, apr_asks;
+@@ -1517,7 +1522,8 @@ apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint3
+ 	h->src_port = port;
+ 	h->dest_svc = svc;
+ 	h->dest_domain = APR_DOMAIN_ADSP;
+-	h->dest_port = port;
++	h->dest_port = apr_next_dst >= 0 ? (uint16_t)apr_next_dst : port;
++	apr_next_dst = -1;
+ 	h->token = apr_token++;
+ 	h->opcode = opcode;
+ 	if (len != 0) {
+@@ -1528,6 +1534,7 @@ apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint3
+ }
+ 
+ static void apr_answer(const struct apr_hdr *h, const uint32_t *p, uint32_t plen);
++static bool asm_event(const struct apr_hdr *h, const uint32_t *p, uint32_t plen);
+ 
+ static void
+ apr_rx(const uint8_t *d, uint32_t len)
+@@ -1561,6 +1568,9 @@ apr_rx(const uint8_t *d, uint32_t len)
+ 		    plen >= 4 ? p[0] : 0, plen >= 8 ? p[1] : 0);
+ 		break;
+ 	default:
++		if (asm_event(h, p, plen)) {
++			break;
++		}
+ 		LOG("t=%u.%03u apr: svc %u port %u opcode %#x token %u, %u payload bytes: %08x %08x %08x", T, h->src_svc,
+ 		    h->src_port, h->opcode, h->token, plen, plen >= 4 ? p[0] : 0, plen >= 8 ? p[1] : 0, plen >= 12 ? p[2] : 0);
+ 		break;
+@@ -1687,6 +1697,92 @@ stage5(void)
+ 	return true;
+ }
+ 
++/*
++ * Stage 5 mode A (taimenaudiosmmu=2): stream 1 of the LPASS Q6 SMMU through an identity context
++ * bank (SCTLR.M=0, no translation), as TaimenModem's anoc2 WLAN bank (0281). Boot 156: sCR0
++ * 0x00200626 (translation on, unmatched streams fault), 12 SMRs, 13 banks, no valid SMR: the DSP's
++ * reads with SID 1 (msm-audio-ion's iova | 1 << 32) need one. A free bank from the top down.
++ */
++#define LPASS_CB_CBAR           0x0001f000u     /* S1 translate, S2 bypass, memory attributes WB */
++#define LPASS_CB_CBA2R          0x00000001u     /* VA64 */
++#define LPASS_CB_SCTLR          0x000000e0u     /* CFCFG|CFIE|CFRE, M=0: no translation */
++
++static volatile uint8_t *lpass_cb;      /* the bank we gave stream 1, for its fault status */
++
++static bool
++lpass_smmu_identity(void)
++{
++	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(LPASS_SMMU_PA, LPASS_SMMU_SIZE);
++	if (s == NULL) {
++		return false;
++	}
++	uint32_t id0 = r32(s, 0x20), id1 = r32(s, 0x24);
++	uint32_t nsmr = id0 & 0xFF, ncb = id1 & 0xFF;
++	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	uint32_t slot = ~0u, cb = ~0u, smr, s2cr;
++	uint64_t used = 0;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		smr = r32(s, 0x800 + 4 * i);
++		s2cr = r32(s, 0xC00 + 4 * i);
++		bool valid = (smr >> 31) != 0;
++		uint32_t id = smr & 0x7FFF, m = (smr >> 16) & 0x7FFF;
++		if (valid && ((id ^ LPASS_SID) & ~m) == 0) {
++			slot = i;
++		} else if (!valid && slot == ~0u) {
++			slot = i;
++		}
++		if (valid && ((s2cr >> 16) & 3) == 0) {
++			used |= 1ull << (s2cr & 0x3F);
++		}
++	}
++	for (uint32_t i = ncb; i-- > 1;) {
++		if ((used & (1ull << i)) == 0) {
++			cb = i;
++			break;
++		}
++	}
++	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > LPASS_SMMU_SIZE) {
++		LOG("5: no free SMR/bank for stream 1 (slot %u cb %u)", slot, cb);
++		return false;
++	}
++	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
++	w32(cbp, 0x58, 0xFFFFFFFF);                 /* FSR: clear */
++	w32(cbp, 0x20, 0);                          /* TTBR0 */
++	w32(cbp, 0x24, 0);
++	w32(cbp, 0x30, 0);                          /* TCR */
++	w32(cbp, 0x10, 0);                          /* TCR2 */
++	w32(cbp, 0x38, 0);                          /* MAIR */
++	w32(cbp, 0x3C, 0);
++	w32(gr1, 0x800 + 4 * cb, LPASS_CB_CBA2R);
++	w32(gr1, 0x000 + 4 * cb, LPASS_CB_CBAR);
++	w32(cbp, 0x0, LPASS_CB_SCTLR);              /* SCTLR last */
++	w32(s, 0xC00 + 4 * slot, cb);               /* S2CR: translate, this bank */
++	w32(s, 0x800 + 4 * slot, (1u << 31) | LPASS_SID);   /* SMR: stream 1 exactly, valid last */
++	w32(s, 0x70, 0);                            /* sTLBGSYNC */
++	uint32_t n;
++	for (n = 0; n < 100000 && (r32(s, 0x74) & 1) != 0; n++) {
++		IODelay(1);
++	}
++	smr = r32(s, 0x800 + 4 * slot);
++	s2cr = r32(s, 0xC00 + 4 * slot);
++	bool ok = (smr >> 31) != 0 && (smr & 0x7FFF) == LPASS_SID && ((s2cr >> 16) & 3) == 0 && (s2cr & 0xFF) == cb;
++	lpass_cb = cbp;
++	LOG("5: M5 stream 1 identity bank CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x -> %s", cb, slot, smr, s2cr,
++	    r32(cbp, 0x0), ok ? "OK" : "NOT as written");
++	return ok;
++}
++
++static void
++lpass_smmu_faults(const char *when)
++{
++	if (lpass_cb == NULL) {
++		return;
++	}
++	uint32_t fsr = r32(lpass_cb, 0x58);
++	LOG("t=%u.%03u 5: stream 1 bank %s: FSR %08x FAR %08x%08x FSYNR0 %08x", T, when, fsr, r32(lpass_cb, 0x64),
++	    r32(lpass_cb, 0x60), r32(lpass_cb, 0x68));
++}
++
+ /* ---------------------------------------------------------------- stage 6: AFE quaternary MI2S RX */
+ 
+ #define TLMM_WEST_PA            0x03500000ull
+@@ -1838,6 +1934,243 @@ stage6(void)
+ 	return ok;
+ }
+ 
++/* ---------------------------------------------------------------- stage 8: ADM COPP + ASM stream (tone) */
++
++/*
++ * HackiOS redwood_sound.c's order with taimen's port (plan stage 8): map the period buffers for
++ * ASM, open an ADM COPP on 0x1006 (null topology), open an ASM write stream (session 1, stream 1,
++ * multi-channel PCM v2, no POPP), route the session to the COPP, send the media format, run, then
++ * keep 8 x 20 ms periods queued (ASM_DATA_CMD_WRITE_V2; ASM_DATA_EVENT_WRITE_DONE_V2 frees one).
++ * The DSP reads the periods through the LPASS SMMU (stream 1): the address form is the boot-arg
++ * taimenaudioaddr: 0 = pa | 1 << 32 (stream 1 identity bank, msm_audio_ion's SID bits; mode A),
++ * 1 = plain pa (SMMU bypass, mode B).
++ */
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS      0x00010D92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS   0x00010D93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS    0x00010D94u
++#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2    0x00010D98u
++#define ASM_DATA_EVENT_WRITE_DONE_V2        0x00010D99u
++#define ASM_SESSION_CMD_RUN_V2              0x00010DAAu
++#define ASM_DATA_CMD_WRITE_V2               0x00010DABu
++#define ASM_STREAM_CMD_OPEN_WRITE_V3        0x00010DB3u
++#define ASM_STREAM_CMD_CLOSE                0x00010BCDu
++#define ASM_SESSION_EVENT_RX_UNDERFLOW      0x00010C17u
++#define ASM_NULL_POPP_TOPOLOGY              0x00010C68u
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2  0x00010DA5u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5      0x00010325u
++#define ADM_CMD_DEVICE_OPEN_V5              0x00010326u
++#define ADM_CMD_DEVICE_CLOSE_V5             0x00010327u
++#define ADM_CMDRSP_DEVICE_OPEN_V5           0x00010329u
++#define ADM_NULL_COPP_TOPOLOGY              0x00010312u
++#define SHMEM8_4K_POOL                      3
++#define PCM_CHANNEL_FL                      1
++#define PCM_CHANNEL_FR                      2
++#define ASM_PORT                            0x0101  /* session 1 << 8 | stream 1 */
++
++#define PERIODS                 8
++#define PERIOD_FRAMES           960             /* 20 ms at 48 kHz */
++#define PERIOD_BYTES            (PERIOD_FRAMES * 4)
++
++struct asm_map_regions {
++	uint16_t pool, nregions;
++	uint32_t property;
++	struct { uint32_t lsw, msw, size; } r;
++} __attribute__((packed));
++struct adm_open_v5 {
++	uint16_t flags, mode, endpoint1, endpoint2;
++	uint32_t topology;
++	uint16_t channels, bit_width;
++	uint32_t rate;
++	uint8_t  map[8];
++} __attribute__((packed));
++struct asm_open_write_v3 {
++	uint32_t mode_flags;
++	uint16_t sink, bits;
++	uint32_t popp, fmt;
++} __attribute__((packed));
++struct adm_routing_v5 {
++	uint32_t matrix, nsessions;
++	uint16_t session, ncopps, copp, pad;
++} __attribute__((packed));
++struct asm_fmt_update_v2 {
++	uint32_t blk_size;
++	uint16_t channels, bits;
++	uint32_t rate;
++	uint16_t is_signed, reserved;
++	uint8_t  map[8];
++} __attribute__((packed));
++struct asm_write_v2 {
++	uint32_t lsw, msw, handle, size, seq, ts_lsw, ts_msw, flags;
++} __attribute__((packed));
++
++static uint8_t *periods;
++static uint64_t periods_pa;
++static uint32_t asm_handle, writes_done, underflows, periods_out;
++static uint16_t copp_id;
++
++/* 1 kHz at -20 dBFS (3277), 48 samples a cycle: round(3277 sin(2 pi k / 48)) */
++static const int16_t tone48[48] = {
++	0, 428, 848, 1254, 1638, 1992, 2317, 2600, 2838, 3025, 3166, 3253,
++	3277, 3253, 3166, 3025, 2838, 2600, 2317, 1992, 1638, 1254, 848, 428,
++	0, -428, -848, -1254, -1638, -1992, -2317, -2600, -2838, -3025, -3166, -3253,
++	-3277, -3253, -3166, -3025, -2838, -2600, -2317, -1992, -1638, -1254, -848, -428,
++};
++
++static uint64_t
++dsp_addr(uint64_t pa)
++{
++	int mode = 0;
++	(void)PE_parse_boot_argn("taimenaudioaddr", &mode, sizeof(mode));
++	return mode == 1 ? pa : (pa | (1ull << 32));
++}
++
++static void
++period_fill(unsigned i, bool tone)
++{
++	int16_t *s = (int16_t *)(periods + (uint64_t)i * 0x1000);
++	for (unsigned f = 0; f < PERIOD_FRAMES; f++) {
++		int16_t v = tone ? tone48[f % 48] : 0;
++		s[2 * f] = v;
++		s[2 * f + 1] = v;
++	}
++	mb();
++}
++
++static bool
++period_send(unsigned i)
++{
++	struct asm_write_v2 w;
++	uint64_t a = dsp_addr(periods_pa + (uint64_t)i * 0x1000);
++	bzero(&w, sizeof(w));
++	w.lsw = (uint32_t)a;
++	w.msw = (uint32_t)(a >> 32);
++	w.handle = asm_handle;
++	w.size = PERIOD_BYTES;
++	w.seq = i;
++	periods_out++;
++	return apr_send(APR_SVC_ASM, ASM_PORT, ASM_DATA_CMD_WRITE_V2, &w, sizeof(w));
++}
++
++/* ASM events outside a call: write done (refill), underflow. From apr_rx's default case. */
++static bool
++asm_event(const struct apr_hdr *h, const uint32_t *p, uint32_t plen)
++{
++	if (h->opcode == ASM_DATA_EVENT_WRITE_DONE_V2) {
++		writes_done++;
++		if (periods_out > 0) {
++			periods_out--;
++		}
++		return true;
++	}
++	if (h->opcode == ASM_SESSION_EVENT_RX_UNDERFLOW) {
++		underflows++;
++		return true;
++	}
++	(void)p;
++	(void)plen;
++	return false;
++}
++
++static bool
++stage8(void)
++{
++	uint64_t pa = 0;
++	periods = (uint8_t *)pool_alloc((uint64_t)PERIODS * 0x1000, &pa);
++	if (periods == NULL) {
++		LOG("8: no pool room for the periods");
++		return false;
++	}
++	periods_pa = pa;
++	uint64_t a = dsp_addr(pa);
++	struct asm_map_regions mr = { SHMEM8_4K_POOL, 1, 0, { (uint32_t)a, (uint32_t)(a >> 32), PERIODS * 0x1000 } };
++	int rc = apr_call("ASM map periods", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &mr, sizeof(mr), 1000);
++	if (rc != 0 || apr_wait_opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS || apr_wait_len < 4) {
++		LOG("8: ASM map of %#llx (DSP address %#llx) failed: %d", pa, a, rc);
++		return false;
++	}
++	asm_handle = apr_wait_payload[0];
++	struct adm_open_v5 ao;
++	bzero(&ao, sizeof(ao));
++	ao.mode = 1;                            /* RX */
++	ao.endpoint1 = APR_PORT_QUAT_MI2S_RX;
++	ao.endpoint2 = 0xFFFF;
++	ao.topology = ADM_NULL_COPP_TOPOLOGY;
++	ao.channels = 2;
++	ao.bit_width = 16;
++	ao.rate = 48000;
++	ao.map[0] = PCM_CHANNEL_FL;
++	ao.map[1] = PCM_CHANNEL_FR;
++	rc = apr_call("ADM DEVICE_OPEN_V5 0x1006", APR_SVC_ADM, APR_PORT_QUAT_MI2S_RX, ADM_CMD_DEVICE_OPEN_V5, &ao, sizeof(ao), 1000);
++	if (apr_wait_opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || apr_wait_len < 8 || apr_wait_payload[0] != 0) {
++		LOG("8: ADM open failed (rc %d, opcode %#x, status %#x)", rc, apr_wait_opcode, apr_wait_len >= 4 ? apr_wait_payload[0] : 0);
++		return false;
++	}
++	copp_id = (uint16_t)apr_wait_payload[1];
++	struct asm_open_write_v3 ow = { 0, 0, 16, ASM_NULL_POPP_TOPOLOGY, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
++	rc = apr_call("ASM OPEN_WRITE_V3", APR_SVC_ASM, ASM_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, &ow, sizeof(ow), 1000);
++	if (rc != 0) {
++		return false;
++	}
++	struct adm_routing_v5 rt = { 0, 1, 1, 1, copp_id, 0 };
++	rc = apr_call("ADM MATRIX_MAP_ROUTINGS_V5", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &rt, sizeof(rt), 1000);
++	if (rc != 0) {
++		return false;
++	}
++	struct asm_fmt_update_v2 fu;
++	bzero(&fu, sizeof(fu));
++	fu.blk_size = sizeof(fu) - 4;
++	fu.channels = 2;
++	fu.bits = 16;
++	fu.rate = 48000;
++	fu.is_signed = 1;
++	fu.map[0] = PCM_CHANNEL_FL;
++	fu.map[1] = PCM_CHANNEL_FR;
++	rc = apr_call("ASM MEDIA_FMT_UPDATE_V2", APR_SVC_ASM, ASM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &fu, sizeof(fu), 1000);
++	if (rc != 0) {
++		return false;
++	}
++	uint32_t run[3] = { 0, 0, 0 };
++	rc = apr_call("ASM RUN_V2", APR_SVC_ASM, ASM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 1000);
++	if (rc != 0) {
++		return false;
++	}
++	/* 3 s of tone, then silence until every period is back */
++	uint64_t t = now_ms();
++	unsigned next = 0, sent = 0;
++	for (unsigned i = 0; i < PERIODS; i++) {
++		period_fill(i, true);
++		period_send(i);
++		sent++;
++	}
++	uint32_t seen_done = writes_done;
++	while (now_ms() - t < 5000) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++		while (writes_done != seen_done) {
++			seen_done++;
++			if (now_ms() - t < 3000) {
++				period_fill(next, true);
++				period_send(next);
++				sent++;
++			}
++			next = (next + 1) % PERIODS;
++		}
++		if (now_ms() - t >= 3000 && periods_out == 0) {
++			break;
++		}
++	}
++	LOG("t=%u.%03u 8: %s: %u periods sent, %u written back, %u underflows, %u still out (%llu ms)", T,
++	    writes_done >= 100 ? "M8 the stream ran" : "the stream did NOT run", sent, writes_done, underflows, periods_out,
++	    now_ms() - t);
++	apr_call("ASM CLOSE", APR_SVC_ASM, ASM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 1000);
++	apr_next_dst = copp_id;                 /* q6adm: src the AFE port, dest the COPP */
++	apr_call("ADM DEVICE_CLOSE_V5", APR_SVC_ADM, APR_PORT_QUAT_MI2S_RX, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 1000);
++	uint32_t um = asm_handle;
++	apr_call("ASM unmap periods", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &um, sizeof(um), 1000);
++	return writes_done >= 100;
++}
++
+ /* ---------------------------------------------------------------- the thread */
+ 
+ static void
+@@ -1877,14 +2210,25 @@ audio_thread(void *arg, wait_result_t)
+ 		if (!m4 && adsp_core_state == 1 && apr_versions_done) {
+ 			m4 = true;
+ 			LOG("t=%u.%03u 4: M4 ADSP core ready, service versions read", T);
+-			if (level >= 6) {
+-				(void)stage6();
+-			}
++			bool m6 = level >= 6 && stage6();
+ 			/* SMMU reads can hang an unclocked bus: on request, and after the AFE test */
+ 			int census = 0;
+ 			(void)PE_parse_boot_argn("taimenaudiosmmu", &census, sizeof(census));
+-			if (level >= 5 && census != 0) {
+-				(void)stage5();
++			bool m5 = false;
++			if (level >= 5 && census != 0 && stage5() && census >= 2) {
++				m5 = lpass_smmu_identity();
++			}
++			int addr = 0;
++			(void)PE_parse_boot_argn("taimenaudioaddr", &addr, sizeof(addr));
++			if (level >= 8 && m6 && (m5 || addr == 1)) {
++				(void)stage8();
++				lpass_smmu_faults("after the stream");
++			}
++			if (level > 6 && m6) {
++				uint16_t stop[2] = { APR_PORT_QUAT_MI2S_RX, 0 };
++				apr_call("AFE DEVICE_STOP 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 1000);
++				afe_clock(false);
++				pins_mi2s(false);
+ 			}
+ 		}
+ 		if (slave != NULL && (*slave & SLAVE_ERR_FATAL) != 0) {
