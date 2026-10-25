@@ -929,3 +929,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   daemon either. Last physical lead before stepping back: power headroom once the radio is live. 0294 votes BoB
   (L25's parent; bobb 1) at 3.312 V in PWM, and S3 1.352 V / S5 2.04 V (the WCN3990 BT node's io and xtal
   supplies) before the modem boots.
+- 2026-10-24 boot 126 (r114 = +0263-0294, a plain ROOTFIX + taimenwifi=10, 420 s): BoB 3.312 V PWM (bobm 3 acked),
+  S3 1.352 V, S5 2.04 V voted; FW_READY, mission, scan (35 networks); FATAL at +14.21 s as before.
+  **Where Wi-Fi stands (boots 116-126):** everything up to a working passive scan runs (modem, GLINK/QRTR, rmtfs,
+  pd-mapper, tftp, PDR listener, WLFW with BDF to FW_READY and mission, SMMU, CE, HTC, WMI READY, HTT, scan), and
+  the modem dies on DOG_HB task starvation 9.5 s after WLAN_MODE mission, every time (14.20-14.34 s from modem
+  start). Bisected: FW_READY alone (boot 123) and WLAN_CFG alone (boot 124) leave the modem alive; the mission
+  mode is the trigger, with or without CE/HTC/WMI afterwards (boot 118). Ruled out: the HTT rx ring, the IPA core
+  clock, the power cycle at FW_READY, rejuvenate, VBATT, the unacknowledged GLINK channels, HOST_CAP (no
+  daemon), BoB PWM and S3/S5. The 80-byte SFR does not name the task. Stopped guessing here; next steps need a
+  known-good reference (e.g. this firmware under a mainline kernel) or a different priority.
