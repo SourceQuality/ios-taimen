@@ -1,0 +1,31 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2c73f37..9a2b34b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -549,6 +549,26 @@ sweet_exec_wklog(struct image_params *imgp, int ptr_size, const char *base)
+ 	}
+ 	printf("SWEET ENV: %s += OS_ACTIVITY_DT_MODE=YES CFLOG_FORCE_STDERR=1 (%s)\n", base,
+ 	    webkit ? "sweetwklog" : "sweetlogp");
++	/*
++	 * 0311: sweetlogp processes also get sweetexc.dylib (tools/phone/sweetexc.m), which prints an
++	 * uncaught exception's name, reason and throw-site backtrace before the process dies; only when
++	 * the file is there (dyld refuses to start a process whose inserted library is missing).
++	 */
++	static const char exc[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/sweetexc.dylib";
++	vnode_t lib = NULLVP;
++	if (!webkit && vnode_lookup(exc + sizeof("DYLD_INSERT_LIBRARIES=") - 1, 0, &lib, vfs_context_kernel()) == 0) {
++		vnode_put(lib);
++		int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(exc), UIO_SYSSPACE, TRUE);
++		if (error) {
++			return error;
++		}
++		if (imgp->ip_argspace < ptr_size) {
++			return E2BIG;
++		}
++		imgp->ip_argspace -= ptr_size;
++		imgp->ip_envc++;
++		printf("SWEET ENV: %s += %s\n", base, exc);
++	}
+ 	return 0;
+ }
+ 
