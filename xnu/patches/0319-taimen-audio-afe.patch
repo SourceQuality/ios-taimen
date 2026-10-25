@@ -1,0 +1,304 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 520f3e2..d803ce7 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -12,6 +12,11 @@
+  *
+  * 3 (0318): GLINK on the lpass edge, QRTR (pd-mapper: no domains), the APR channel apr_audio_svc.
+  * 4 (0318): the AVCS core says ready (AVCS_CMD_ADSP_EVENT_GET_STATE = 1); its service versions.
++ * 5 (0319, with taimenaudiosmmu=1): the LPASS SMMU powered and clocked (GDSC and clock votes), what
++ *   ABL/TZ left for stream 1 (read only so far: the shared buffer comes with stage 8).
++ * 6 (0319): AFE quaternary MI2S RX (port 0x1006): pins 58-61 to qua_mi2s, the muxsel to I2S, the
++ *   QUAD_MI2S_IBIT clock at 1.536 MHz, I2S 16-bit stereo on SD1 at 48 kHz, DEVICE_START; then the
++ *   SCK and WS pins must toggle (TLMM IN bits). Stopped and restored again unless taimenaudio > 6.
+  *
+  * SMEM, the hwlock and SMP2P as TaimenModem.cpp (from ios-topaz TopazModem.cpp), with the ADSP's
+  * host id, items and doorbell bits. Only partitions APPS is a host of are read (another pair's
+@@ -1522,6 +1527,8 @@ apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint3
+ 	return glink_send(ACHAN, buf, sizeof(*h) + len);
+ }
+ 
++static void apr_answer(const struct apr_hdr *h, const uint32_t *p, uint32_t plen);
++
+ static void
+ apr_rx(const uint8_t *d, uint32_t len)
+ {
+@@ -1534,6 +1541,7 @@ apr_rx(const uint8_t *d, uint32_t len)
+ 	const uint32_t *p = (const uint32_t *)(d + (hlen >= sizeof(*h) && hlen <= len ? hlen : sizeof(*h)));
+ 	uint32_t plen = len > hlen ? len - hlen : 0;
+ 	apr_rx_pkts++;
++	apr_answer(h, p, plen);
+ 	switch (h->opcode) {
+ 	case AVCS_GET_STATE_RSP:
+ 		adsp_core_state = plen >= 4 ? (int)p[0] : -2;
+@@ -1581,6 +1589,255 @@ apr_poll(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- APR calls */
++
++static uint32_t apr_wait_token, apr_wait_status, apr_wait_opcode, apr_wait_len;
++static bool apr_wait_done;
++static uint32_t apr_wait_payload[32];
++
++/* Record the answer to the call in flight (from apr_rx). */
++static void
++apr_answer(const struct apr_hdr *h, const uint32_t *p, uint32_t plen)
++{
++	if (apr_wait_token == 0 || h->token != apr_wait_token) {
++		return;
++	}
++	apr_wait_opcode = h->opcode;
++	apr_wait_status = h->opcode == APR_BASIC_RSP_RESULT && plen >= 8 ? p[1] : 0;
++	apr_wait_len = MIN(plen, (uint32_t)sizeof(apr_wait_payload));
++	memcpy(apr_wait_payload, p, apr_wait_len);
++	apr_wait_done = true;
++}
++
++/* Send and wait for the answer with the same token: its status (0 = ok), -1 not sent, -2 no answer. */
++static int
++apr_call(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len, unsigned wait_ms)
++{
++	apr_wait_token = apr_token;             /* the token apr_send uses */
++	apr_wait_done = false;
++	if (!apr_send(svc, port, opcode, payload, len)) {
++		LOG("t=%u.%03u apr: %s (%#x) not sent", T, what, opcode);
++		apr_wait_token = 0;
++		return -1;
++	}
++	uint64_t t = now_ms();
++	while (!apr_wait_done && now_ms() - t < wait_ms) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++		qrtr_poll();
++	}
++	apr_wait_token = 0;
++	if (!apr_wait_done) {
++		LOG("t=%u.%03u apr: %s (%#x): no answer in %u ms", T, what, opcode, wait_ms);
++		return -2;
++	}
++	LOG("t=%u.%03u apr: %s (%#x) -> %s %#x in %llu ms", T, what, opcode,
++	    apr_wait_opcode == APR_BASIC_RSP_RESULT ? "status" : "answer",
++	    apr_wait_opcode == APR_BASIC_RSP_RESULT ? apr_wait_status : apr_wait_opcode, now_ms() - t);
++	return (int)apr_wait_status;
++}
++
++/* ---------------------------------------------------------------- stage 5: the LPASS SMMU (census) */
++
++#define GCC_PA                  0x00100000ull
++#define GCC_LPASS_ADSP_GDSC     0x7D034         /* gdsc_hlos1_vote_lpass_adsp (votable) */
++#define GCC_LPASS_SMMU_CBCR     0x7D014         /* hlos1_vote_lpass_adsp_smmu_clk (voted branch) */
++#define LPASS_SMMU_PA           0x05100000ull   /* lpass_q6_smmu, qcom,skip-init, tz-device-id LPASS */
++#define LPASS_SMMU_SIZE         0x00040000u
++#define LPASS_SID               1               /* msm-audio-ion: iommus = <&lpass_q6_smmu 1> */
++
++static inline uint32_t r32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void w32(volatile uint8_t *b, uint32_t o, uint32_t v) { mb(); *(volatile uint32_t *)(b + o) = v; mb(); }
++
++/* Stage 5, read only for now: power and clock the SMMU, then what ABL/TZ left for stream 1. */
++static bool
++stage5(void)
++{
++	volatile uint8_t *gcc = (volatile uint8_t *)ml_io_map(GCC_PA + 0x7D000, 0x1000);
++	if (gcc == NULL) {
++		return false;
++	}
++	uint32_t g0 = r32(gcc, GCC_LPASS_ADSP_GDSC - 0x7D000), c0 = r32(gcc, GCC_LPASS_SMMU_CBCR - 0x7D000);
++	w32(gcc, GCC_LPASS_ADSP_GDSC - 0x7D000, g0 & ~1u);         /* SW_COLLAPSE off: our vote */
++	IODelay(100);
++	w32(gcc, GCC_LPASS_SMMU_CBCR - 0x7D000, c0 | 1u);          /* the clock vote */
++	IODelay(100);
++	LOG("5: LPASS ADSP GDSC vote %#x -> %#x, SMMU clock vote %#x -> %#x", g0, r32(gcc, GCC_LPASS_ADSP_GDSC - 0x7D000),
++	    c0, r32(gcc, GCC_LPASS_SMMU_CBCR - 0x7D000));
++	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(LPASS_SMMU_PA, LPASS_SMMU_SIZE);
++	if (s == NULL) {
++		return false;
++	}
++	uint32_t cr0 = r32(s, 0x0), id0 = r32(s, 0x20), id1 = r32(s, 0x24);
++	uint32_t nsmr = id0 & 0xFF, ncb = id1 & 0xFF;
++	LOG("5: LPASS SMMU sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u CBs", cr0, id0, id1, nsmr, ncb);
++	unsigned shown = 0;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = r32(s, 0x800 + 4 * i), s2cr = r32(s, 0xC00 + 4 * i);
++		if ((smr >> 31) == 0 || shown >= 24) {
++			continue;
++		}
++		shown++;
++		uint32_t id = smr & 0xFFFF, m = (smr >> 16) & 0x7FFF;
++		bool ours = ((id ^ LPASS_SID) & ~m & 0x7FFF) == 0;
++		LOG("5:   SMR%u %08x (sid %x mask %x)%s S2CR %08x (type %u cb %u)", i, smr, id, m, ours ? " <- stream 1" : "",
++		    s2cr, (s2cr >> 16) & 3, s2cr & 0xFF);
++	}
++	return true;
++}
++
++/* ---------------------------------------------------------------- stage 6: AFE quaternary MI2S RX */
++
++#define TLMM_WEST_PA            0x03500000ull
++#define MI2S_SCK                58
++#define MI2S_WS                 59
++#define MI2S_SD0                60
++#define MI2S_SD1                61
++#define LPAIF_QUAD_MUXSEL_PA    0x1711D000ull   /* lpaif_quat_mode_muxsel: 0 = I2S */
++
++#define APR_PORT_QUAT_MI2S_RX   0x1006
++#define AFE_PORT_CMD_DEVICE_START   0x000100E5u
++#define AFE_PORT_CMD_DEVICE_STOP    0x000100E6u
++#define AFE_PORT_CMD_SET_PARAM_V2   0x000100EFu
++#define AFE_SVC_CMD_SET_PARAM       0x000100F3u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE 0x0001020Cu
++#define AFE_PARAM_ID_I2S_CONFIG     0x0001020Du
++#define AFE_MODULE_CLOCK_SET        0x0001028Fu
++#define AFE_PARAM_ID_CLOCK_SET      0x00010290u
++#define CLK_ID_QUAD_MI2S_IBIT       0x106
++#define CLK_ATTR_COUPLE_NO          1
++
++struct afe_param_hdr { uint32_t module_id, param_id; uint16_t param_size, reserved; } __attribute__((packed));
++struct afe_clk_set {
++	uint32_t minor, clk_id, freq;
++	uint16_t attri, root;
++	uint32_t enable;
++} __attribute__((packed));
++struct afe_svc_set_clk {
++	uint32_t payload_size, lsw, msw, handle;
++	struct afe_param_hdr p;
++	struct afe_clk_set clk;
++} __attribute__((packed));
++struct afe_i2s_cfg {
++	uint32_t minor;
++	uint16_t bit_width, channel_mode, mono_stereo, ws_src;
++	uint32_t sample_rate;
++	uint16_t data_format, reserved;
++} __attribute__((packed));
++struct afe_port_set_i2s {
++	uint16_t port_id, payload_size;
++	uint32_t lsw, msw, handle;
++	struct afe_param_hdr p;
++	struct afe_i2s_cfg cfg;
++} __attribute__((packed));
++
++static volatile uint32_t *tlmm_pin[4];
++static uint32_t tlmm_saved[4];
++
++static bool
++pins_mi2s(bool on)
++{
++	static const unsigned gpio[4] = { MI2S_SCK, MI2S_WS, MI2S_SD0, MI2S_SD1 };
++	for (unsigned i = 0; i < 4; i++) {
++		if (tlmm_pin[i] == NULL) {
++			tlmm_pin[i] = (volatile uint32_t *)ml_io_map(TLMM_WEST_PA + 0x1000ull * gpio[i], 0x1000);
++			if (tlmm_pin[i] == NULL) {
++				return false;
++			}
++			tlmm_saved[i] = tlmm_pin[i][0];
++		}
++		/* CFG: pull [1:0] none, function [5:2] 1 (qua_mi2s), drive [8:6] 8 mA */
++		tlmm_pin[i][0] = on ? ((1u << 2) | (3u << 6)) : tlmm_saved[i];
++		mb();
++	}
++	LOG("6: pins 58-61 %s (were %#x %#x %#x %#x)", on ? "to qua_mi2s, 8 mA" : "restored", tlmm_saved[0], tlmm_saved[1],
++	    tlmm_saved[2], tlmm_saved[3]);
++	return true;
++}
++
++/* LPASS drives the clock pins: count changes of SCK and WS in their TLMM IN bits. */
++static void
++pins_sample(unsigned *sck, unsigned *ws)
++{
++	uint32_t a = tlmm_pin[0][1] & 1, b = tlmm_pin[1][1] & 1;
++	*sck = *ws = 0;
++	for (unsigned i = 0; i < 20000; i++) {
++		uint32_t x = tlmm_pin[0][1] & 1, y = tlmm_pin[1][1] & 1;
++		*sck += x != a;
++		*ws += y != b;
++		a = x;
++		b = y;
++	}
++}
++
++static int
++afe_clock(bool on)
++{
++	struct afe_svc_set_clk m;
++	bzero(&m, sizeof(m));
++	m.payload_size = sizeof(m.p) + sizeof(m.clk);
++	m.p.module_id = AFE_MODULE_CLOCK_SET;
++	m.p.param_id = AFE_PARAM_ID_CLOCK_SET;
++	m.p.param_size = sizeof(m.clk);
++	m.clk.minor = 1;
++	m.clk.clk_id = CLK_ID_QUAD_MI2S_IBIT;
++	m.clk.freq = 48000 * 2 * 16;            /* 1.536 MHz: 16-bit stereo */
++	m.clk.attri = CLK_ATTR_COUPLE_NO;
++	m.clk.root = 0;
++	m.clk.enable = on;
++	return apr_call(on ? "AFE QUAD_MI2S_IBIT on" : "AFE QUAD_MI2S_IBIT off", APR_SVC_AFE, 0, AFE_SVC_CMD_SET_PARAM,
++	           &m, sizeof(m), 1000);
++}
++
++static bool
++stage6(void)
++{
++	if (!pins_mi2s(true)) {
++		return false;
++	}
++	volatile uint32_t *mux = (volatile uint32_t *)ml_io_map(LPAIF_QUAD_MUXSEL_PA, 0x1000);
++	if (mux == NULL) {
++		return false;
++	}
++	*mux = 0;                               /* write only: LPASS reads can abort (HackiOS) */
++	mb();
++	unsigned sck0, ws0;
++	pins_sample(&sck0, &ws0);
++	int rc = afe_clock(true);
++	struct afe_port_set_i2s c;
++	bzero(&c, sizeof(c));
++	c.port_id = APR_PORT_QUAT_MI2S_RX;
++	c.payload_size = sizeof(c.p) + sizeof(c.cfg);
++	c.p.module_id = AFE_MODULE_AUDIO_DEV_INTERFACE;
++	c.p.param_id = AFE_PARAM_ID_I2S_CONFIG;
++	c.p.param_size = sizeof(c.cfg);
++	c.cfg.minor = 1;
++	c.cfg.bit_width = 16;
++	c.cfg.channel_mode = 2;                 /* AFE_PORT_I2S_SD1 */
++	c.cfg.mono_stereo = 1;                  /* stereo */
++	c.cfg.ws_src = 1;                       /* internal */
++	c.cfg.sample_rate = 48000;
++	int rc2 = apr_call("AFE I2S config 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, &c, sizeof(c), 1000);
++	uint16_t start[2] = { APR_PORT_QUAT_MI2S_RX, 0 };
++	int rc3 = apr_call("AFE DEVICE_START 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 1000);
++	IOSleep(20);
++	unsigned sck, ws;
++	pins_sample(&sck, &ws);
++	bool ok = rc == 0 && rc2 == 0 && rc3 == 0 && sck > 100 && ws > 4;
++	LOG("t=%u.%03u 6: %s: clock %d, i2s %d, start %d; SCK changes %u (before %u), WS %u (before %u) in 20000 samples", T,
++	    ok ? "M6 quaternary MI2S RX runs" : "quaternary MI2S RX NOT running", rc, rc2, rc3, sck, sck0, ws, ws0);
++	int level = 0;
++	(void)PE_parse_boot_argn("taimenaudio", &level, sizeof(level));
++	if (level <= 6 || !ok) {
++		/* nothing follows yet: stop the port and the clock, give the pins back */
++		apr_call("AFE DEVICE_STOP 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, start, sizeof(start), 1000);
++		afe_clock(false);
++		pins_mi2s(false);
++	}
++	return ok;
++}
++
+ /* ---------------------------------------------------------------- the thread */
+ 
+ static void
+@@ -1620,6 +1877,14 @@ audio_thread(void *arg, wait_result_t)
+ 		if (!m4 && adsp_core_state == 1 && apr_versions_done) {
+ 			m4 = true;
+ 			LOG("t=%u.%03u 4: M4 ADSP core ready, service versions read", T);
++			int census = 0;
++			(void)PE_parse_boot_argn("taimenaudiosmmu", &census, sizeof(census));
++			if (level >= 5 && census != 0) {
++				(void)stage5();         /* SMMU reads can hang an unclocked bus: on request */
++			}
++			if (level >= 6) {
++				(void)stage6();
++			}
+ 		}
+ 		if (slave != NULL && (*slave & SLAVE_ERR_FATAL) != 0) {
+ 			LOG("t=%u.%03u *** ADSP FATAL (slave-kernel %#x) ***", T, *slave);
