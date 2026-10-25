@@ -2,10 +2,14 @@
 """Drive the phone's UI over its USB link (xnu 0304, TCP 5144 on 192.168.7.2).
 
     tools/taimen/phonectl.py tap X Y                 panel coordinates (1440 x 2880)
-    tools/taimen/phonectl.py swipe X1 Y1 X2 Y2 [MS]
+    tools/taimen/phonectl.py tapc X Y                screenshot (canvas, 1125 x 2436) coordinates
+    tools/taimen/phonectl.py swipe X1 Y1 X2 Y2 [MS]  (swipec: canvas coordinates)
     tools/taimen/phonectl.py unlock | home           swipe up from the bottom edge
     tools/taimen/phonectl.py shot OUT.png            the 1125 x 2436 canvas iOS last drew
-    tools/taimen/phonectl.py run 'tap 870 1034' 'sleep 3' 'shot s.png' ...
+    tools/taimen/phonectl.py type TEXT | enter | backspace [N] | tab | escape   (xnu 0307)
+    tools/taimen/phonectl.py key power|volup|voldown|home
+    tools/taimen/phonectl.py run 'tapc 700 875' 'sleep 3' 'shot s.png' ...
+The canvas is scaled 2880/2436 onto the panel and centred: panel x = 55 + 1.182 x, y = 1.182 y.
 """
 import socket
 import struct
@@ -75,6 +79,13 @@ class Phone:
         print(f'{path}: {w}x{h} in {time.time() - t:.1f} s')
 
 
+SCALE, OFF_X = 2880 / 2436, 55
+
+
+def panel(x, y):
+    return round(OFF_X + float(x) * SCALE), round(float(y) * SCALE)
+
+
 def run(p, words):
     op = words[0]
     if op == 'shot':
@@ -83,8 +94,15 @@ def run(p, words):
         p.cmd('swipe 720 2870 720 1300 250')
     elif op == 'sleep':
         time.sleep(float(words[1]))
-    elif op in ('tap', 'swipe'):
+    elif op in ('tap', 'swipe', 'enter', 'backspace', 'tab', 'escape', 'key'):
         p.cmd(' '.join(words))
+    elif op == 'type':
+        p.cmd('type ' + ' '.join(words[1:]))
+    elif op == 'tapc':
+        p.cmd('tap %d %d' % panel(words[1], words[2]))
+    elif op == 'swipec':
+        a, b = panel(words[1], words[2]), panel(words[3], words[4])
+        p.cmd('swipe %d %d %d %d %s' % (a + b + (words[5] if len(words) > 5 else '250',)))
     else:
         sys.exit(__doc__)
 

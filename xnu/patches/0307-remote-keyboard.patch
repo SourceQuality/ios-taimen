@@ -1,0 +1,229 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0e1b76b..e077938 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1183,9 +1183,15 @@ ud_tcplog_thread(void *arg __unused, wait_result_t wr __unused)
+  *   swipe X1 Y1 X2 Y2 [MS]      16 moves over MS ms (default 250)
+  *   shot                        "SHOT W H" then H rows of W x 4 bytes (BGRA) of the last surface
+  *                               backboardd swapped (the 1125 x 2436 canvas), then "OK"
++ *   type TEXT                   the rest of the line as key presses (0307, US layout; the
++ *                               keyboard service registers on the first one)
++ *   enter | backspace [N] | tab | escape
++ *   key power|volup|voldown|home
+  * Only the PC at the other end of the phone's own USB cable can reach it. sweetusbctl=0: off.
+  */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_kbd(uint32_t usage, int down);
+ extern bool sweet_fb_grab(uintptr_t *base, uint32_t *w, uint32_t *h, uint32_t *bpr, void **ref);
+ extern void sweet_fb_grab_release(void *ref);
+ 
+@@ -1258,6 +1264,63 @@ ctl_args(const char *p, int *v, int max)
+ 	return n;
+ }
+ 
++/* the HID usage (page 7) and shift for an ASCII character, US layout */
++static bool
++ctl_usage(char c, uint32_t *usage, bool *shift)
++{
++	static const char plain[] = " -=[]\\;'`,./", shifted[] = " _+{}|:\"~<>?";
++	static const uint8_t punct[] = { 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 };
++	static const char digits_shifted[] = "!@#$%^&*()";
++	*shift = false;
++	if (c >= 'a' && c <= 'z') {
++		*usage = 0x04 + (uint32_t)(c - 'a');
++		return true;
++	}
++	if (c >= 'A' && c <= 'Z') {
++		*usage = 0x04 + (uint32_t)(c - 'A');
++		*shift = true;
++		return true;
++	}
++	if (c >= '1' && c <= '9') {
++		*usage = 0x1e + (uint32_t)(c - '1');
++		return true;
++	}
++	if (c == '0') {
++		*usage = 0x27;
++		return true;
++	}
++	for (unsigned i = 0; i < sizeof(punct); i++) {
++		if (c == plain[i] || (i > 0 && c == shifted[i])) {
++			*usage = punct[i];
++			*shift = c != plain[i];
++			return true;
++		}
++	}
++	for (unsigned i = 0; i < 10; i++) {
++		if (c == digits_shifted[i]) {
++			*usage = 0x1e + i;
++			*shift = true;
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++ctl_press(uint32_t usage, bool shift)
++{
++	if (shift) {
++		sweet_hid_kbd(0xe1, 1);
++	}
++	sweet_hid_kbd(usage, 1);
++	delay(25000);
++	sweet_hid_kbd(usage, 0);
++	if (shift) {
++		sweet_hid_kbd(0xe1, 0);
++	}
++	delay(25000);
++}
++
+ static void
+ ctl_command(socket_t s, const char *line)
+ {
+@@ -1293,15 +1356,51 @@ ctl_command(socket_t s, const char *line)
+ 		if (err == 0) {
+ 			ctl_say(s, "OK\n");
+ 		}
++	} else if (strncmp(line, "type ", 5) == 0) {
++		unsigned bad = 0;
++		for (const char *p = line + 5; *p; p++) {
++			uint32_t usage;
++			bool shift;
++			if (ctl_usage(*p, &usage, &shift)) {
++				ctl_press(usage, shift);
++			} else {
++				bad++;
++			}
++		}
++		ctl_say(s, bad ? "OK (characters without a key skipped)\n" : "OK\n");
++	} else if (strcmp(line, "enter") == 0 || strcmp(line, "tab") == 0 || strcmp(line, "escape") == 0 ||
++	    strncmp(line, "backspace", 9) == 0) {
++		uint32_t usage = line[0] == 'e' && line[1] == 'n' ? 0x28 : line[0] == 't' ? 0x2b : line[0] == 'e' ? 0x29 : 0x2a;
++		int times = (usage == 0x2a && n >= 1) ? v[0] : 1;
++		for (int i = 0; i < times && i < 200; i++) {
++			ctl_press(usage, false);
++		}
++		ctl_say(s, "OK\n");
++	} else if (strncmp(line, "key ", 4) == 0) {
++		static const char *const names[] = { "power", "volup", "voldown", "home" };
++		int k = -1;
++		for (int i = 0; i < 4; i++) {
++			if (strcmp(line + 4, names[i]) == 0) {
++				k = i;
++			}
++		}
++		if (k < 0) {
++			ctl_say(s, "ERR key power|volup|voldown|home\n");
++			return;
++		}
++		sweet_hid_key(k, 1);
++		delay(100000);
++		sweet_hid_key(k, 0);
++		ctl_say(s, "OK\n");
+ 	} else {
+-		ctl_say(s, "ERR commands: tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot\n");
++		ctl_say(s, "ERR commands: tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot | type TEXT | enter | backspace [N] | key NAME\n");
+ 	}
+ }
+ 
+ static void
+ ud_ctl_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	static char line[128];
++	static char line[512];
+ 	socket_t ls = NULL;
+ 	for (;;) {
+ 		if (ls == NULL) {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index cad9f59..567b62d 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -386,8 +386,54 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
++/*
++ * 0307: a keyboard for the remote control (bsd/dev/sweet_usb.c "type"): usage page 7 key events
++ * from a GenericDesktop/Keyboard service. It registers on its first key, so until the PC types
++ * iOS sees no hardware keyboard and keeps the on-screen one.
++ */
++class SweetHIDKeyboard : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDKeyboard);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void key(UInt32 usage, bool down);
++	bool fRegistered;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Keyboard; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++};
++OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static SweetHIDKeyboard *gSweetKeyboard;
++
++bool
++SweetHIDKeyboard::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	gSweetKeyboard = this;
++	IOLog("SWEET HID: keyboard ready (registers on its first key)\n");
++	return true;
++}
++
++void
++SweetHIDKeyboard::key(UInt32 usage, bool down)
++{
++	if (!fRegistered) {
++		fRegistered = true;
++		registerService();
++		IOLog("SWEET HID: keyboard registered\n");
++		IOSleep(500);           /* let backboardd open it before the first key */
++	}
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_KeyboardOrKeypad, usage, down);
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -609,6 +655,15 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++/* usage: HID keyboard page (7) usage */
++extern "C" void
++sweet_hid_kbd(uint32_t usage, int down)
++{
++	if (gSweetKeyboard) {
++		gSweetKeyboard->key(usage, down != 0);
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c0d5d8d..c91ee01 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDKeyboard;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDKeyboard;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
