@@ -1,0 +1,162 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a9f325b..9d603a8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -43,6 +43,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static int ud_ncm;                              /* defined with the descriptors (0298) */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -101,6 +102,7 @@ sweet_usb_probe(void)
+ 
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	PE_parse_boot_argn("sweetusbncm", &ud_ncm, sizeof(ud_ncm));
+ 	if (!enabled) {
+ 		return;
+ 	}
+@@ -368,6 +370,33 @@ static const uint8_t ud_cfg_desc[80] = {
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+ };
++/*
++ * 0298: the same function as CDC-NCM (class 0x02/0x0d), which Windows 10/11 drive with their
++ * built-in UsbNcm (they have no ECM driver), as do Linux (cdc_ncm) and macOS. NCM functional
++ * descriptor 1.00, no optional requests; the data interface speaks protocol 0x01 (NTB). Frames go
++ * one per NTB16 both ways (wNtbOutMaxDatagrams 1). Boot-arg sweetusbncm=0 keeps ECM; the default
++ * is NCM on taimen, ECM on sweet.
++ */
++static const uint8_t ud_cfg_desc_ncm[86] = {
++	9, 2, 86, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	9, 4, 0, 0, 1, 0x02, 0x0d, 0x00, 0,             /* comm interface 0: CDC NCM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	6, 0x24, 0x1a, 0x00, 0x01, 0x00,                /* NCM 1.00, no optional capabilities */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x01, 0,             /* data interface 1 alt 0: no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x01, 0,             /* data interface 1 alt 1: NTB, two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++static int ud_ncm = 1;
++#else
++static int ud_ncm = 0;
++#endif
++#define NCM_NTB_MAX     0x800                   /* dwNtbIn/OutMaxSize: one frame buffer */
++
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+ 	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
+@@ -431,7 +460,7 @@ ud_configure(void)
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+ 	ud_rx_arm();
+-	printf("SWEET USB: ECM endpoints configured\n");
++	printf("SWEET USB: %s endpoints configured\n", ud_ncm ? "NCM" : "ECM");
+ }
+ 
+ static void
+@@ -448,14 +477,36 @@ ud_setup(void)
+ 
+ 	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+ 	ud.data_in = (type & 0x80) != 0;
+-	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
++	if ((type & 0x60) == 0x20 && ud_ncm && (type & 0x80) && req == 0x80) {   /* GET_NTB_PARAMETERS */
++		static const uint16_t w[14] = {
++			0x1c, 0x0001,                           /* wLength, bmNtbFormatsSupported: NTB16 */
++			NCM_NTB_MAX, 0,                         /* dwNtbInMaxSize */
++			4, 0, 4, 0,                             /* wNdpInDivisor, PayloadRemainder, Alignment, reserved */
++			NCM_NTB_MAX, 0,                         /* dwNtbOutMaxSize */
++			4, 0, 4, 1,                             /* wNdpOut..., wNtbOutMaxDatagrams 1 */
++		};
++		memcpy(data, w, sizeof(w));
++		n = sizeof(w);
++	} else if ((type & 0x60) == 0x20 && ud_ncm && (type & 0x80) && req == 0x83) {    /* GET_NTB_FORMAT */
++		data[0] = 0; data[1] = 0; n = 2;        /* NTB16 */
++	} else if ((type & 0x60) == 0x20 && ud_ncm && (type & 0x80) && req == 0x85) {    /* GET_NTB_INPUT_SIZE */
++		data[0] = NCM_NTB_MAX & 0xff; data[1] = NCM_NTB_MAX >> 8; data[2] = 0; data[3] = 0; n = 4;
++	} else if ((type & 0x60) == 0x20) {    /* class request (SET_ETHERNET_PACKET_FILTER, SET_NTB_*) */
++		ok = (type & 0x80) == 0;        /* setters accepted, their data stage read and ignored */
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+ 		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 2:
++			if (ud_ncm) {
++				memcpy(data, ud_cfg_desc_ncm, sizeof(ud_cfg_desc_ncm));
++				n = sizeof(ud_cfg_desc_ncm);
++			} else {
++				memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc));
++				n = sizeof(ud_cfg_desc);
++			}
++			break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -519,6 +570,23 @@ ud_rx_done(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	uint32_t off = 0;
++	if (ud_ncm) {
++		/* NTH16 "NCMH" (wNdpIndex at +10) -> NDP16 "NCM0", {index, length} pairs: the first datagram */
++		const uint8_t *b = (const uint8_t *)(ud.dma + UD_RX);
++		uint32_t ndp = len >= 12 ? (uint32_t)(b[10] | b[11] << 8) : 0;
++		if (len < 12 || memcmp(b, "NCMH", 4) != 0 || ndp + 16 > len || memcmp(b + ndp, "NCM0", 4) != 0) {
++			ud_rx_arm();
++			return;
++		}
++		off = (uint32_t)(b[ndp + 8] | b[ndp + 9] << 8);
++		uint32_t dl = (uint32_t)(b[ndp + 10] | b[ndp + 11] << 8);
++		if (off == 0 || off + dl > len) {
++			ud_rx_arm();
++			return;
++		}
++		len = dl;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+@@ -530,7 +598,7 @@ ud_rx_done(void)
+ 		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+ 			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX + off), len);
+ 			mbuf_setlen(m, len);
+ 			mbuf_pkthdr_setlen(m, len);
+ 			void *frame_header = mbuf_data(m);
+@@ -562,7 +630,24 @@ ud_tx_kick_locked(void)
+ 			mbuf_freem(m);
+ 			continue;
+ 		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		if (ud_ncm) {
++			/* NTH16 (12) + NDP16 (16: one datagram and the terminator) + the frame at 28 */
++			uint8_t *b = (uint8_t *)(ud.dma + UD_TX);
++			uint16_t total = (uint16_t)(28 + len), seq = (uint16_t)ud.tx_frames;
++			bzero(b, 28);
++			memcpy(b, "NCMH", 4);
++			b[4] = 12; b[6] = (uint8_t)seq; b[7] = (uint8_t)(seq >> 8);
++			b[8] = (uint8_t)total; b[9] = (uint8_t)(total >> 8);
++			b[10] = 12;                                     /* wNdpIndex */
++			memcpy(b + 12, "NCM0", 4);
++			b[16] = 16;                                     /* wLength */
++			b[20] = 28;                                     /* datagram index */
++			b[22] = (uint8_t)len; b[23] = (uint8_t)(len >> 8);
++			mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX + 28));
++			len += 28;
++		} else {
++			mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		}
+ 		mbuf_freem(m);
+ 		/* A frame of a multiple of 512 bytes would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
