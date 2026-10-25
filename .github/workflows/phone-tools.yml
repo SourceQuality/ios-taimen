@@ -1,0 +1,62 @@
+name: phone-tools
+
+# The on-phone helper programs (tools/phone/build.sh) for iOS 16 arm64, with
+# Xcode's iPhoneOS SDK, signed ad hoc with their entitlements.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/phone/**"
+      - ".github/workflows/phone-tools.yml"
+
+concurrency:
+  group: phone-tools-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  XCODE_PREFER: "15.4"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_"$XCODE_PREFER"*.app 2>/dev/null | sort -V | head -1)
+          [ -n "$XC" ] || XC=$(dirname "$(dirname "$(xcode-select -p)")")
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR=$XC/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build
+        run: tools/phone/build.sh
+
+      - name: Inspect
+        run: |
+          for f in tools/phone/out/*; do
+            file "$f"
+            otool -L "$f"
+            codesign -d --entitlements - "$f" 2>&1 | tail -20
+          done
+
+      - name: Collect
+        run: |
+          mkdir -p artifact
+          cp tools/phone/out/* artifact/
+          echo "commit $GITHUB_SHA run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > artifact/BUILDINFO.txt
+          (cd artifact && shasum -a 256 $(ls | grep -v BUILDINFO) > SHA256SUMS)
+          cat artifact/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phone-tools
+          path: artifact/
+          if-no-files-found: error
