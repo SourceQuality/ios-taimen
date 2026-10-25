@@ -972,3 +972,29 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   set): ABL drives the port over the USB3 PHY with the USB2 PHY off, so at high speed there is no UTMI clock.
   0300: stay at SuperSpeed (DCFG speed 4) with USB 3.0 descriptors (ep0 2^9, BOS, endpoint companions, 1024-byte
   bulk), SET_SEL/SET_ISOCH_DELAY accepted, ep0 kept at 512 after connect. sweetusbss=0 forces high speed.
+- 2026-10-24 boot 132 (r120 = +0300, SuperSpeed): no endpoint 0 timeout, the gadget runs, but the link stays in
+  RX.Detect (DSTS 0x0096032c, link state 5) and the PC sees nothing. The probe's DSTS 0x00d32544 says halted,
+  SS.Disabled, last connected at SuperSpeed: ABL stopped its fastboot link and powered its PHYs down on the way
+  out. 0301: both PHYs back up before the controller restarts, as Linux brings them up (phy-qcom-qusb2.c
+  msm8998: clear POWER_DOWN only; phy-qcom-qmp-usbc.c msm8998 tables when the USB3 PHY is down; aux and pipe
+  clocks GCC 0x50000/0x50004), the link state logged on every change.
+- 2026-10-24 **boot 133 (r121 = +0301): Windows enumerates the phone** ("Sweet iOS (USB Ethernet)", class Net,
+  UsbNcm bound). QUSB2 back up (PWR_CTRL1 0x23 -> 0x22, PLL_STATUS 0x17 ready); ABL left the USB3 PHY running
+  (32 table values differ from Linux's; left alone). The SuperSpeed attempt fails (RX.Detect, then SS.Disabled)
+  and the core falls back to high speed by itself 83 ms in: bus reset, connect at high speed, address,
+  descriptors, SET_CONFIGURATION, NCM data alt 1, GET_NTB_PARAMETERS; ue0 rx 158 / tx 50 frames. The PC had no
+  address on the link (169.254, no admin rights to set one). 0302: the gadget answers the PC's DHCP itself
+  (192.168.7.1/24, no router, no DNS) and serves the console on TCP 5141 (the PC connects out: no firewall
+  rule; tools/windows/usblog.ps1).
+- 2026-10-24 **boot 134 (r122 = +0302, 360 s): USB networking works.** DHCP DISCOVER/OFFER/REQUEST/ACK in the
+  first second, Windows' adapter 192.168.7.1/24 (Dhcp), ping 192.168.7.2 0-1 ms, the TCP live log 1.6 MB in
+  2 minutes, ue0 rx 1943 / tx 4675 frames by the deadline; WSL reaches 192.168.7.2 too. netsvcd
+  (tools/phone/netsvcd.c, CI workflow phone-tools.yml, ad hoc signed with the SCDynamicStore write
+  entitlement; mkrootfix.py --zfile + --daemon com.sweet.netsvcd) was written by ROOTFIX and exec'd by
+  launchd once (never restarted), but its stdout on /dev/console does not reach the kernel log.
+  Internet for iOS, two ways: (1) NAT on the PC, admin once: tools/windows/usb-share.ps1 (WinNAT
+  192.168.7.0/24); (2) no admin: netsvcd adds an HTTP/HTTPS proxy 127.0.0.1:8080 to the service while the
+  PC's agent (tools/taimen/usbproxy.py, WSL) keeps idle connections open to 192.168.7.2:5142, and splices app
+  connections onto them; netsvcd status on 5143 (usbproxy.py --status). 0303 logs the first off-link packets
+  (proof of the default route). 0304: remote control on TCP 5144 (tools/taimen/phonectl.py tap / swipe /
+  unlock / shot OUT.png at 1125x2436 from the last swapped surface).
