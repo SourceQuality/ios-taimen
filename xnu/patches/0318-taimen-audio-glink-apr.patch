@@ -1,0 +1,1009 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 7a059ff..520f3e2 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -10,6 +10,9 @@
+  *   carve-out (0x8B200000, 26 MB), AUTH_AND_RESET; then READY (bit 1 of "slave-kernel" in the
+  *   ADSP's item 443) within 5 s.
+  *
++ * 3 (0318): GLINK on the lpass edge, QRTR (pd-mapper: no domains), the APR channel apr_audio_svc.
++ * 4 (0318): the AVCS core says ready (AVCS_CMD_ADSP_EVENT_GET_STATE = 1); its service versions.
++ *
+  * SMEM, the hwlock and SMP2P as TaimenModem.cpp (from ios-topaz TopazModem.cpp), with the ADSP's
+  * host id, items and doorbell bits. Only partitions APPS is a host of are read (another pair's
+  * header hung a CPU, boot 109).
+@@ -94,6 +97,16 @@ struct smp2p_entry { char name[16]; uint32_t value; } __attribute__((packed));
+ 
+ static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
+ 
++static uint64_t t0;                     /* the ADSP's reset, for the GLINK/QRTR/APR log */
++static unsigned
++ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return (unsigned)(ns / 1000000);
++}
++#define T   ms() / 1000, ms() % 1000
++
+ static uint64_t
+ now_ms(void)
+ {
+@@ -625,6 +638,7 @@ stage2(void)
+ 	if (!pas_boot()) {
+ 		return false;
+ 	}
++	t0 = mach_absolute_time();
+ 	uint64_t t1 = now_ms(), seen = 0;
+ 	struct smp2p_hdr *in = NULL;
+ 	volatile uint32_t *slave = NULL;
+@@ -663,12 +677,917 @@ stage2(void)
+ 	return true;
+ }
+ 
++/* ---------------------------------------------------------------- GLINK (lpass edge) */
++
++/*
++ * Stage 3 (0318): GLINK over SMEM in the APPS<->ADSP partition (descriptor 478, our TX FIFO 479,
++ * the ADSP's RX FIFO 480; doorbell APCS IPC bit 9), QRTR on IPCRTR with a pd-mapper that answers
++ * no domains, and APR on apr_audio_svc. Multi-channel GLINK and QRTR from ios-topaz 0144
++ * TopazAudio.cpp (a port of topaz-woa's Glink.c/Qrtr.c), with this file's SMEM and doorbell.
++ */
++
++#define ITEM_GLINK_DESC     478
++#define ITEM_GLINK_FIFO_TX  479
++#define ITEM_GLINK_FIFO_RX  480
++#define GLINK_TX_SIZE       0x4000
++
++enum {
++	CMD_VERSION = 0, CMD_VERSION_ACK = 1, CMD_OPEN = 2, CMD_CLOSE = 3, CMD_OPEN_ACK = 4, CMD_INTENT = 5,
++	CMD_RX_DONE = 6, CMD_RX_INTENT_REQ = 7, CMD_RX_INTENT_REQ_ACK = 8, CMD_TX_DATA = 9, CMD_CLOSE_ACK = 11,
++	CMD_TX_DATA_CONT = 12, CMD_READ_NOTIF = 13, CMD_RX_DONE_W_REUSE = 14, CMD_SIGNALS = 15,
++};
++
++#define MAX_CHANS           8
++#define OUR_INTENTS         8
++#define OUR_INTENT_SIZE     0x4400
++#define MAX_RINTENTS        256
++#define TXQ_LEN             32
++
++struct glink_msg { uint16_t cmd, p1; uint32_t p2; } __attribute__((packed));
++struct glink_data_hdr { struct glink_msg m; uint32_t chunk, left; } __attribute__((packed));
++
++typedef void (*glink_rx_t)(const uint8_t *data, uint32_t len);
++
++struct rintent { uint32_t id, size; bool used; };
++struct chan {
++	char       name[32];
++	glink_rx_t rx;                          /* NULL: not ours, only acked */
++	uint16_t   lcid;
++	uint32_t   rcid;
++	bool       remote_open, open_sent, open_acked, intents_sent, intent_req_sent;
++	struct rintent ri[MAX_RINTENTS];
++	uint32_t   ri_count;
++	uint8_t   *asm_buf;                     /* reassembly, OUR_INTENT_SIZE */
++	uint32_t   asm_len;
++	void      *txq[TXQ_LEN];
++	uint32_t   txq_len[TXQ_LEN];
++	uint32_t   txq_head, txq_tail, txq_drops;
++	uint32_t   rx_pkts, tx_pkts, ri_lost, intent_reqs;
++};
++
++static volatile uint32_t *g_desc;               /* [0] tx tail [1] tx head [2] rx tail [3] rx head */
++static uint8_t *g_tx, *g_rx;
++static uint32_t g_rx_len, g_features = 1, g_next_intent = 1, g_chans;
++static struct chan *g_ch;                       /* MAX_CHANS */
++static uint32_t g_rx_msgs, g_tx_msgs;
++static bool g_dead;
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t h = g_desc[3], t = g_desc[2];
++	return h >= t ? h - t : g_rx_len - t + h;
++}
++
++static void
++rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t t = g_desc[2] + off;
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	uint32_t n1 = MIN(n, g_rx_len - t);
++	memcpy(dst, g_rx + t, n1);
++	if (n > n1) {
++		memcpy((uint8_t *)dst + n1, g_rx, n - n1);
++	}
++}
++
++static void
++rx_advance(uint32_t n)
++{
++	uint32_t t = g_desc[2] + n;
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	mb();
++	g_desc[2] = t;
++}
++
++static uint32_t
++tx_put(uint32_t head, const void *src, uint32_t n)
++{
++	uint32_t n1 = MIN(n, GLINK_TX_SIZE - head);
++	memcpy(g_tx + head, src, n1);
++	if (n > n1) {
++		memcpy(g_tx, (const uint8_t *)src + n1, n - n1);
++	}
++	head += n;
++	return head >= GLINK_TX_SIZE ? head - GLINK_TX_SIZE : head;
++}
++
++static bool
++tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t head = 0, tail, avail, n;
++
++	for (n = 0; n < 1000; n++) {
++		head = g_desc[1];
++		tail = g_desc[0];
++		avail = tail <= head ? GLINK_TX_SIZE - head + tail : tail - head;
++		avail = avail < 8 ? 0 : avail - 8;
++		if (avail >= ((hlen + dlen + 7) & ~7u)) {
++			break;
++		}
++		IODelay(100);
++	}
++	if (n == 1000) {
++		LOG("glink TX FIFO full");
++		return false;
++	}
++	head = tx_put(head, hdr, hlen);
++	if (dlen != 0) {
++		head = tx_put(head, data, dlen);
++	}
++	head = (head + 7) & ~7u;
++	if (head >= GLINK_TX_SIZE) {
++		head -= GLINK_TX_SIZE;
++	}
++	mb();
++	g_desc[1] = head;
++	mb();
++	apcs_kick(ADSP_GLINK_BIT);
++	g_tx_msgs++;
++	return true;
++}
++
++static void
++send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct glink_msg m = { cmd, p1, p2 };
++	tx_write(&m, sizeof(m), NULL, 0);
++}
++
++static struct chan *
++by_name(const char *name)
++{
++	for (uint32_t i = 0; i < g_chans; i++) {
++		if (strcmp(g_ch[i].name, name) == 0) {
++			return &g_ch[i];
++		}
++	}
++	return NULL;
++}
++
++static struct chan *
++by_rcid(uint32_t rcid)
++{
++	for (uint32_t i = 0; i < g_chans; i++) {
++		if (g_ch[i].remote_open && g_ch[i].rcid == rcid) {
++			return &g_ch[i];
++		}
++	}
++	return NULL;
++}
++
++static struct chan *
++add_chan(const char *name)
++{
++	if (g_chans == MAX_CHANS) {
++		return NULL;
++	}
++	struct chan *c = &g_ch[g_chans];
++	bzero(c, sizeof(*c));
++	strlcpy(c->name, name, sizeof(c->name));
++	c->lcid = (uint16_t)(g_chans + 1);
++	g_chans++;
++	return c;
++}
++
++static void
++glink_register(const char *name, glink_rx_t rx)
++{
++	struct chan *c = by_name(name);
++	if (c == NULL) {
++		c = add_chan(name);
++	}
++	if (c != NULL) {
++		c->rx = rx;
++		c->asm_buf = (uint8_t *)IOMallocZero(OUR_INTENT_SIZE);
++	}
++}
++
++static void
++send_open(struct chan *c)
++{
++	struct { struct glink_msg m; char name[32]; } req;
++	uint32_t len = (uint32_t)strlen(c->name) + 1;
++
++	bzero(&req, sizeof(req));
++	req.m.cmd = CMD_OPEN;
++	req.m.p1 = c->lcid;
++	req.m.p2 = len;
++	memcpy(req.name, c->name, len);
++	tx_write(&req, (8 + len + 7) & ~7u, NULL, 0);
++	c->open_sent = true;
++	LOG("t=%u.%03u glink OPEN \"%s\" lcid %u", T, c->name, c->lcid);
++}
++
++static void
++advertise_intents(struct chan *c, uint32_t count, uint32_t size)
++{
++	struct { struct glink_msg m; uint32_t pair[2 * OUR_INTENTS]; } m;
++
++	count = MIN(count, (uint32_t)OUR_INTENTS);
++	m.m.cmd = CMD_INTENT;
++	m.m.p1 = c->lcid;
++	m.m.p2 = count;
++	for (uint32_t i = 0; i < count; i++) {
++		m.pair[2 * i] = size;
++		m.pair[2 * i + 1] = g_next_intent++;
++	}
++	tx_write(&m, sizeof(struct glink_msg) + 8 * count, NULL, 0);
++}
++
++static bool
++chan_up(const struct chan *c)
++{
++	return c->remote_open && c->open_acked;
++}
++
++static bool
++glink_chan_up(const char *name)
++{
++	struct chan *c = by_name(name);
++	return c != NULL && chan_up(c);
++}
++
++static bool
++try_send(struct chan *c, const void *data, uint32_t len)
++{
++	uint32_t i;
++
++	for (i = 0; i < c->ri_count; i++) {
++		if (!c->ri[i].used && c->ri[i].size >= len) {
++			break;
++		}
++	}
++	if (i == c->ri_count) {
++		if (!c->intent_req_sent) {
++			send_cmd(CMD_RX_INTENT_REQ, c->lcid, len);
++			c->intent_req_sent = true;
++			c->intent_reqs++;
++		}
++		return false;
++	}
++	struct glink_data_hdr h = { { CMD_TX_DATA, c->lcid, c->ri[i].id }, len, 0 };
++	c->ri[i].used = true;
++	c->tx_pkts++;
++	return tx_write(&h, sizeof(h), data, len);
++}
++
++static void
++pump(struct chan *c)
++{
++	while (chan_up(c) && c->txq_head != c->txq_tail &&
++	    try_send(c, c->txq[c->txq_head % TXQ_LEN], c->txq_len[c->txq_head % TXQ_LEN])) {
++		IOFree(c->txq[c->txq_head % TXQ_LEN], c->txq_len[c->txq_head % TXQ_LEN]);
++		c->txq_head++;
++	}
++}
++
++/* queue a packet: it goes out when the channel is up and the ADSP has an intent for it */
++static bool
++glink_send(const char *name, const void *data, uint32_t len)
++{
++	struct chan *c = by_name(name);
++	void *copy;
++
++	if (c == NULL || c->txq_tail - c->txq_head >= TXQ_LEN || len == 0 || (copy = IOMalloc(len)) == NULL) {
++		if (c != NULL) {
++			c->txq_drops++;
++		}
++		return false;
++	}
++	memcpy(copy, data, len);
++	c->txq[c->txq_tail % TXQ_LEN] = copy;
++	c->txq_len[c->txq_tail % TXQ_LEN] = len;
++	c->txq_tail++;
++	pump(c);
++	return true;
++}
++
++static bool
++rx_one(void)
++{
++	struct glink_msg m;
++	uint32_t avail = rx_avail(), n;
++	struct chan *c;
++
++	if (avail < sizeof(m)) {
++		return false;
++	}
++	rx_peek(0, &m, sizeof(m));
++	g_rx_msgs++;
++
++	switch (m.cmd) {
++	case CMD_VERSION:
++		LOG("t=%u.%03u glink VERSION %u features %x", T, m.p1, m.p2);
++		rx_advance(8);
++		if (m.p1 != 0) {
++			g_features &= m.p2;
++			send_cmd(CMD_VERSION_ACK, 1, g_features);
++		}
++		break;
++	case CMD_VERSION_ACK:
++		LOG("t=%u.%03u glink VERSION_ACK %u features %x", T, m.p1, m.p2);
++		rx_advance(8);
++		if (m.p1 != 0 && m.p2 != g_features) {
++			g_features &= m.p2;
++			send_cmd(CMD_VERSION, 1, g_features);
++		}
++		break;
++	case CMD_OPEN: {
++		char name[33];
++		n = (8 + m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		bzero(name, sizeof(name));
++		rx_peek(8, name, MIN(m.p2, 32u));
++		rx_advance(n);
++		c = by_name(name);
++		if (c == NULL) {
++			c = add_chan(name);
++		}
++		LOG("t=%u.%03u glink ADSP OPEN \"%s\" rcid %u%s", T, name, m.p1, (c != NULL && c->rx != NULL) ? "" : " (no client)");
++		if (c != NULL) {
++			c->rcid = m.p1;
++			c->remote_open = true;
++			send_cmd(CMD_OPEN_ACK, (uint16_t)c->rcid, 0);
++			if (c->rx != NULL && !c->open_sent) {
++				send_open(c);
++			}
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
++		rx_advance(8);
++		for (uint32_t i = 0; i < g_chans; i++) {
++			if (g_ch[i].lcid == m.p1) {
++				g_ch[i].open_acked = true;
++				LOG("t=%u.%03u glink OPEN_ACK \"%s\"", T, g_ch[i].name);
++			}
++		}
++		break;
++	case CMD_CLOSE:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		LOG("t=%u.%03u glink ADSP CLOSE rcid %u \"%s\"", T, m.p1, c != NULL ? c->name : "?");
++		send_cmd(CMD_CLOSE_ACK, (uint16_t)m.p1, 0);
++		if (c != NULL) {
++			c->remote_open = false;
++			c->ri_count = 0;
++		}
++		break;
++	case CMD_INTENT:
++		n = (8 + 8 * m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		c = by_rcid(m.p1);
++		for (uint32_t i = 0; c != NULL && i < m.p2; i++) {
++			uint32_t pair[2];
++			rx_peek(8 + 8 * i, pair, 8);
++			if (c->ri_count < MAX_RINTENTS) {
++				c->ri[c->ri_count].size = pair[0];
++				c->ri[c->ri_count].id = pair[1];
++				c->ri[c->ri_count].used = false;
++				c->ri_count++;
++			} else {
++				c->ri_lost++;
++			}
++		}
++		rx_advance(n);
++		if (c != NULL) {
++			c->intent_req_sent = false;
++			pump(c);
++		}
++		break;
++	case CMD_RX_DONE:
++	case CMD_RX_DONE_W_REUSE:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		for (uint32_t i = 0; c != NULL && i < c->ri_count; i++) {
++			if (c->ri[i].id == m.p2) {
++				if (m.cmd == CMD_RX_DONE_W_REUSE) {
++					c->ri[i].used = false;
++				} else {
++					c->ri[i] = c->ri[--c->ri_count];
++				}
++				break;
++			}
++		}
++		if (c != NULL) {
++			pump(c);
++		}
++		break;
++	case CMD_RX_INTENT_REQ:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		LOG("t=%u.%03u glink \"%s\" wants an intent of %u bytes", T, c != NULL ? c->name : "?", m.p2);
++		if (c != NULL) {
++			advertise_intents(c, 1, MAX(m.p2, (uint32_t)OUR_INTENT_SIZE));
++			send_cmd(CMD_RX_INTENT_REQ_ACK, c->lcid, 1);
++		}
++		break;
++	case CMD_RX_INTENT_REQ_ACK:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		if (c != NULL && m.p2 == 0) {
++			c->intent_req_sent = false;
++		}
++		break;
++	case CMD_CLOSE_ACK:
++	case CMD_SIGNALS:
++		rx_advance(8);
++		break;
++	case CMD_READ_NOTIF:
++		rx_advance(8);
++		apcs_kick(ADSP_GLINK_BIT);
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		uint32_t hdr[2];
++		if (avail < 16) {
++			return false;
++		}
++		rx_peek(8, hdr, 8);                     /* chunk_size, left_size */
++		n = (16 + hdr[0] + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		c = by_rcid(m.p1);
++		if (c != NULL && c->asm_buf != NULL) {
++			if (m.cmd == CMD_TX_DATA) {
++				c->asm_len = 0;
++			}
++			if (c->asm_len + hdr[0] <= OUR_INTENT_SIZE) {
++				rx_peek(16, c->asm_buf + c->asm_len, hdr[0]);
++				c->asm_len += hdr[0];
++			}
++		}
++		rx_advance(n);
++		if (hdr[1] == 0 && c != NULL) {
++			c->rx_pkts++;
++			if (c->rx != NULL) {
++				c->rx(c->asm_buf, c->asm_len);
++			}
++			if (g_features & 1) {
++				send_cmd(CMD_RX_DONE_W_REUSE, c->lcid, m.p2);
++			} else {
++				send_cmd(CMD_RX_DONE, c->lcid, m.p2);
++				advertise_intents(c, 1, OUR_INTENT_SIZE);
++			}
++		}
++		break;
++	}
++	default:
++		LOG("t=%u.%03u glink unknown cmd %u (%x %x), RX stopped", T, m.cmd, m.p1, m.p2);
++		g_dead = true;
++		return false;
++	}
++	return true;
++}
++
++static bool
++glink_init(void)
++{
++	bool existed = smem_part_get(adsp_part, ITEM_GLINK_DESC, NULL) != NULL;
++
++	g_ch = (struct chan *)IOMallocZero(MAX_CHANS * sizeof(struct chan));
++	g_desc = (volatile uint32_t *)smem_alloc(adsp_part, ITEM_GLINK_DESC, 32);
++	g_tx = (uint8_t *)smem_alloc(adsp_part, ITEM_GLINK_FIFO_TX, GLINK_TX_SIZE);
++	if (g_ch == NULL || g_desc == NULL || g_tx == NULL) {
++		LOG("glink: no memory (desc %p tx %p)", g_desc, g_tx);
++		g_dead = true;
++		return false;
++	}
++	LOG("glink desc %s", existed ? "existed" : "ours");
++	g_desc[2] = 0;                              /* rx tail */
++	g_desc[1] = 0;                              /* tx head */
++	mb();
++	send_cmd(CMD_VERSION, 1, g_features);
++	return true;
++}
++
++static bool
++glink_poll(void)
++{
++	uint32_t rx0 = g_rx_msgs, tx0 = g_tx_msgs, sz = 0, i;
++
++	if (g_dead || g_desc == NULL) {
++		return false;
++	}
++	if (g_rx == NULL) {
++		g_rx = (uint8_t *)smem_part_get(adsp_part, ITEM_GLINK_FIFO_RX, &sz);
++		if (g_rx == NULL) {
++			return false;
++		}
++		g_rx_len = sz;
++		LOG("t=%u.%03u ADSP RX FIFO, %u bytes", T, sz);
++	}
++	for (i = 0; i < 64 && !g_dead && rx_one(); i++) {
++	}
++	for (i = 0; i < g_chans; i++) {
++		struct chan *c = &g_ch[i];
++		if (c->rx == NULL) {
++			continue;
++		}
++		/* the ADSP opens its channels first; if it has not after 8 s, open from our side */
++		if (!c->open_sent && ms() >= 8000) {
++			send_open(c);
++		}
++		if (chan_up(c) && !c->intents_sent) {
++			advertise_intents(c, OUR_INTENTS, OUR_INTENT_SIZE);
++			c->intents_sent = true;
++			LOG("t=%u.%03u \"%s\" open both ways", T, c->name);
++		}
++		pump(c);
++	}
++	return g_rx_msgs != rx0 || g_tx_msgs != tx0;
++}
++
++static void
++glink_summary(void)
++{
++	LOG("glink: rx %u msgs, tx %u%s", g_rx_msgs, g_tx_msgs, g_dead ? " (DEAD)" : "");
++	for (uint32_t i = 0; i < g_chans; i++) {
++		struct chan *c = &g_ch[i];
++		LOG(" chan \"%s\" lcid %u rcid %u %s%s rx %u tx %u, remote intents %u, txq %u drops %u", c->name, c->lcid, c->rcid,
++		    chan_up(c) ? "UP" : "down", c->rx == NULL ? " (no client)" : "", c->rx_pkts, c->tx_pkts, c->ri_count,
++		    c->txq_tail - c->txq_head, c->txq_drops);
++	}
++}
++
++/* ---------------------------------------------------------------- QRTR + pd-mapper */
++
++#define QCHAN               "IPCRTR"
++#define QRTR_NODE_APPS      1
++#define QRTR_PORT_CTRL      0xFFFFFFFEu
++enum {
++	QRTR_TYPE_DATA = 1, QRTR_TYPE_HELLO = 2, QRTR_TYPE_BYE = 3, QRTR_TYPE_NEW_SERVER = 4, QRTR_TYPE_DEL_SERVER = 5,
++	QRTR_TYPE_DEL_CLIENT = 6, QRTR_TYPE_RESUME_TX = 7, QRTR_TYPE_EXIT = 8, QRTR_TYPE_PING = 9,
++	QRTR_TYPE_NEW_LOOKUP = 10, QRTR_TYPE_DEL_LOOKUP = 11,
++};
++#define SVC_PDM             0x40
++#define PORT_PDM            0x4001
++#define QMI_REQ             0
++#define QMI_RESP            2
++
++struct qrtr_v1 { uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port; } __attribute__((packed));
++struct qrtr_v2 { uint8_t version, type, flags, optlen; uint32_t size; uint16_t src_node, src_port, dst_node, dst_port; } __attribute__((packed));
++struct qrtr_ctrl { uint32_t cmd, a, b, c, d; } __attribute__((packed));
++
++static uint32_t q_ver = 1, q_node = 0xFFFFFFFFu;
++static bool q_hello_rx, q_hello_sent, q_announced;
++static uint32_t q_services, q_lookups, q_pdreqs, q_other, q_resumes;
++
++static void
++qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
++{
++	uint8_t buf[sizeof(struct qrtr_v1) + 512];
++	uint32_t n;
++
++	if (len > 512) {
++		return;
++	}
++	bzero(buf, sizeof(buf));
++	if (q_ver == 2) {
++		struct qrtr_v2 *h = (struct qrtr_v2 *)buf;
++		h->version = 2;
++		h->type = (uint8_t)type;
++		h->flags = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = (uint16_t)src_port;
++		h->dst_node = (uint16_t)dst_node;
++		h->dst_port = (uint16_t)dst_port;
++		n = sizeof(*h);
++	} else {
++		struct qrtr_v1 *h = (struct qrtr_v1 *)buf;
++		h->version = 1;
++		h->type = type;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = src_port;
++		h->confirm_rx = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->dst_node = dst_node;
++		h->dst_port = dst_port;
++		n = sizeof(*h);
++	}
++	memcpy(buf + n, payload, len);
++	glink_send(QCHAN, buf, (n + len + 3) & ~3u);
++}
++
++static void
++send_ctrl(uint32_t type, uint32_t dst_node, uint32_t dst_port, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{
++	struct qrtr_ctrl m = { type, a, b, c, d };
++	qrtr_send(type, QRTR_PORT_CTRL, dst_node, dst_port, &m, sizeof(m));
++}
++
++/*
++ * MSM8998: the audio service lives in the ADSP's root PD; Android's PDR lookup of avs/audio on this
++ * phone found no domains (docs/taimen-audio-plan.md section 2), so every lookup answers 0.
++ */
++static const struct { const char *svc, *domain; } pd_map[1] = { { NULL, NULL } };
++
++static const uint8_t *
++qm_find(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
++{
++	uint32_t o = 7;
++
++	while (o + 3 <= len) {
++		uint16_t l = *(const uint16_t *)(d + o + 1);
++		if (o + 3 + l > len) {
++			break;
++		}
++		if (d[o] == type) {
++			*tlen = l;
++			return d + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++static uint32_t
++qm_tlv(uint8_t *m, uint32_t n, uint8_t type, const void *v, uint16_t len)
++{
++	m[n] = type;
++	*(uint16_t *)(m + n + 1) = len;
++	memcpy(m + n + 3, v, len);
++	return n + 3 + len;
++}
++
++static void
++pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	uint8_t m[400], list[300];
++	char name[80];
++	uint16_t r[2] = { 0, 0 }, v, l = 0;
++	const uint8_t *s;
++	uint32_t n = 7, ln = 1, cnt = 0, inst = 74, zero = 0;
++
++	m[0] = QMI_RESP;
++	*(uint16_t *)(m + 1) = txn;
++	*(uint16_t *)(m + 3) = msg;
++	name[0] = 0;
++	s = qm_find(d, len, 1, &l);
++	if (s != NULL) {
++		l = (uint16_t)MIN((size_t)l, sizeof(name) - 1);
++		memcpy(name, s, l);
++		name[l] = 0;
++	}
++	n = qm_tlv(m, n, 2, r, 4);
++	if (msg == 0x21) {                          /* GET_DOMAIN_LIST */
++		for (unsigned i = 0; i < sizeof(pd_map) / sizeof(pd_map[0]); i++) {
++			if (pd_map[i].svc == NULL || strcmp(pd_map[i].svc, name) != 0) {
++				continue;
++			}
++			uint32_t dl = (uint32_t)strlen(pd_map[i].domain);
++			list[ln++] = (uint8_t)dl;
++			memcpy(list + ln, pd_map[i].domain, dl);
++			ln += dl;
++			memcpy(list + ln, &inst, 4);
++			ln += 4;
++			list[ln++] = 0;                 /* service_data_valid */
++			memcpy(list + ln, &zero, 4);
++			ln += 4;
++			cnt++;
++		}
++		list[0] = (uint8_t)cnt;
++		v = (uint16_t)cnt;
++		n = qm_tlv(m, n, 0x10, &v, 2);          /* total_domains */
++		v = 1;
++		n = qm_tlv(m, n, 0x11, &v, 2);          /* db_rev_count */
++		if (cnt != 0) {
++			n = qm_tlv(m, n, 0x12, list, (uint16_t)ln);
++		}
++	}
++	*(uint16_t *)(m + 5) = (uint16_t)(n - 7);
++	qrtr_send(QRTR_TYPE_DATA, PORT_PDM, node, port, m, n);
++	q_pdreqs++;
++	LOG("t=%u.%03u pd-mapper: msg %x \"%s\" -> %u domain(s)", T, msg, name, cnt);
++}
++
++static void
++qrtr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t type, src_node, src_port, dst_port, size, hlen, confirm;
++
++	if (len >= sizeof(struct qrtr_v1) && *(const uint32_t *)p == 1) {
++		const struct qrtr_v1 *h = (const struct qrtr_v1 *)p;
++		type = h->type; src_node = h->src_node; src_port = h->src_port; dst_port = h->dst_port;
++		size = h->size; hlen = sizeof(*h); confirm = h->confirm_rx;
++		q_ver = 1;
++	} else if (len >= sizeof(struct qrtr_v2) && p[0] == 2) {
++		const struct qrtr_v2 *h = (const struct qrtr_v2 *)p;
++		type = h->type; src_node = h->src_node; src_port = h->src_port; dst_port = h->dst_port;
++		size = h->size; hlen = sizeof(*h) + h->optlen * 4; confirm = h->flags & 1;
++		src_port = src_port == 0xFFFE ? QRTR_PORT_CTRL : src_port;
++		dst_port = dst_port == 0xFFFE ? QRTR_PORT_CTRL : dst_port;
++		q_ver = 2;
++	} else {
++		LOG("t=%u.%03u qrtr: bad packet, %u bytes", T, len);
++		return;
++	}
++	if (hlen + size > len) {
++		LOG("t=%u.%03u qrtr: truncated (%u + %u > %u)", T, hlen, size, len);
++		return;
++	}
++	struct qrtr_ctrl c;
++	bzero(&c, sizeof(c));
++	memcpy(&c, p + hlen, MIN((uint32_t)sizeof(c), size));
++
++	switch (type) {
++	case QRTR_TYPE_HELLO:
++		q_node = src_node;
++		q_hello_rx = true;
++		q_hello_sent = false;                   /* (re)answer with our HELLO */
++		LOG("t=%u.%03u qrtr v%u HELLO from node %u", T, q_ver, src_node);
++		break;
++	case QRTR_TYPE_NEW_SERVER:
++		if (c.a == 0 && c.b == 0) {
++			break;
++		}
++		q_services++;
++		LOG("t=%u.%03u ADSP service %x v%u inst %x node %u port %x", T, c.a, c.b & 0xFF, c.b >> 8, c.c, c.d);
++		break;
++	case QRTR_TYPE_NEW_LOOKUP:
++		q_lookups++;
++		if (c.a == 0 || c.a == SVC_PDM) {
++			send_ctrl(QRTR_TYPE_NEW_SERVER, src_node, src_port, SVC_PDM, 0x101, QRTR_NODE_APPS, PORT_PDM);
++		}
++		send_ctrl(QRTR_TYPE_NEW_SERVER, src_node, src_port, 0, 0, 0, 0);
++		break;
++	case QRTR_TYPE_DATA:
++		if (confirm) {
++			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
++			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
++		}
++		if (dst_port == PORT_PDM && size >= 7 && p[hlen] == QMI_REQ) {
++			pdm_rx(src_node, src_port, *(const uint16_t *)(p + hlen + 1), *(const uint16_t *)(p + hlen + 3), p + hlen, size);
++		} else if (q_other++ < 16) {
++			LOG("t=%u.%03u qrtr DATA %u:%x -> port %x, %u B", T, src_node, src_port, dst_port, size);
++		}
++		break;
++	case QRTR_TYPE_RESUME_TX:
++		q_resumes++;
++		break;
++	default:
++		if (q_other++ < 16) {
++			LOG("t=%u.%03u qrtr type %u from %u:%x", T, type, src_node, src_port);
++		}
++		break;
++	}
++}
++
++static void
++qrtr_poll(void)
++{
++	if (!glink_chan_up(QCHAN)) {
++		return;
++	}
++	if (!q_hello_sent) {
++		send_ctrl(QRTR_TYPE_HELLO, q_node, QRTR_PORT_CTRL, 0, 0, 0, 0);
++		q_hello_sent = true;
++		LOG("t=%u.%03u sent qrtr HELLO to node %x", T, q_node);
++	}
++	if (q_hello_rx && !q_announced) {
++		send_ctrl(QRTR_TYPE_NEW_SERVER, q_node, QRTR_PORT_CTRL, SVC_PDM, 0x101, QRTR_NODE_APPS, PORT_PDM);
++		q_announced = true;
++		LOG("t=%u.%03u announced pd-mapper 0x40", T);
++	}
++}
++
++/* ---------------------------------------------------------------- APR (Elite) */
++
++/*
++ * APR rides GLINK channel "apr_audio_svc" on the lpass edge, one packet per message (WH
++ * apr_tal_glink.c). Header 20 bytes; replies are APR_BASIC_RSP_RESULT {opcode, status} or a
++ * command's own response. IDs as Linux dt-bindings qcom,apr.h / HackiOS redwood_audio.h.
++ */
++#define ACHAN                   "apr_audio_svc"
++#define APR_DOMAIN_ADSP         4
++#define APR_DOMAIN_APPS         5
++#define APR_SVC_CORE            3
++#define APR_SVC_AFE             4
++#define APR_SVC_ASM             7
++#define APR_SVC_ADM             8
++#define APR_HDR_SEQ_CMD         ((2u << 8) | (5u << 4))         /* SEQ_CMD, 5 words, version 0 */
++#define APR_BASIC_RSP_RESULT    0x000110E8u
++#define AVCS_GET_VERSIONS       0x00012905u
++#define AVCS_GET_VERSIONS_RSP   0x00012906u
++#define AVCS_GET_STATE          0x0001290Cu     /* AVCS_CMD_ADSP_EVENT_GET_STATE */
++#define AVCS_GET_STATE_RSP      0x0001290Du
++
++struct apr_hdr {
++	uint16_t hdr_field, pkt_size;
++	uint8_t  src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t  dest_svc, dest_domain;
++	uint16_t dest_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
++
++static uint32_t apr_token = 1, apr_rx_pkts, apr_tx_pkts;
++static int adsp_core_state = -1;        /* AVCS state: 1 = ready */
++static bool apr_versions_done;
++static unsigned apr_last_ask, apr_asks;
++
++static bool
++apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len)
++{
++	uint8_t buf[sizeof(struct apr_hdr) + 256];
++	if (len > 256) {
++		return false;
++	}
++	struct apr_hdr *h = (struct apr_hdr *)buf;
++	h->hdr_field = APR_HDR_SEQ_CMD;
++	h->pkt_size = (uint16_t)(sizeof(*h) + len);
++	h->src_svc = svc;                       /* the client mirrors the service it talks to */
++	h->src_domain = APR_DOMAIN_APPS;
++	h->src_port = port;
++	h->dest_svc = svc;
++	h->dest_domain = APR_DOMAIN_ADSP;
++	h->dest_port = port;
++	h->token = apr_token++;
++	h->opcode = opcode;
++	if (len != 0) {
++		memcpy(buf + sizeof(*h), payload, len);
++	}
++	apr_tx_pkts++;
++	return glink_send(ACHAN, buf, sizeof(*h) + len);
++}
++
++static void
++apr_rx(const uint8_t *d, uint32_t len)
++{
++	if (len < sizeof(struct apr_hdr)) {
++		LOG("t=%u.%03u apr: short packet, %u bytes", T, len);
++		return;
++	}
++	const struct apr_hdr *h = (const struct apr_hdr *)d;
++	uint32_t hlen = ((h->hdr_field >> 4) & 0xF) * 4;
++	const uint32_t *p = (const uint32_t *)(d + (hlen >= sizeof(*h) && hlen <= len ? hlen : sizeof(*h)));
++	uint32_t plen = len > hlen ? len - hlen : 0;
++	apr_rx_pkts++;
++	switch (h->opcode) {
++	case AVCS_GET_STATE_RSP:
++		adsp_core_state = plen >= 4 ? (int)p[0] : -2;
++		LOG("t=%u.%03u apr: ADSP core state %d", T, adsp_core_state);
++		break;
++	case AVCS_GET_VERSIONS_RSP: {
++		uint32_t n = plen >= 8 ? p[1] : 0;
++		LOG("t=%u.%03u apr: AVCS build %#x, %u services", T, plen >= 4 ? p[0] : 0, n);
++		for (uint32_t i = 0; i < n && 8 + 8 * (i + 1) <= plen && i < 40; i++) {
++			LOG("t=%u.%03u apr:   service %#x version %#x", T, p[2 + 2 * i], p[3 + 2 * i]);
++		}
++		apr_versions_done = true;
++		break;
++	}
++	case APR_BASIC_RSP_RESULT:
++		LOG("t=%u.%03u apr: svc %u port %u: result of %#x = %#x", T, h->src_svc, h->src_port,
++		    plen >= 4 ? p[0] : 0, plen >= 8 ? p[1] : 0);
++		break;
++	default:
++		LOG("t=%u.%03u apr: svc %u port %u opcode %#x token %u, %u payload bytes: %08x %08x %08x", T, h->src_svc,
++		    h->src_port, h->opcode, h->token, plen, plen >= 4 ? p[0] : 0, plen >= 8 ? p[1] : 0, plen >= 12 ? p[2] : 0);
++		break;
++	}
++}
++
++/* Stage 4: ask the AVCS core until it says ready (1), then for the service versions. */
++static void
++apr_poll(void)
++{
++	if (!glink_chan_up(ACHAN)) {
++		return;
++	}
++	if (adsp_core_state != 1) {
++		if (apr_asks < 200 && (apr_asks == 0 || ms() - apr_last_ask >= 50)) {
++			apr_last_ask = ms();
++			apr_asks++;
++			apr_send(APR_SVC_CORE, 0, AVCS_GET_STATE, NULL, 0);
++		}
++		return;
++	}
++	if (!apr_versions_done && (apr_last_ask == 0 || ms() - apr_last_ask >= 1000) && apr_asks < 210) {
++		apr_last_ask = ms();
++		apr_asks++;
++		apr_send(APR_SVC_CORE, 0, AVCS_GET_VERSIONS, NULL, 0);
++	}
++}
++
+ /* ---------------------------------------------------------------- the thread */
+ 
+ static void
+ audio_thread(void *arg, wait_result_t)
+ {
+ 	int level = (int)(intptr_t)arg;
++	unsigned last_status = 0;
+ 	LOG("taimenaudio=%d", level);
+ 	if (level >= 1 && !stage1()) {
+ 		return;
+@@ -676,7 +1595,50 @@ audio_thread(void *arg, wait_result_t)
+ 	if (level >= 2 && !stage2()) {
+ 		return;
+ 	}
+-	LOG("stages 1..%d done", MIN(level, 2));
++	if (level < 3) {
++		LOG("stages 1..%d done", level);
++		return;
++	}
++	if (!glink_init()) {
++		return;
++	}
++	glink_register(QCHAN, qrtr_rx);
++	glink_register(ACHAN, apr_rx);
++	volatile uint32_t *slave = smp2p_find((struct smp2p_hdr *)smem_part_get(adsp_part, ITEM_SMP2P_IN, NULL),
++	    "slave-kernel");
++	bool m3 = false, m4 = false;
++	for (;;) {
++		bool busy = glink_poll();
++		qrtr_poll();
++		if (level >= 4) {
++			apr_poll();
++		}
++		if (!m3 && glink_chan_up(ACHAN)) {
++			m3 = true;
++			LOG("t=%u.%03u 3: M3 APR channel up", T);
++		}
++		if (!m4 && adsp_core_state == 1 && apr_versions_done) {
++			m4 = true;
++			LOG("t=%u.%03u 4: M4 ADSP core ready, service versions read", T);
++		}
++		if (slave != NULL && (*slave & SLAVE_ERR_FATAL) != 0) {
++			LOG("t=%u.%03u *** ADSP FATAL (slave-kernel %#x) ***", T, *slave);
++			adsp_crash_reason(adsp_part);
++			break;
++		}
++		if (ms() - last_status >= (ms() < 60000 ? 15000u : 300000u)) {
++			last_status = ms();
++			LOG("t=%u.%03u status: slave-kernel %#x, qrtr node %x hello %u, %u services, %u lookups, pd-mapper %u; "
++			    "apr rx %u tx %u, core state %d", T, slave != NULL ? *slave : 0, q_node, q_hello_rx, q_services,
++			    q_lookups, q_pdreqs, apr_rx_pkts, apr_tx_pkts, adsp_core_state);
++			glink_summary();
++		}
++		if (busy) {
++			IODelay(200);
++		} else {
++			IOSleep(2);
++		}
++	}
+ }
+ 
+ void
