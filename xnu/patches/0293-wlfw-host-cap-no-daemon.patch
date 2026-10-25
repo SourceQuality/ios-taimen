@@ -1,0 +1,33 @@
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 755a2c3..6e778f6 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2633,6 +2633,7 @@ static void w_rails(void);
+ #define WLFW_SEG                6144            /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+ #define WLFW_FEATURE_MASK       0x3B
+ #define WLFW_REJUVENATE_IND     0x39
++#define WLFW_HOST_CAP           0x34
+ #define WLFW_REJUVENATE_ACK     0x3A
+ #define WLFW_MSA_SIZE           0x00100000u     /* icnss msa_mem_size */
+ #define WLFW_CLIENT_ID          0x4b4e454c      /* icnss WLFW_CLIENT_ID */
+@@ -2971,6 +2972,20 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 		if (!ok) {
+ 			break;
+ 		}
++		/*
++		 * 0293: HOST_CAP with daemon_support 0, as mainline ath10k sends it right after IND_REGISTER, in
++		 * the one-byte form of its msm8998 quirk (snoc-host-cap-8bit-quirk). Android has cnss-daemon
++		 * (it downloads the BDF there); a firmware not told that there is none may wait for it once
++		 * in mission mode: boots 116-122 died 9.5 s after WLAN_MODE whatever the host did, and boot
++		 * 124 (WLAN_CFG, no WLAN_MODE) lived.
++		 */
++		wm_new(&m, WLFW_HOST_CAP);
++		wm_u8(&m, 0x10, 0);                     /* daemon_support = 0 */
++		wm_send(&m, "host_cap sent");
++		break;
++	}
++	case WLFW_HOST_CAP: {
++		LOG("M7: t=%u ms: host_cap (daemon_support 0, 8-bit) %s err %u", g_ms, ok ? "ok" : "refused (not fatal)", err);
+ 		/* 1 MB aligned, as icnss's CMA allocation of it is (boot 114 had it at 0x8920c000) */
+ 		if (w_msa_pa == 0 && pool_alloc_aligned(WLFW_MSA_SIZE, WLFW_MSA_SIZE, &w_msa_pa) == NULL) {
+ 			LOG("M7: no pool space for the MSA");

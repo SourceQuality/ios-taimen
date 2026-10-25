@@ -917,3 +917,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   +4.70 s, the WLAN hardware powered off and left off (Android without a WLAN driver), no WLAN_CFG/mission:
   **the modem stayed up the whole 200 s watch.** So the starvation comes from WLAN_CFG or WLAN_MODE, not from
   the BDF or FW_READY. Boot 124: taimenmission=2, WLAN_CFG without WLAN_MODE (0292).
+- 2026-10-24 boot 124 (r112 = +0263-0292, a plain ROOTFIX + taimenwifi=8 taimenmission=2, 360 s): FW_READY,
+  WLAN_CFG ok, no WLAN_MODE: **the modem lived the whole watch.** So WLAN_MODE mission is the trigger (with or
+  without our CE/HTC/WMI afterwards); our request is Android's (mode 0, hw_debug 0). The WCN3990's BT node also
+  names S3 (1.352 V io), S5 (2.04 V xtal) and BoB pin1 (3.3-3.6 V) as chip supplies; mainline runs WLAN on
+  msm8998 without voting those, so power stays a weaker lead. What mainline ath10k does and icnss does not:
+  HOST_CAP with daemon_support 0 (8-bit, its msm8998 quirk) right after IND_REGISTER. Android has cnss-daemon;
+  a firmware not told there is none may wait for it in mission mode. 0293 sends it; boot 125 is the full M0-M9.
