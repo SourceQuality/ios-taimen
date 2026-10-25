@@ -30,6 +30,8 @@ fix=$P/../research/taimen/rootfix-sweetgl-current.bin
 # the phone tools (USB networking: netsvcd) ride along when tools/windows/ci-phone-tools.sh fetched them
 tools=()
 [ -f "$P/../out/phone-tools/netsvcd" ] && tools=(--phone-tools "$P/../out/phone-tools")
+# and the RedwoodAudio HAL plug-in, iOS's speaker (tools/phone/RedwoodAudio, xnu 0323/0326)
+[ -f "$P/../out/phone-tools/RedwoodAudio" ] && tools+=(--hal-plugin "$P/../out/phone-tools")
 python3 -I "$P/tools/taimen/mkrootfix.py" "$P/../research/ipsw-x/ios16-root.img" "$fix" --zfile "$lib=$d/sweetgl.dylib" "${tools[@]}" | tail -2
 cat > "$P/../out/sweetgl/current.env" <<EOF
 SWEETGL_SHA=$sha

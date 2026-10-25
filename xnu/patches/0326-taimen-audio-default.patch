@@ -1,0 +1,59 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index e2cd650..f708376 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -26,6 +26,8 @@
+  * 7 (0323): the TAS2557 amps (bsd/dev/taimen_tas2557.c over taimen_i2c.c, BLSP2 QUP1): reset, program
+  *   0, configuration 0, calibration, ASI 24-bit, powered down; up with the bit clock (the tone,
+  *   sessions), down before it stops. The port runs S24_LE in 32-bit slots (3.072 MHz) as Android.
++ * Default (0326): taimenaudio=9 with the stream 1 bank (taimenaudiosmmu=2): boot 159 played iOS's own
++ *   audio (RedwoodAudio in mediaserverd) through the DSP and the amps.
+  * 9 (0323, taimenaudio>=9): /dev/redwood-audio (the HackiOS ABI of tools/phone/RedwoodAudio) into a
+  *   32768-frame ring; the feeder opens the session (AFE port, ADM/ASM stream) when frames come,
+  *   refills each period the DSP returns, closes it after 3 s without frames; level cap
+@@ -1525,6 +1527,7 @@ struct apr_hdr {
+ 
+ static uint32_t apr_token = 1, apr_rx_pkts, apr_tx_pkts;
+ static int apr_next_dst = -1;           /* the next packet's destination port, if not its source */
++static int audio_level;                 /* taimenaudio=N, default 9 (0326) */
+ static bool amps;                       /* stage 7 loaded the TAS2557 firmware */
+ static int adsp_core_state = -1;        /* AVCS state: 1 = ready */
+ static bool apr_versions_done;
+@@ -1998,8 +2001,7 @@ stage6(void)
+ 	bool ok = rc == 0 && rc2 == 0 && rc3 == 0 && sck > 100 && ws > 4;
+ 	LOG("t=%u.%03u 6: %s: clock %d, i2s %d, start %d; SCK changes %u (before %u), WS %u (before %u) in 20000 samples", T,
+ 	    ok ? "M6 quaternary MI2S RX runs" : "quaternary MI2S RX NOT running", rc, rc2, rc3, sck, sck0, ws, ws0);
+-	int level = 0;
+-	(void)PE_parse_boot_argn("taimenaudio", &level, sizeof(level));
++	int level = audio_level;
+ 	if (level <= 6 || !ok) {
+ 		/* nothing follows yet: stop the port and the clock, give the pins back */
+ 		apr_call("AFE DEVICE_STOP 0x1006", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, start, sizeof(start), 1000);
+@@ -2614,7 +2616,7 @@ audio_thread(void *arg, wait_result_t)
+ 				LOG("t=%u.%03u 7: %s", T, amps ? "M7 TAS2557 amps loaded (powered down)" : "the amps did NOT load");
+ 			}
+ 			/* SMMU reads can hang an unclocked bus: on request, and after the AFE test */
+-			int census = 0;
++			int census = 2;         /* 0326: the stream 1 bank by default (boot 159: CB1 works) */
+ 			(void)PE_parse_boot_argn("taimenaudiosmmu", &census, sizeof(census));
+ 			bool m5 = false;
+ 			if (level >= 5 && census != 0 && stage5() && census >= 2) {
+@@ -2680,12 +2682,17 @@ audio_thread(void *arg, wait_result_t)
+ void
+ taimen_audio_init(void)
+ {
+-	int level = 0;
++	/*
++	 * 0326: sound by default (boot 159 played iOS's audio through the speakers); without the
++	 * ADSP-* payload blobs stage 1 says so and the thread ends. taimenaudio=0 turns it off.
++	 */
++	int level = 9;
+ 	thread_t t;
+ 	(void)PE_parse_boot_argn("taimenaudio", &level, sizeof(level));
+ 	if (level <= 0) {
+ 		return;
+ 	}
++	audio_level = level;
+ 	if (kernel_thread_start(audio_thread, (void *)(intptr_t)level, &t) == KERN_SUCCESS) {
+ 		thread_deallocate(t);
+ 	}

@@ -114,9 +114,12 @@ fi
 # AUDIOFW=DIR: the ADSP and TAS2557 firmware for taimenaudio>=1 (xnu 0317, docs/taimen-audio-plan.md
 # stage 1; pulled by the log reader as fw-adsp.* / fw-tas2557s_*, the calibration from persist, kept in
 # ../research/taimen/firmware, never in git): ADSP-MDT, ADSP-Bnn, TAS-FW, TAS-CAL, ~9.4 MB of payload.
+# Sound is the kernel's default since xnu 0326 (taimenaudio=9): the blobs go in unless AUDIO=0 or
+# taimenaudio=0.
 audio=$(echo "$cmdline ${TAIMEN_ADT_ARGS:-}" | sed -n 's/.*taimenaudio=\([0-9]*\).*/\1/p')
+[ "${AUDIO:-1}" = 0 ] && audio=0
 AUDIOFW=${AUDIOFW:-$P/../research/taimen/firmware}
-if [ "${audio:-0}" -ge 1 ] && [ -f "$AUDIOFW/adsp.mdt" ]; then
+if [ "${audio:-9}" -ge 1 ] && [ -f "$AUDIOFW/adsp.mdt" ]; then
 	blobs+=(--blob "ADSP-MDT=$AUDIOFW/adsp.mdt")
 	for f in "$AUDIOFW"/adsp.b[0-9][0-9]; do
 		n=${f##*.b}
