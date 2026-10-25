@@ -1009,3 +1009,17 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   content area stays black** (as on the Pixel 4 port), two minutes later too; no WebKit crash, the GPU process
   runs (first IOSurface selector 44). The App Store shows its welcome and ads sheets, then "Cannot Connect to
   App Store" (fairplayd is removed from launchd). Screenshots: 11 MB in 10-26 s (~1 MB/s: 0305 polls faster).
+- 2026-10-24 boot 136 (r125 = +0263-0306, sweetwklog=1, 900 s): the link is fast now (0305): screenshots in
+  0.9-2.0 s instead of 10-26 s. Safari still black, and the 0305 surface log says why: WebKit's GPU process draws
+  the page into wide-colour tiles, 'w30r' (0x77333072, 1125x1905 etc.) and the planar 'b3a8' (0x62336138), and
+  sweetgl (tools/sweetgl/eagl.c surface_format) has no texture format for 'w30r'. The Pixel 1 had the same
+  problem with CA's CPU renderer and reports an sRGB display; mkadt.py now does that for taimen too
+  (artwork-display-gamut sRGB; TAIMEN_GAMUT=P3 keeps the iPhone X's). netsvcd's messages reach the kernel log
+  now (0306 tee). Podcasts crashes at launch (data abort in the shared cache, far 0x131068000); MusicWidgets
+  crashes (NULL); not looked at yet.
+- 2026-10-25 **boot 137 (r125, sRGB ADT, MobileGestalt cache removed): Safari renders web pages.** SpringBoard,
+  backboardd and WebKit's GPU process now use BGRA surfaces only; a new tab and the Apple favourite drew the live
+  www.apple.com home page, images and all, through usbproxy.py, driven from WSL with phonectl.py
+  (out/shots137, shot137-apple.png). On the way: after the phone resets, the agent's idle connections stay
+  half open and nothing reaches the phone; usbproxy.py now sets TCP keepalive (10 s idle, 5 s x 3) so a rebooted
+  phone's RST ends them; and a tab that failed while the agent was down needs a new tab, not a reload.

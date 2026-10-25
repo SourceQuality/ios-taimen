@@ -92,7 +92,14 @@ async def slot(phone):
         if said:
             log(f'connected to {phone}:{AGENT_PORT}')
             said = False
-        w.get_extra_info('socket').setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock = w.get_extra_info('socket')
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # the phone resets without closing anything: keepalive finds the dead idle connections
+        # (a rebooted phone answers the probes with RST) and the slot opens a new one
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (('TCP_KEEPIDLE', 10), ('TCP_KEEPINTVL', 5), ('TCP_KEEPCNT', 3)):
+            if hasattr(socket, opt):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
         try:
             head = await r.readuntil(b'\r\n\r\n')
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError):
