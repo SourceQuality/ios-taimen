@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index ca2920e..e32a9d4 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -15,6 +15,8 @@
+  * 5 (0319, with taimenaudiosmmu=1): the LPASS SMMU powered and clocked (GDSC and clock votes), what
+  *   ABL/TZ left for stream 1 (read only so far: the shared buffer comes with stage 8).
+  * 5 mode A (0321, taimenaudiosmmu=2): stream 1 through an identity context bank of the LPASS SMMU.
++ *   Boot 158: =3 wrote SMR0 = stream 1, but S2CR read back type 2 (fault) for bypass (1): no
++ *   non-secure bypass here. 0324: the lowest free bank (boot 157 hung on CB12), census after TZ.
+  *   Boot 157: it hung (no line after the census, the GPU never came up). 0322: breadcrumbs, the
+  *   GPU first, and taimenaudiosmmu=3: an SMR with an S2CR bypass only (GR0 page writes).
+  *   0323: =4 / =5 call TZ's MP_RESTORE_SEC_CFG for the LPASS SMMU first, then identity / bypass.
+@@ -1798,7 +1800,11 @@ lpass_smmu_identity(void)
+ 			used |= 1ull << (s2cr & 0x3F);
+ 		}
+ 	}
+-	for (uint32_t i = ncb; i-- > 1;) {
++	/*
++	 * Boot 157 took the top bank (CB12) and hung on its first access; the non-secure banks may
++	 * be the low ones (sCR1.NSNUMCBO): the lowest free bank above CB0 now.
++	 */
++	for (uint32_t i = 1; i < ncb && i < 64; i++) {
+ 		if ((used & (1ull << i)) == 0) {
+ 			cb = i;
+ 			break;
+@@ -2630,6 +2636,7 @@ audio_thread(void *arg, wait_result_t)
+ 					uint64_t r = scm(SCM_FN(0x0C, 0x02), 2, 2, 0, 0, &r1);
+ 					LOG("t=%u.%03u 5: is_call_avail(restore_sec_cfg) -> %lld/%llu; restore_sec_cfg(LPASS) -> %lld/%llu", T,
+ 					    (int64_t)ra, avail, (int64_t)r, r1);
++					(void)stage5();         /* what TZ changed */
+ 				}
+ 				m5 = (census == 3 || census == 5) ? lpass_smmu_bypass() : lpass_smmu_identity();
+ 			}
