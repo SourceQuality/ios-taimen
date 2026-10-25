@@ -1,0 +1,325 @@
+# sweetmtl: a Metal device on the Adreno 540 (Gallium freedreno)
+
+The Metal driver of `docs/taimen-metal-plan.md` ("metal2gallium"). Flame's native Metal frontend
+and bridge run on a runtime of our own. The runtime uses the metal2vulkan translator for shaders
+and binding plans and Mesa's Gallium freedreno a5xx driver for the GPU.
+
+**Status (2026-10-25): phase 1, PC only.** The runtime, the Gallium shim and the bridge build for
+Linux x86_64 against a host Mesa. `host-check.sh` runs the bridge's self-test and an ABI test of
+every bridge call the frontend makes:
+
+- on freedreno's **drm-shim** as an Adreno 540: everything records, compiles with ir3 for gpu 540
+  and submits, and the submits are decoded with cffdump. drm-shim executes nothing, so values the
+  GPU writes are not checked there.
+- on **softpipe**, Mesa's CPU driver, through the same runtime, translator and NIR lowering: there
+  the values are checked.
+
+The Rust half also builds for `aarch64-apple-ios` on the PC. Nothing has run on the phone yet. The
+frontend, plugin, iOS build of the shim, CI and install are the next steps (see the iOS build and
+phone tests sections below).
+
+## Layers
+
+```
+Metal.framework (client process)
+  SweetMetal plugin + NativeBridgeMetalFrontend.mm   flame's ObjC frontend (not in this tree yet: M1)
+    bridge/            NativeMetalObjects.{h,rs}, NativeMetalBridge.{h,rs}: flame's C ABI (nmb_*), MIT
+      runtime/         sweetmtl-runtime (Rust): Metal's object model, recording, binder, sync
+        m2v/           metal2vulkan translator (720ef1ce + patches/): AIR -> SPIR-V, layouts, binding plans
+      gallium/         sg (C): SPIR-V -> NIR -> Gallium CSOs, resources, command replay, fences
+        Mesa           freedreno a5xx + ir3 (tools/sweetgl/mesa.patch + m0/mesa-a5xx-ir3.patch)
+          phone: tools/sweetgl/sweet_drm.c -> SweetGPU     PC: drm-shim (records) or softpipe (executes)
+```
+
+- **Bridge.** Flame's files with `use metal2vulkan_runtime` pointed at `sweetmtl_runtime`. They
+  are otherwise unchanged, which keeps their self-test (`nmb_selftest`, steps 0x6501-0x6506) and
+  the frontend's ABI as they are.
+- **Runtime.** It implements the subset of metal2vulkan-runtime's API that the bridge imports
+  (`runtime/src/lib.rs` re-exports every name). It was written from that API; no code was copied,
+  so the GPL/LGPL terms of metal2vulkan-runtime do not reach it. The translator crate is a
+  dependency.
+- **Shim.** One `pipe_screen`, `pipe_context` and `cso_context` per process, behind a device lock.
+  Its C ABI is `gallium/sg.h`. Values cross it in Vulkan or Metal terms (VkFormat, Vulkan blend
+  enums, Metal sampler and depth enums), and `sg_map.c`/`sg_format.c` map them to Gallium.
+
+## How work flows
+
+- **Shaders.** A library is parsed once by the translator. A pipeline is the translator's
+  SPIR-V per stage plus one layout. `assign_slots` (`runtime/src/pipeline.rs`) gives each
+  descriptor a Gallium slot, per stage, in (set, binding) order:
+
+  | Descriptor | Gallium slot |
+  | --- | --- |
+  | push constants | constant buffer 0 |
+  | uniform buffers | constant buffers 1.. |
+  | storage buffers | SSBOs 0.. |
+  | vertex-stage storage buffers (read-only) | constant buffers: a5xx has no VS SSBOs |
+  | sampled images, input attachments | sampler views 0.. |
+  | samplers | samplers 0.. |
+  | storage images | after the SSBOs (a5xx shares one IBO space) |
+
+  `sg_shader.c` takes it from there: `spirv_to_nir`, then the Vulkan resource intrinsics are
+  lowered to those slots, and ir3's own NIR passes and `ir3_nir_lower_io` run. The CSO is created
+  and its default ir3 variant compiled at once, so a stage ir3 cannot compile fails the pipeline,
+  as Metal would.
+- **Specialization.** Each specialization the binder asks for gets its own CSO, compiled under the
+  lock when first used: workgroup size, threadgroup memory lengths (`SpecKey::TgLength/TgOffset`)
+  and function constants.
+- **Binding.** At each dispatch or draw, the encoder's Metal argument tables become the binder's
+  facts. Then `pipeline.plan(device, shape)` and `instantiate_dispatch/draw` run, and
+  `bind.rs::resolve` turns each `WriteSource` into an `sg_ctx_set_*` binding at the stage's slots
+  (buffers, inline bytes, textures, samplers, combined image/samplers, immutable constexpr
+  samplers, neutral zero/sink buffers). The bindings hold their resources until completion.
+- **Recording and replay.** Encoders record `Cmd`s: Gallium-ready shaders, bindings, push bytes
+  and state. At `commit`, the command buffer goes to its queue's thread, which replays it into the
+  context under the device lock and flushes with a fence. A per-device completion thread waits on
+  the fences in submission order, with a 10 s timeout that reports an error. It then copies no-copy
+  shadows back, sets events, marks the buffer completed and runs its handlers.
+- **Memory.**
+  - Buffers are `PIPE_BUFFER` resources kept mapped. `contents` is that mapping (none for
+    private storage), and `gpuAddress` is the bo's iova.
+  - `newBufferWithBytesNoCopy` is shadowed, because freedreno cannot make a bo from user pages. The
+    pages are copied in before a command buffer that uses them runs, and copied back after it
+    completes.
+  - A texture over a buffer is a linear texture imported over the buffer's own bo (KMS handle,
+    `resource_from_handle`), with no copy. a5xx needs 64-byte bases and 64-byte row pitch.
+- **Sync.**
+  - A signaled event flushes at the signal and takes its value once that submission's fence has
+    signaled. An event wait releases the device lock and holds only its own queue.
+  - A fence update counts at commit. A fence wait holds the replay until the updates committed
+    before it have flushed; there is one ring, so they run in submission order. Waits run before an
+    encoder's commands and updates after them.
+- **Rendering.** Metal's viewport becomes a negative-height viewport with lavapipe's conventions
+  (half-z clip, half-pixel centers, first-vertex flat shading, scissor always on). Load-action
+  clears are `pipe->clear`, one per color attachment and one for depth/stencil, right after the
+  framebuffer is set. The shim forces
+  `FD_MESA_DEBUG=sysmem,inorder`: no GMEM tiling and no batch reordering. That is the base for
+  framebuffer fetch through a texture barrier (plan 2.3).
+
+## Coverage of the bridge's calls
+
+The bridge exports 126 `nmb_*` functions. "Not yet" means the runtime returns `Error::NotYet`
+naming the missing feature. The bridge passes it to the frontend as a nil/NO result with that
+reason, and never substitutes another behavior. "Unsupported" (`Error::Unsupported`) is a typed
+refusal for something the a540 cannot do.
+
+| Area | Calls | State |
+| --- | --- | --- |
+| Device | `device_open/release/name/vendor_name/max_buffer_length/max_threads_per_threadgroup/linear_bytes_per_row/shader_cache_stats/work_stats`, `last_error/warning` | done |
+| Device answers | `device_answer`, `device_answer_selector`, `device_family_waivers` | done. 72 private selectors are answered from the a540 profile and freedreno's limits (`families.rs`), and 2 have no answer. `supportsFamily` is false for every Apple family; the waivers list is empty |
+| Buffers | `buffer_new/new_no_copy/contents/gpu_address/length/release/set_purgeable_state` | done. No-copy buffers are shadowed; one with a deallocator is not yet. Purgeable state always answers NonVolatile |
+| Textures | `texture_new/new_linear/new_on_buffer/new_view/describe/replace/get_bytes/release/set_purgeable_state` | done: 1D/2D/3D/cube/arrays, mip levels, views with swizzle. A texture over a buffer needs freedreno. A linear texture of several images is not yet |
+| Libraries, functions | `library_new/function_count/function_name/release`, `function_new/new_specialized/type/release`, `fixture_air`, `function_constant_air` | done (function constants included) |
+| Compute | `compute_pipeline_new/new_with_descriptor/new_with_options/execution_width/max_threads/release`, `compute_encoder_new`, `compute_set_pipeline/set_threadgroup_memory`, `compute_dispatch` | done. Indirect dispatch is not yet |
+| Render | `render_pipeline_new/new_with_options/release`, `render_encoder_new`, `render_set_pipeline/viewport/scissor/raster/depth_stencil/stencil_reference/depth_bias/blend_color/line_width/visibility_mode`, `render_draw`, `render_draw_indexed` | done: vertex descriptors, blend per attachment, depth/stencil, culling and winding, scissor, primitive restart. Not yet: visibility results, line widths other than 1, multisample resolve, passes without attachments, pipelines without a fragment function, base instance (a5xx has no start instance), tessellation, mesh and tile functions (imageblocks), attachments read as storage images. Unsupported: sample-rate shading |
+| Encoder state | `encoder_set_buffer/set_buffer_offset/set_bytes/set_texture/set_sampler/end/discard/update_fence/wait_fence` | done. Argument buffers (descriptor bytes, handle tables) and push holes (device addresses a shader reads) are not yet |
+| Blits | `blit_encoder_new`, `blit_copy_buffer/fill_buffer/copy_texture/texture_to_buffer/buffer_to_texture/generate_mipmaps` | done. Copies run on the GPU with `resource_copy_region`, and mipmaps with `util_gen_mipmap`. a5xx has no `clear_buffer`, so fills, texture-to-buffer and buffer-to-texture run on the CPU after a wait |
+| Command buffers, queues | `queue_new/release`, `command_buffer_new/commit/status/error/gpu_time/on_completed/on_scheduled/wait/wait_scheduled/signal_event/wait_event/uses_buffer/uses_texture/release` | done |
+| Sync | `event_new/release`, `shared_event_value/set_value/wait/notify`, `fence_new/release` | done, within one process |
+| Heaps | `heap_new/new_buffer/new_texture/size/used_size/allocated_size/max_available_size/set_purgeable_state/release` | not yet (`heap_new` refuses) |
+| Binary archives | `binary_archive_new/add_compute/add_compute_descriptor/add_render/release`, `binary_archive_serialize` | adds are accepted and change nothing. Serialize is not yet: the pipeline cache on disk is M3 |
+| Self-test | `nmb_selftest` | runs (0x6501-0x6506) |
+
+Shader-side limits are typed errors at pipeline creation:
+
+- 15 uniform buffers besides the push block;
+- 24 storage buffers plus images per stage;
+- 16 textures and 16 samplers per stage;
+- no storage images in the vertex stage;
+- vertex-stage storage buffers that are written. They are refused: a5xx reads them as constant
+  buffers.
+- pointer (buffer-device-address) loads and stores. ir3 has no a5xx global memory ops yet (plan
+  risk 1). CoreAnimation's shaders do not use them (M0).
+
+## Build and run on the PC (WSL)
+
+```bash
+source ~/tools/m0env.sh                # gcc, meson, ninja, cargo, python3 with mako
+tools/sweetmtl/host-check.sh           # [--qc PATH/TO/QuartzCore/default.metallib] [--no-build]
+```
+
+It builds:
+
+1. Mesa (the M0 tree: Mesa 26.3.0-rc2 + `tools/sweetgl/mesa.patch` + `m0/mesa-a5xx-ir3.patch`)
+   with freedreno, softpipe, drm-shim and cffdump;
+2. the shim (`gallium/build-host.sh`, with the compiler flags Mesa's own build gives
+   `freedreno_resource.c`);
+3. the runtime and bridge (cargo, release);
+4. the test tools `mtlbridgetest` (the bridge's self-test) and `mtlabitest` (one check per bridge
+   call group, with values), and `profile/gen-formats`.
+
+It then runs:
+
+- the format table check: `profile/a540-gallium.json` against freedreno's answers. Regenerate it
+  with `gen-formats` + `profile/make-profile.py`.
+- both tests on drm-shim with every submit dumped (`FD_RD_DUMP=combine`). Per submit it prints
+  the CP_EXEC_CS, draw, blit and load-state counts and the MRT0 address.
+- both tests on softpipe, with values checked.
+
+It exits 0 only if all of that passes. Inputs and outputs default to `../research/m1/`. The
+header of `host-check.sh` lists `RESEARCH`, `MESA_SRC`, `MESA_BUILD`, `M2V_SRC`, `LLVM_AS` and
+`OUT`. `m2v-fetch.sh` makes the translator checkout (pin + `patches/`), or links an existing one
+with `M2V_SRC`.
+
+Environment variables:
+
+| Variable | Effect |
+| --- | --- |
+| `SWEETMTL_TRACE=1` | one line per compiled stage (ir3 instructions, registers, constlen, local size) and per completed command buffer (time, device counters) |
+| `SWEETMTL_PROFILE=FILE` | a different device profile JSON for the translator |
+| `SG_DRIVER=softpipe` | the CPU validation driver (PC builds with softpipe) |
+| `SG_RENDER_NODE=PATH` | the DRM node on Linux (default `/dev/dri/renderD128`) |
+| `SG_DEBUG=1` | print every shim error to stderr as it is set |
+| `SG_DEBUG_DRIVER=1` | print the driver's debug messages (ir3, freedreno) |
+| `SG_PRINT_NIR=1` | the NIR handed to the driver, per stage |
+| `NMB_LIST=1` | the self-test's QuartzCore step lists each function and each refusal |
+| `SWEETMTL_DRM_SHIM=1` | (the tests) report GPU-written values as not checkable |
+| `FD_MESA_DEBUG`, `FD_RD_DUMP`, `SOFTPIPE_DEBUG=cs` | Mesa's own; the shim always adds `sysmem,inorder` |
+
+### Results (2026-10-25)
+
+drm-shim, FD_GPU_ID=540:
+
+- **Self-test.** 0x6501-0x6505 all run (exit 0), with 3 submits:
+  - compute: 2 CP_EXEC_CS, 15 groups of 64 and 1 of 40, each a variant of its own;
+  - render: a clear (RB_BLIT) and one draw, MRT0 linear with a 256-byte pitch;
+  - import: the same draw, with MRT0 at the no-copy buffer's shadow bo.
+- **Shader compiles.** The kernels take 60-69 ir3 instructions. The render pair takes 39 (VS)
+  and 222 (FS).
+- **mtlabitest.** Every call group records and submits, with no FAIL.
+- **QuartzCore** (`--qc`, the iPhone X `default.metallib`, 141 functions): kernels 3 ok, 4
+  failed; pairs 13 ok, 8 failed. Every failure comes from the self-test's minimal descriptors, not
+  from the runtime. The 4 `tile_downsample_*` kernels need tile attachments. 6 pairs need a
+  vertex descriptor and 2 (`path_blit_*`) need 3 color attachments. M0's driver, which builds
+  full descriptors, translated 139 of 141.
+
+softpipe:
+
+- **Self-test.** compute 0/1000 wrong, render 0/64 wrong. 0x6505 import stops with a clear error,
+  by design: a texture over a buffer needs freedreno.
+- **mtlabitest.** All value checks right: sampled render through a constexpr sampler, read and
+  write images, the blits and mipmaps, culling, depth, viewport and scissor, function constants,
+  threadgroup memory, sampler arguments, events, and fences across queues. Heaps and archive
+  serialization report not yet.
+
+iOS (Rust only): `cargo build --release --target aarch64-apple-ios` of the bridge works in WSL
+with conda-forge's `rust-std-aarch64-apple-ios` (same version as rustc). The static library's
+only unresolved externals are the `sg_*` shim calls, libSystem, the unwinder and
+`sys_dcache_flush` (which flame's plugin provides).
+
+Fixed on the way (worth knowing for the phone): `nir_rewrite_image_intrinsic` leaves the deref
+form's SRC_TYPE in the new RANGE_BASE slot (160 for float32), so `sg_shader.c` resets it.
+nir_to_tgsi added it to the image index. ir3 does not read it.
+
+## Files
+
+| Path | What |
+| --- | --- |
+| `bridge/` | flame's bridge (MIT, `LICENSE`), `build.rs` assembles the two fixtures with `LLVM_AS` (or takes `NMB_FIXTURE_AIR`/`NMB_FC_AIR`) |
+| `runtime/src/` | `device.rs` (device, answers, trace), `families.rs` (families, private selectors, format capabilities), `resource.rs` (buffers, textures, views, heaps), `library.rs`, `pipeline.rs` (pipelines, slots, variants, samplers, depth/stencil, archives), `encoder.rs`, `bind.rs` (binder), `command.rs` (queues, command buffers, replay, completion), `sync.rs`, `ffi.rs` (sg.h by hand), `error.rs` |
+| `gallium/` | `sg.h` (the ABI), `sg_device.c` (screen: sweet_drm on iOS, a render node or softpipe on Linux), `sg_resource.c`, `sg_shader.c`, `sg_replay.c`, `sg_format.c`, `sg_map.c`, `build-host.sh` |
+| `profile/` | `a540-gallium.json` (the translator's device profile: M0's profile + freedreno's format table), `gen-formats.c`, `make-profile.py` |
+| `test/` | `mtlbridgetest.c` (runs `nmb_selftest`, like flame's `m2vtest.c`), `mtlabitest.c` (the ABI test) |
+| `m0/` | M0: the CA shader qualification and `mesa-a5xx-ir3.patch` (`m0/README.md`) |
+| `m2v-fetch.sh`, `patches/` | the translator checkout at 720ef1ce with flame's patches 0001, 0004, 0005 (`m2v/`, not in git) |
+| `host-check.sh` | the PC check above |
+
+## iOS build (plan 4.4): next steps
+
+The phone cannot be built for here: the PC has no iOS SDK. Builds go through a GitHub macOS
+runner, like `sweetgl.yml`.
+
+1. **Mesa for iOS.** A sweetmtl job, or a second build dir in `sweetgl.yml`. Run
+   `tools/sweetgl/mesa-fetch.sh` and `mesa-setup.sh` as sweetgl does, plus
+   `tools/sweetmtl/m0/mesa-a5xx-ir3.patch`. Build these targets with ninja:
+   - `libfreedreno.a`, `libfreedrenowinsys.a`;
+   - `libgallium.a`;
+   - `libvtn.a`, `libnir.a`, `libcompiler.a`;
+   - the ir3/isa/layout/common libraries;
+   - `libmesa_util*`, `libblake3.a`, `libmesa_util_c11.a`, `libxmlconfig.a`.
+
+   `gallium/build-host.sh` writes the list as `mesa-libs.txt`.
+
+   The patch's triops change (no bitwise triops before a6xx) also reaches sweetgl if both share
+   one tree. Keep a separate build dir until M0's open question is settled.
+2. **Shim.** `CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0"
+   gallium/build-host.sh MESA_SRC MESA_BUILD_IOS OUT`. It takes the flags from the iOS build's
+   `compile_commands.json`. Softpipe is left out because that build has none. Then compile
+   `tools/sweetgl/sweet_drm.c` with the same flags. `sg_device.c` already has the `__APPLE__` path:
+   `sweet_drm_open()`, the /dev/null log and the renderonly stubs.
+3. **Rust.**
+   `IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build --release --target aarch64-apple-ios` in
+   `bridge/`. The fixtures need `LLVM_AS` (brew llvm 21+) or prebuilt `.air` files through
+   `NMB_FIXTURE_AIR`/`NMB_FC_AIR`.
+4. **Test tools first.** Link `test/mtlbridgetest.c` and `test/mtlabitest.c` with the bridge,
+   `libsweetgallium.a`, `sweet_drm.o` and Mesa. They need no Metal.framework, no plugin and no
+   kernel patch: they open SweetGPU through `sweet_drm.c` as sweetgl does. Then `codesign -f -s -`
+   and the `nm -m | grep "weak external"` check.
+5. **Bundle (M1).**
+   - Copy `NativeBridgeMetalFrontend.{mm,h}`, `SweetMetal2.mm` (as `SweetMetal.mm`) and
+     `Info.plist` from flame (MIT) into `tools/sweetmtl/frontend/`, with the plan 4.3 deltas:
+     - ignore `loader`;
+     - `sys_dcache_flush` only for no-copy host memory;
+     - import IOSurfaces by ID;
+     - a client list in `/private/var/sweetmtl/clients`;
+     - a bounded wait for the GPU service.
+   - Build with `xcrun -sdk iphoneos clang++ -bundle` together with the libraries above.
+   - Upload `SweetMetal.bundle`, the two test tools, `BUILDINFO.txt` and SHA256SUMS as the
+     artifact.
+6. **IOSurface import by ID** (plan 4.3).
+   - In the shim, add `sg_buffer_import_iosurface(dev, surface_id)`: a `PIPE_BUFFER` imported
+     with `resource_from_handle` over the GEM handle from `sweet_drm_import_iosurface`.
+   - In the bridge, add `nmb_buffer_new_iosurface`.
+
+   Until then, the frontend's host-pointer import goes through the no-copy shadow, which is
+   correct but copies.
+
+## Phone tests (M1-M3)
+
+The runtime already covers M2 and most of M3's list, so the first phone run can skip straight to
+the self-test.
+
+1. **`mtlbridgetest` as a launchd job.** Install with ROOTFIX
+   `--zfile /usr/local/bin/mtlbridgetest-<hash>=... --daemon com.sweet.mtlbridgetest=/usr/local/bin/mtlbridgetest-<hash>,/private/var/sweetmtl/cache,/System/Library/Frameworks/QuartzCore.framework/default.metallib`,
+   or with `devd put/run` once M0b exists. Add it to `sweetnull=` so its stdout (/dev/null)
+   reaches the XNU log.
+   - The job is KeepAlive with a 10 s throttle. Give the tools an idle-after-run mode, or expect
+     the run to repeat.
+   - **Pass:** `compute bad 0/1000`, `render bad 0/64`, `import bad 0/4096`, the QuartzCore counts
+     as on the PC, no GPU hang, and sweetgl's backboardd unaffected. Unset `SWEETMTL_DRM_SHIM` on
+     the phone so the values are checked.
+2. **`mtlabitest`** the same way. It must print the same `ok` lines as softpipe does on the PC.
+   Things only hardware settles:
+   - VS storage buffers read as UBOs;
+   - a5xx linear pitch and offset rules for textures over buffers (64 bytes);
+   - the CPU texture paths after `sync_all`;
+   - the triops question;
+   - GPU timestamps (taken on the host today).
+3. **M1 proper.**
+   - The kernel patch `taimenmtl=SweetMetal-<hash>` sets `MetalPluginName/ClassName` on the
+     `IOAcceleratorES`.
+   - The bundle installs through `tools/taimen/sweetmtl-install.sh`.
+   - `mtltest` (ObjC) checks `MTLCreateSystemDefaultDevice`: name, registryID, `supportsFamily`,
+     `newBuffer`, `contents`, `gpuAddress`.
+   - **Pass:** backboardd stays on GLES at ~60 frames/s.
+4. **M2.** `mtltest` clears a BGRA8 texture over an IOSurface and reads it back. This needs the
+   IOSurface import from step 6 above.
+5. **M3.** The self-test's 0x6506 with full descriptors (M0's `m0drive.py` pairing) instead of
+   the minimal ones, and the compositor pair (`fixed_vert_lph_spc` + `fixed_frag_lph_cph`) drawn
+   with CA-like buffers. The pipeline cache on disk (`binary_archive_serialize`, the translator's
+   `to_bytes`) is the M3 runtime work left.
+
+## Known gaps and risks
+
+- **Not built yet:** heaps, argument buffers and handle tables, push holes, global memory (the
+  ir3 `ldg`/`stg` patch), pipeline variants beyond specialization (`Plans` refuses a non-empty
+  variant), indirect dispatch and draws, visibility queries, resolve, base instance, the disk
+  cache.
+- **Neutral images.** An image binding where nothing is bound is refused, not given a dummy
+  texture.
+- **Framebuffer fetch.** The texture-barrier emulation is wired in the profile and in sysmem mode
+  but has not been exercised by a test here.
+- **No-copy buffers** cost two copies per command buffer until a SweetGPU bo-from-user-memory
+  selector exists (plan 4.2, optional kernel patch).
+- **A shader that hangs the GPU** takes GLES down with it until the A540 hang-recovery patch
+  (plan M4).
