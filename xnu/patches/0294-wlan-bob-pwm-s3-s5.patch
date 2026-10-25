@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index 9298c41..f9468be 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -426,6 +426,18 @@ sweet_rpm_rail_level(uint32_t type, uint32_t level)
+ 	return ok;
+ }
+ 
++/* Any active-set request (TaimenModem's BoB vote): type, id, then nkvp key/value pairs. */
++bool sweet_rpm_vote(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp);
++bool
++sweet_rpm_vote(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp)
++{
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request(what, 0, type, id, kv, nkvp);
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: %s: %s\n", what, ok ? "ok" : "FAILED");
++	return ok;
++}
++
+ /* LDOn's software enable off in the active set (TaimenModem's WLAN power cycle, icnss_hw_power_off). */
+ bool sweet_rpm_ldoa_off(unsigned ldo);
+ bool
+diff --git a/iokit/Kernel/arm/TaimenModem.cpp b/iokit/Kernel/arm/TaimenModem.cpp
+index 6e778f6..e189b88 100644
+--- a/iokit/Kernel/arm/TaimenModem.cpp
++++ b/iokit/Kernel/arm/TaimenModem.cpp
+@@ -2604,6 +2604,8 @@ svc_summary(void)
+ extern "C" bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
+ extern "C" bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
+ extern "C" bool sweet_rpm_ldoa_off(unsigned ldo);
++extern "C" bool sweet_rpm_vote(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp);
++extern "C" bool sweet_rpm_smpa(unsigned smps, uint32_t uv);
+ static void w_rails(void);
+ 
+ /* ---------------------------------------------------------------- M7: WLFW (QMI 0x45) */
+@@ -3226,6 +3228,16 @@ w_rails(void)
+ 	 */
+ 	bool ipa = sweet_rpm_clk(0x617069u, 0, 150000);
+ 	LOG("M7: IPA core clock 150 MHz %s", ipa ? "ok" : "FAILED");
++	/*
++	 * 0294: the WCN3990's other supplies (its BT node: S3 1.352 V io, S5 2.04 V xtal, BoB pin1 for the
++	 * chip) and BoB, L25's parent, in PWM: nothing here asks BoB for high current, and the mission mode
++	 * (the first time the radio may transmit) is what boots 116-125 died after. bobm 3 = PWM.
++	 */
++	uint32_t bob[6] = { 0x6e657773u, 1u, 0x00007675u, 3312000u, 0x6d626f62u, 3u };      /* swen, uv, bobm */
++	bool b = sweet_rpm_vote("BoB 3.312 V PWM", 0x62626f62u, 1, bob, 3);               /* "bobb" */
++	bool s3 = sweet_rpm_smpa(3, 1352000), s5 = sweet_rpm_smpa(5, 2040000);
++	LOG("M7: BoB 3.312 V PWM %s, S3 1.352 V %s, S5 2.04 V %s", b ? "ok" : "FAILED", s3 ? "ok" : "FAILED",
++	    s5 ? "ok" : "FAILED");
+ 	LOG("M7: WLAN rails (100 mA each) L5 0.8 V %s, L7 1.8 V %s, L17 1.304 V %s, L25 3.312 V %s", l5 ? "ok" : "FAILED",
+ 	    l7 ? "ok" : "FAILED", l17 ? "ok" : "FAILED", l25 ? "ok" : "FAILED");
+ }

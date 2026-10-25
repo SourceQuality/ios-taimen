@@ -924,3 +924,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   msm8998 without voting those, so power stays a weaker lead. What mainline ath10k does and icnss does not:
   HOST_CAP with daemon_support 0 (8-bit, its msm8998 quirk) right after IND_REGISTER. Android has cnss-daemon;
   a firmware not told there is none may wait for it in mission mode. 0293 sends it; boot 125 is the full M0-M9.
+- 2026-10-24 boot 125 (r113 = +0263-0293, a plain ROOTFIX + taimenwifi=10, 420 s): HOST_CAP (daemon_support 0,
+  8-bit) accepted at +1.29 s; FW_READY, mission, scan fine (36 networks); FATAL at +14.21 s as before. Not the
+  daemon either. Last physical lead before stepping back: power headroom once the radio is live. 0294 votes BoB
+  (L25's parent; bobb 1) at 3.312 V in PWM, and S3 1.352 V / S5 2.04 V (the WCN3990 BT node's io and xtal
+  supplies) before the modem boots.
