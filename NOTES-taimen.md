@@ -1058,3 +1058,15 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (identity lookup? still open). 0312 + sweettcc.dylib: preflight agrees with the audit token check, inserted
   into the Photos stack. New tools: tools/sweetgl/dsc-dis.py by address, mkrootfix.py --mkdir, the contact sheet
   and Mach-O disassembly scripts (scratch). AegirPoster did not crash in boots 142-143.
+- 2026-10-25 boots 145-148: **TCC works: Photos and Music open.** sweettcc.dylib (0312, an interposer for
+  TCCAccessPreflight) never fired: PhotoLibraryServicesCore reaches TCC through a cache stub that branches
+  straight to the function (adrp/add/br, no GOT), which neither __interpose nor GOT rebinding can change. TCC debug
+  logging (/Library/Preferences/Logging/Subsystems/com.apple.TCC.plist) still showed nothing from tccd. tcctest v2
+  (boot 147) asked tccd itself over XPC: result false, auth_error_code 6, "Failed to issue Sandbox Extension for
+  kTCCServicePhotos from Resp:{TCCDProcess: ...}". tccd attaches a sandbox extension to every grant, and the SWEET
+  Sandbox policy failed op 5 (extension issue) with ENOENT. 0313 issues a token (class and path, the usual
+  ';'-separated shape) and accepts any consume (op 6, a fresh handle). Boot 148: preflight granted for the
+  entitled services (Photos, Contacts) and still denied for the rest (Camera, Microphone), tccd's reply result
+  true; assetsd runs; **Photos** shows What's New, the notification prompt, then its Library ("No Photos or
+  Videos"); **Music** opens (Listen Now: "An Error Occurred" without an Apple Music account, the mini player) -
+  its NULL databasePath was the media library refused by TCC too. sweettcc.dylib is no longer needed.
