@@ -368,32 +368,93 @@ take_agent(void)
 	}
 }
 
+/*
+ * All spliced connections in one thread (a thread each crossed iOS's 32-thread watermark in a
+ * 15-minute boot, boot 149: long-lived app connections keep theirs). Writes block at most 5 s
+ * (SO_SNDTIMEO), after which that pair is dropped, so a stalled peer cannot hold up the rest.
+ */
+#define MAXPAIRS        256
+
 struct pair {
 	int a, b;
 };
 
+static struct pair pairs[MAXPAIRS];
+static int npairs, wake_fd[2] = { -1, -1 };
+
+static void
+add_pair(int a, int b)
+{
+	struct timeval tv = { 5, 0 };
+	setsockopt(a, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	setsockopt(b, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	pthread_mutex_lock(&mu);
+	if (npairs < MAXPAIRS) {
+		pairs[npairs].a = a;
+		pairs[npairs].b = b;
+		npairs++;
+		a = b = -1;
+		n_spliced++;
+	}
+	pthread_mutex_unlock(&mu);
+	if (a >= 0) {
+		close(a);
+		close(b);
+	}
+	(void)write(wake_fd[1], "x", 1);
+}
+
 static void *
 splice_thread(void *arg)
 {
-	struct pair p = *(struct pair *)arg;
-	free(arg);
-	char buf[32768];
-	struct pollfd f[2] = { { p.a, POLLIN, 0 }, { p.b, POLLIN, 0 } };
-	for (int done = 0; !done;) {
-		if (poll(f, 2, -1) <= 0 && errno != EINTR) {
-			break;
+	(void)arg;
+	static char buf[32768];
+	static struct pollfd f[1 + 2 * MAXPAIRS];
+	static struct pair snap[MAXPAIRS];
+	for (;;) {
+		pthread_mutex_lock(&mu);
+		int n = npairs;
+		memcpy(snap, pairs, sizeof(struct pair) * n);
+		pthread_mutex_unlock(&mu);
+		f[0].fd = wake_fd[0];
+		f[0].events = POLLIN;
+		for (int i = 0; i < n; i++) {
+			f[1 + 2 * i] = (struct pollfd){ snap[i].a, POLLIN, 0 };
+			f[2 + 2 * i] = (struct pollfd){ snap[i].b, POLLIN, 0 };
 		}
-		for (int i = 0; i < 2 && !done; i++) {
-			if (f[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-				ssize_t n = read(f[i].fd, buf, sizeof(buf));
-				if (n <= 0 || write_all(f[1 - i].fd, buf, n) != 0) {
-					done = 1;
+		if (poll(f, 1 + 2 * n, -1) < 0) {
+			continue;
+		}
+		if (f[0].revents & POLLIN) {
+			char w[64];
+			(void)read(wake_fd[0], w, sizeof(w));
+		}
+		for (int i = 0; i < n; i++) {
+			int dead = 0;
+			for (int k = 0; k < 2 && !dead; k++) {
+				struct pollfd *p = &f[1 + 2 * i + k];
+				if (p->revents & (POLLIN | POLLHUP | POLLERR)) {
+					ssize_t r = read(p->fd, buf, sizeof(buf));
+					int to = k == 0 ? snap[i].b : snap[i].a;
+					if (r <= 0 || write_all(to, buf, r) != 0) {
+						dead = 1;
+					}
 				}
+			}
+			if (dead) {
+				close(snap[i].a);
+				close(snap[i].b);
+				pthread_mutex_lock(&mu);
+				for (int j = 0; j < npairs; j++) {
+					if (pairs[j].a == snap[i].a && pairs[j].b == snap[i].b) {
+						pairs[j] = pairs[--npairs];
+						break;
+					}
+				}
+				pthread_mutex_unlock(&mu);
 			}
 		}
 	}
-	close(p.a);
-	close(p.b);
 	return NULL;
 }
 
@@ -423,18 +484,7 @@ proxy_thread(void *arg)
 			close(c);
 			continue;
 		}
-		struct pair *p = malloc(sizeof(*p));
-		pthread_t t;
-		p->a = c;
-		p->b = a;
-		if (pthread_create(&t, NULL, splice_thread, p) == 0) {
-			pthread_detach(t);
-			n_spliced++;
-		} else {
-			free(p);
-			close(c);
-			close(a);
-		}
+		add_pair(c, a);
 	}
 	return NULL;
 }
@@ -628,6 +678,10 @@ main(int argc, char **argv)
 		sleep(2);
 	}
 	pthread_t t;
+	if (pipe(wake_fd) != 0) {
+		say("pipe: %s", strerror(errno));
+	}
+	pthread_create(&t, NULL, splice_thread, NULL);
 	pthread_create(&t, NULL, agent_thread, NULL);
 	pthread_create(&t, NULL, proxy_thread, NULL);
 	pthread_create(&t, NULL, status_thread, NULL);
