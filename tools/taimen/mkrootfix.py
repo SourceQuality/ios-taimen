@@ -132,9 +132,17 @@ class Blob:
         return b''.join(out)
 
 
-def launchd(plist):
-    """sweet-root-tweaks.py launchd(): no panics on crashes, no baseband/FairPlay/diagnostics jobs."""
+def launchd(plist, daemons=()):
+    """sweet-root-tweaks.py launchd(): no panics on crashes, no baseband/FairPlay/diagnostics jobs.
+    daemons: (label, argv) jobs of ours to add (--daemon), run as root at load, kept alive,
+    stdout/stderr on /dev/console (the kernel log)."""
     jobs = plist['LaunchDaemons']
+    for label, argv in daemons:
+        jobs[f'/System/Library/LaunchDaemons/{label}.plist'] = {
+            'Label': label, 'ProgramArguments': argv, 'RunAtLoad': True, 'KeepAlive': True,
+            'ThrottleInterval': 10, 'UserName': 'root',
+            'StandardOutPath': '/dev/console', 'StandardErrorPath': '/dev/console'}
+        print(f'launchd.plist: job {label} added: {" ".join(argv)}')
     renamed = 0
     for job in jobs.values():
         if '_PanicOnCrash' in job:
@@ -168,6 +176,8 @@ def main():
                     help='remove matching files below DIR at boot, first thing (op 9, xnu 0280)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
+    ap.add_argument('--daemon', action='append', default=[], metavar='LABEL=/PATH[,ARG...]',
+                    help='add a launchd job of ours (RunAtLoad, KeepAlive, output to the console)')
     a = ap.parse_args()
     if a.apps_archive:
         apps_archive(a.image, a.apps_archive)
@@ -183,7 +193,8 @@ def main():
         orig = extract(a.image, ['System/Library/xpc/launchd.plist'] + srv, tmp)
 
     b.plist(WRITE, '/System/Library/xpc/launchd.plist',
-            launchd(plistlib.loads(orig['System/Library/xpc/launchd.plist'])), 0o644, 0, 0)
+            launchd(plistlib.loads(orig['System/Library/xpc/launchd.plist']),
+                    [(d.split('=', 1)[0], d.split('=', 1)[1].split(',')) for d in a.daemon]), 0o644, 0, 0)
     for p in srv:      # camera filter prewarm calls a NULL OpenGL function without a GPU
         data = plistlib.loads(orig[p])
         data['StartRecorderServer'] = False
@@ -244,6 +255,7 @@ def main():
         dest, src = f.split('=', 1)
         assert dest.startswith('/'), dest
         raw = open(src, 'rb').read()
+        b.mkdirs(os.path.dirname(dest))         # existing levels are skipped (EEXIST)
         b.add(CREATE_Z, dest, struct.pack('<I', len(raw)) + zlib.compress(raw, 9), 0o755, 0, 0)
 
     blob = b.pack()
