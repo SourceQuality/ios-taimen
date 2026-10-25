@@ -4,10 +4,12 @@
  * depth, viewport, scissor and culling, function constants, threadgroup memory, vertex attributes, events, shared
  * events and listeners, fences, handlers and resource tracking.
  *
- *   mtlabitest [AIR_DIR]
+ *   mtlabitest [--daemon] [AIR_DIR]
  *
  * AIR_DIR holds extra fixtures assembled from metal2vulkan's validation fixtures (host-check.sh makes them):
- * stage_io.air, sampling.air, threadgroup_word.air. Each check prints one line:
+ * stage_io.air, sampling.air, threadgroup_word.air. A build with MTLABITEST_EMBEDDED_AIR (build-ios.sh) carries them
+ * in the binary (embedded_air[], from a header it generates) and needs no AIR_DIR. --daemon: as a launchd job on the
+ * phone, run once per boot and then idle (test/oneshot.h). Each check prints one line:
  *   ok        it ran and what it computed is right
  *   ran       it ran (recorded, compiled, submitted); its GPU-written result is not checkable (SWEETMTL_DRM_SHIM=1:
  *             freedreno drm-shim executes nothing)
@@ -24,6 +26,7 @@
 #include <unistd.h>
 
 #include "NativeMetalObjects.h"
+#include "oneshot.h"
 
 /* The bridge's self-test links against it (mtlbridgetest.c says why); this tool never calls it. */
 void sys_dcache_flush(void *start, size_t len)
@@ -78,6 +81,11 @@ static NmbQueue *queue;
 
 static NmbLibrary *library_file(const char *name)
 {
+#ifdef MTLABITEST_EMBEDDED_AIR
+	for (size_t i = 0; i < sizeof(embedded_air) / sizeof(embedded_air[0]); i++)
+		if (!strcmp(embedded_air[i].name, name))
+			return nmb_library_new(dev, embedded_air[i].bytes, embedded_air[i].size, true);
+#endif
 	char path[1024];
 	snprintf(path, sizeof(path), "%s/%s", air_dir ? air_dir : ".", name);
 	FILE *f = fopen(path, "rb");
@@ -752,13 +760,14 @@ static void not_yet_paths(void)
 
 int main(int argc, char **argv)
 {
+	oneshot_begin("mtlabitest", &argc, &argv);
 	air_dir = argc > 1 ? argv[1] : NULL;
 	shim = getenv("SWEETMTL_DRM_SHIM") != NULL;
 	mkdir("/tmp/sweetmtl-cache", 0777);
 	dev = nmb_device_open("", "/tmp/sweetmtl-cache");
 	if (!dev) {
 		line("FAIL", "device", nmb_last_error());
-		return 1;
+		return oneshot_end("mtlabitest", 1);
 	}
 	queue = nmb_queue_new(dev);
 	size_t n = 0;
@@ -766,7 +775,7 @@ int main(int argc, char **argv)
 	NmbLibrary *lib = nmb_library_new(dev, air, n, true);
 	if (!lib) {
 		line("FAIL", "fixture library", nmb_last_error());
-		return 1;
+		return oneshot_end("mtlabitest", 1);
 	}
 	device_answers();
 	texture_cpu();
@@ -785,5 +794,5 @@ int main(int argc, char **argv)
 	nmb_device_release(dev);
 	usleep(100000);
 	printf("FAIL lines: %d\n", fails);
-	return fails;
+	return oneshot_end("mtlabitest", fails);
 }

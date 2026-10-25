@@ -4,7 +4,10 @@
  * pages (64x64), then, given QuartzCore's default.metallib, every kernel and vertex/fragment pair of it built into
  * pipelines. After flame's phone/metal2/m2vtest.c.
  *
- *   mtlbridgetest [CACHE_DIR] [METALLIB]
+ *   mtlbridgetest [--daemon] [CACHE_DIR] [METALLIB]
+ *
+ * --daemon: as a launchd job on the phone, run once per boot and then idle (test/oneshot.h). The exit status (and the
+ * --daemon status) is 0 when every step ran.
  *
  * On the PC under Mesa's freedreno drm-shim (tools/sweetmtl/host-check.sh) nothing executes: the steps run, record
  * and submit, but the result counts read memory no GPU wrote (SWEETMTL_DRM_SHIM=1 says so instead of judging them).
@@ -20,6 +23,7 @@
 #include <unistd.h>
 
 #include "NativeMetalBridge.h"
+#include "oneshot.h"
 
 /*
  * The bridge cleans and invalidates host pages around the GPU's use (libSystem's sys_dcache_flush on iOS, which assumes
@@ -54,12 +58,27 @@ static void mark(uint32_t m)
 	fflush(stdout);
 }
 
+/* mkdir -p */
+static void make_dirs(const char *path)
+{
+	char p[1024];
+	snprintf(p, sizeof(p), "%s", path);
+	for (char *s = p + 1; *s; s++)
+		if (*s == '/') {
+			*s = 0;
+			mkdir(p, 0777);
+			*s = '/';
+		}
+	mkdir(p, 0777);
+}
+
 int main(int argc, char **argv)
 {
+	oneshot_begin("mtlbridgetest", &argc, &argv);
 	const char *cache = argc > 1 ? argv[1] : "/tmp/sweetmtl-cache";
 	const char *qc = argc > 2 ? argv[2] : NULL;
 	int shim = getenv("SWEETMTL_DRM_SHIM") != NULL;
-	mkdir(cache, 0777);
+	make_dirs(cache);
 	uint8_t *bytes = NULL;
 	size_t n = 0;
 	if (qc) {
@@ -105,5 +124,5 @@ int main(int argc, char **argv)
 	free(bytes);
 	/* let the runtime's threads wind down (their trace lines) before the process exits */
 	usleep(200000);
-	return out.stage != 0;
+	return oneshot_end("mtlbridgetest", out.stage != 0);
 }
