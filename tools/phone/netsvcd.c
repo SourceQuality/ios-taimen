@@ -164,8 +164,33 @@ proxies(void)
 	return dict(8, k, v);
 }
 
+/*
+ * The proxy keys go with the service only while the PC's agent is there (idle connections open, or
+ * one taken in the last 30 s): with the PC routing for us instead (NAT), a proxy with no agent
+ * behind it would fail every request.
+ */
+static time_t last_take;
+
 static int
-publish(SCDynamicStoreRef st)
+agent_alive(void)
+{
+	pthread_mutex_lock(&mu);
+	for (int i = 0; i < nidle;) {           /* drop the ones the PC closed */
+		struct pollfd p = { idle[i], POLLIN, 0 };
+		if (poll(&p, 1, 0) != 0) {
+			close(idle[i]);
+			idle[i] = idle[--nidle];
+		} else {
+			i++;
+		}
+	}
+	int alive = nidle > 0 || time(NULL) - last_take < 30;
+	pthread_mutex_unlock(&mu);
+	return alive;
+}
+
+static int
+publish(SCDynamicStoreRef st, int proxied)
 {
 	const char *addr[] = { ADDR }, *mask[] = { MASK }, *dns[] = { "1.1.1.1", "8.8.8.8" };
 	const char *k4[] = { "Addresses", "SubnetMasks", "Router", "InterfaceName", "ConfigMethod" };
@@ -174,21 +199,29 @@ publish(SCDynamicStoreRef st)
 	CFTypeRef vd[] = { arr(2, dns) };
 	const char *ki[] = { "Addresses", "SubnetMasks" };
 	CFTypeRef vi[] = { arr(1, addr), arr(1, mask) };
-	CFTypeRef vals[] = { dict(5, k4, v4), dict(1, kd, vd), dict(2, ki, vi), proxies(), proxies() };
-	CFDictionaryRef all = dict(NKEYS, keys, vals);
-	Boolean ok = SCDynamicStoreSetMultiple(st, all, NULL, NULL);
-	CFRelease(all);
+	CFTypeRef vals[] = { dict(5, k4, v4), dict(1, kd, vd), dict(2, ki, vi), NULL, NULL };
+	if (proxied) {
+		vals[3] = proxies();
+		vals[4] = proxies();
+	}
+	CFDictionaryRef set = dict(proxied ? 5 : 3, keys, vals);
+	CFArrayRef gone = proxied ? NULL : arr(2, keys + 3);
+	Boolean ok = SCDynamicStoreSetMultiple(st, set, gone, NULL);
+	CFRelease(set);
+	if (gone) {
+		CFRelease(gone);
+	}
 	n_publish++;
-	say("published " IFNAME " (router " ROUTER ", DNS 1.1.1.1 8.8.8.8, proxy 127.0.0.1:%d): %s", PROXY_PORT,
-	    ok ? "ok" : SCErrorString(SCError()));
+	say("published " IFNAME " (router " ROUTER ", DNS 1.1.1.1 8.8.8.8, %s): %s",
+	    proxied ? "proxy 127.0.0.1:8080 to the PC agent" : "no proxy", ok ? "ok" : SCErrorString(SCError()));
 	return ok;
 }
 
 static int
-present(SCDynamicStoreRef st)
+present(SCDynamicStoreRef st, int proxied)
 {
 	int all = 1;
-	for (unsigned i = 0; i < NKEYS; i++) {
+	for (unsigned i = 0; i < (proxied ? NKEYS : 3); i++) {
 		CFStringRef k = str(keys[i]);
 		CFPropertyListRef v = SCDynamicStoreCopyValue(st, k);
 		CFRelease(k);
@@ -320,6 +353,7 @@ take_agent(void)
 			int s = idle[--nidle];
 			struct pollfd p = { s, POLLIN, 0 };
 			if (poll(&p, 1, 0) == 0) {       /* nothing to read and not closed: alive */
+				last_take = time(NULL);
 				pthread_mutex_unlock(&mu);
 				return s;
 			}
@@ -476,7 +510,7 @@ main(int argc, char **argv)
 		return 0;
 	}
 	if (strcmp(cmd, "once") == 0) {
-		int ok = publish(st);
+		int ok = publish(st, 0);
 		sleep(1);               /* let IPMonitor recompute the primary service */
 		show_to(st, stdout);
 		return ok ? 0 : 1;
@@ -492,12 +526,16 @@ main(int argc, char **argv)
 	pthread_create(&t, NULL, agent_thread, NULL);
 	pthread_create(&t, NULL, proxy_thread, NULL);
 	pthread_create(&t, NULL, status_thread, NULL);
-	publish(st);
+	int proxied = -1;
 	for (;;) {
-		sleep(10);
-		if (!present(st)) {
+		int want = agent_alive();
+		if (want != proxied) {
+			publish(st, want);
+			proxied = want;
+		} else if (!present(st, proxied)) {
 			say("keys gone (configd restarted, or prefs reloaded): publishing again");
-			publish(st);
+			publish(st, proxied);
 		}
+		sleep(2);
 	}
 }
