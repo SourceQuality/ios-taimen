@@ -42,3 +42,6 @@ CLAUDE.local.md
 NOTES.md
 AGENTS.md
 out/
+# metal2vulkan checkout or link (tools/sweetmtl/m2v-fetch.sh)
+tools/sweetmtl/m2v
+tools/sweetmtl/runtime/Cargo.lock
