@@ -1,0 +1,77 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 088bd2c..1a5608e 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -185,7 +185,8 @@ sweet_null_tee(char *name, size_t len)
+ 		wklog = 0;
+ 		(void)PE_parse_boot_argn("sweetwklog", &wklog, sizeof(wklog));
+ 	}
+-	if (strncmp(name, "netsvcd", 7) == 0 ||
++	extern bool sweet_logp_match(const char *name);         /* bsd/kern/kern_exec.c, 0308 */
++	if (strncmp(name, "netsvcd", 7) == 0 || sweet_logp_match(name) ||
+ 	    (wklog && (strncmp(name, "com.apple.WebKit", 16) == 0 || strcmp(name, "MobileSafari") == 0))) {
+ 		return true;
+ 	}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 38ef7f3..2c73f37 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -491,6 +491,38 @@ sweet_exec_denied(const char *name)
+  * messages to stderr (as under Xcode), which is /dev/null for them and teed into the kernel log
+  * (bsd/dev/mem.c). The boot-args have no room for it in sweetenv (607 bytes, ROOT=1 + GPU boots).
+  */
++/*
++ * 0308: boot-arg sweetlogp=NAME[,NAME...]: the same for any process by name (mediaserverd,
++ * bluetoothd, an app that crashes): os_log and CFLog mirrored to stderr, stderr teed.
++ */
++bool sweet_logp_match(const char *name);
++
++bool
++sweet_logp_match(const char *name)
++{
++	static char list[96];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++	if (state == 0) {
++		state = PE_parse_boot_argn("sweetlogp", list, sizeof(list)) && list[0] ? 2 : 1;
++	}
++	if (state != 2) {
++		return false;
++	}
++	size_t n = strlen(name);
++	for (const char *t = list; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
+ static int
+ sweet_exec_wklog(struct image_params *imgp, int ptr_size, const char *base)
+ {
+@@ -499,7 +531,8 @@ sweet_exec_wklog(struct image_params *imgp, int ptr_size, const char *base)
+ 		wklog = 0;
+ 		(void)PE_parse_boot_argn("sweetwklog", &wklog, sizeof(wklog));
+ 	}
+-	if (!wklog || (strncmp(base, "com.apple.WebKit.", 17) != 0 && strcmp(base, "MobileSafari") != 0)) {
++	bool webkit = wklog && (strncmp(base, "com.apple.WebKit.", 17) == 0 || strcmp(base, "MobileSafari") == 0);
++	if (!webkit && !sweet_logp_match(base)) {
+ 		return 0;
+ 	}
+ 	static const char *const vars[] = { "OS_ACTIVITY_DT_MODE=YES", "CFLOG_FORCE_STDERR=1" };
+@@ -514,7 +547,8 @@ sweet_exec_wklog(struct image_params *imgp, int ptr_size, const char *base)
+ 		imgp->ip_argspace -= ptr_size;
+ 		imgp->ip_envc++;
+ 	}
+-	printf("SWEET ENV: %s += OS_ACTIVITY_DT_MODE=YES CFLOG_FORCE_STDERR=1 (sweetwklog)\n", base);
++	printf("SWEET ENV: %s += OS_ACTIVITY_DT_MODE=YES CFLOG_FORCE_STDERR=1 (%s)\n", base,
++	    webkit ? "sweetwklog" : "sweetlogp");
+ 	return 0;
+ }
+ 
