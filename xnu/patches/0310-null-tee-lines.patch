@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 1a5608e..dbe055e 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -243,6 +243,46 @@ sweet_null_repeat(const char *name, const char *buf, size_t len)
+ 	lck_mtx_unlock(&sweet_null_lock);
+ 	return same;
+ }
++
++/*
++ * 0310: some processes write a few bytes at a time (boot 139: mediaserverd one character per
++ * write, libc++abi its prefix and its message apart), and each write was a log line. Text
++ * without a newline now waits here (one pending line) until its newline, a write from another
++ * process, or 200 bytes; empty lines are dropped.
++ */
++static LCK_MTX_DECLARE(sweet_null_pend_lock, &sweet_null_grp);
++static char sweet_null_pend[256], sweet_null_pend_name[32];
++static size_t sweet_null_pend_len;
++
++static void
++sweet_null_line(const char *name, const char *buf, size_t len)
++{
++	if (len > 0 && !sweet_null_repeat(name, buf, len)) {
++		printf("|%s| %.*s\n", name, (int)len, buf);
++	}
++}
++
++static void
++sweet_null_emit(const char *name, const char *buf, size_t c)
++{
++	lck_mtx_lock(&sweet_null_pend_lock);
++	if (sweet_null_pend_len > 0 && strcmp(name, sweet_null_pend_name) != 0) {
++		sweet_null_line(sweet_null_pend_name, sweet_null_pend, sweet_null_pend_len);
++		sweet_null_pend_len = 0;
++	}
++	strlcpy(sweet_null_pend_name, name, sizeof(sweet_null_pend_name));
++	for (size_t i = 0; i < c; i++) {
++		if (buf[i] == '\n' || sweet_null_pend_len >= 200) {
++			sweet_null_line(name, sweet_null_pend, sweet_null_pend_len);
++			sweet_null_pend_len = 0;
++			if (buf[i] == '\n') {
++				continue;
++			}
++		}
++		sweet_null_pend[sweet_null_pend_len++] = buf[i];
++	}
++	lck_mtx_unlock(&sweet_null_pend_lock);
++}
+ #endif
+ #endif
+ 
+@@ -320,12 +360,11 @@ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ 						break;
+ 					}
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-					if (sweet_null_repeat(name, buf, c)) {
+-						continue;
+-					}
+-#endif
++					sweet_null_emit(name, buf, c);
++#else
+ 					printf("|%s| %.*s%s", name, (int)c, buf,
+ 					    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
++#endif
+ 					continue;
+ 				}
+ 			}
