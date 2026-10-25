@@ -1104,3 +1104,32 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   plug-in). The reader copies adsp.*, the TAS2557 firmware and Android's mixer paths; xnu 0317 (stages 1-2:
   firmware, the ADSP by PAS, SMP2P READY) and 0318 (stages 3-4: GLINK lpass, QRTR, APR, AVCS ready) are the
   first steps, boot-arg taimenaudio=N, firmware as payload blobs (boot-xnu.sh AUDIOFW).
+- 2026-10-25 **boot 156 (r139 = +0316-0320, taimenaudio=6): the ADSP runs, and LPASS clocks the speaker port.**
+  Every stage passed the first time. PAS (id 1): INIT_IMAGE, MEM_SETUP for the relocatable image
+  (0x91900000..0x93300000 into the carve-out at 0x8B200000), 9.7 MB of segments in 21 ms, AUTH_AND_RESET;
+  the ADSP's SMP2P item 443 after 5 ms and READY ("slave-kernel" 0x6) 12 ms after the reset. GLINK on the
+  lpass edge: the ADSP opened IPCRTR, apr_audio_svc, apr_apps2, glink_ssr, fastrpcglink-apps-dsp and
+  LOOPBACK_CTL_LPASS. QRTR HELLO from node 5 with six services. The pd-mapper was asked tms/pdr_enabled,
+  avs/audio and tms/pddump_disabled and answered no domains. The AVCS core said state 1 after one
+  "not ready" (0x16) and listed 9 services (AFE 0x260000, ASM 0x70002, ADM 0x70000). AFE: CLOCK_SET
+  QUAD_MI2S_IBIT 1.536 MHz, I2S config for 0x1006 (16-bit, SD1, stereo) and DEVICE_START all answered 0,
+  and SCK/WS toggled 10493/12635 times in 20000 TLMM samples (1 before): **M2, M3, M4, M6**. The LPASS Q6
+  SMMU: sCR0 0x00200626 (translation on, unmatched streams fault), 12 SMRs, 13 banks, no valid SMR, so
+  stream 1 (the DSP's reads of our buffers) needs one. Boot 156's Blender MP4 URL was a 404. Somebody
+  used the phone by hand during the boot (Weather, Settings); Settings crashed in CoreImage's GL
+  fallback (CI::GLContext::init calls a NULL GL function: apps have no GLES driver and no Metal device),
+  and driverkitd was jetsammed 82 times (per-process limit while reading a file; once per boot before).
+- 2026-10-25 **boot 157 (r140 = +0321): video plays in Safari.** www.w3schools.com/html/mov_bbb.mp4 played to
+  its end (0:10) in the full-screen player: iOS's software H.264 decoder in mediaserverd with 0316's plane
+  geometry. YouTube still says "error licensing this video" (DRM, no fairplayd). Audio: programming the
+  stream 1 identity bank (taimenaudiosmmu=2) hung: no TaimenAudio line after the census, the GPU never
+  loaded its zap shader (backboardd fell back to Apple's EAGL, the CPU renderer), the perf log stopped:
+  an access that never completed stalled the interconnect. 0322: the SMMU waits for the GPU, a log line
+  before each register group, and taimenaudiosmmu=3 (an SMR with an S2CR bypass, GR0 page only).
+- 2026-10-25 boot 158 (r141 = +0322, taimenaudiosmmu=3): the GPU was ready after 11.5 s, then SMR0 took stream 1
+  (80000001) without hanging, but its S2CR, written as bypass (type 1), read back as fault (type 2): no
+  non-secure bypass on the LPASS SMMU. Stream 1 needs a context bank; 0324 takes the lowest free one (boot 157
+  hung on CB12) and taimenaudiosmmu=4 asks TZ for MP_RESTORE_SEC_CFG (device 2, LPASS) first. 0323 adds the
+  TAS2557 amps (stage 7; parser checked on the PC against this phone's firmware), /dev/redwood-audio and the
+  feeder (stage 9), and runs the port at S24_LE / 3.072 MHz as Android's mixer paths do; the RedwoodAudio HAL
+  plug-in builds on the phone-tools CI (mkrootfix.py --hal-plugin).
