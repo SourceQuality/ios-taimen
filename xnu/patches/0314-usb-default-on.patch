@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index e077938..5366be9 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -100,11 +100,15 @@ usb_rd(vm_offset_t base, uint32_t off)
+ void
+ sweet_usb_probe(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	int enabled = 2;        /* 0314: USB networking by default (boots 134-148) */
++#else
+ 	int enabled = 1;
++#endif
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 off, 1 report state only, 2 (taimen's default) also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	PE_parse_boot_argn("sweetusbncm", &ud_ncm, sizeof(ud_ncm));
+ 	PE_parse_boot_argn("sweetusbdhcp", &ud_dhcp, sizeof(ud_dhcp));

@@ -27,7 +27,10 @@ rm -rf "$d"; mkdir -p "$d"
 (cd "$d" && sha256sum -c SHA256SUMS)
 lib=/usr/lib/sweetgl-$(sha256sum "$d/sweetgl.dylib" | cut -c1-8).dylib
 fix=$P/../research/taimen/rootfix-sweetgl-current.bin
-python3 -I "$P/tools/taimen/mkrootfix.py" "$P/../research/ipsw-x/ios16-root.img" "$fix" --zfile "$lib=$d/sweetgl.dylib" | tail -1
+# the phone tools (USB networking: netsvcd) ride along when tools/windows/ci-phone-tools.sh fetched them
+tools=()
+[ -f "$P/../out/phone-tools/netsvcd" ] && tools=(--phone-tools "$P/../out/phone-tools")
+python3 -I "$P/tools/taimen/mkrootfix.py" "$P/../research/ipsw-x/ios16-root.img" "$fix" --zfile "$lib=$d/sweetgl.dylib" "${tools[@]}" | tail -2
 cat > "$P/../out/sweetgl/current.env" <<EOF
 SWEETGL_SHA=$sha
 SWEETGL_LIB=$lib

@@ -180,9 +180,24 @@ def main():
                     help='remove a file at boot (before the --file/--zfile records)')
     ap.add_argument('--file', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
+    ap.add_argument('--phone-tools', metavar='DIR',
+                    help='install the phone-tools CI build in DIR (tools/windows/ci-phone-tools.sh): '
+                         'netsvcd as /usr/local/bin/netsvcd-HASH with its launchd job, sweetexc.dylib')
     ap.add_argument('--daemon', action='append', default=[], metavar='LABEL=/PATH[,ARG...]',
                     help='add a launchd job of ours (RunAtLoad, KeepAlive, output to the console)')
     a = ap.parse_args()
+    if a.phone_tools:
+        # netsvcd under its content hash: a new build gets a new path (ROOTFIX only creates absent
+        # files, and the old binary may be running), and launchd's job follows the path
+        import hashlib
+        nd = os.path.join(a.phone_tools, 'netsvcd')
+        tag = hashlib.sha256(open(nd, 'rb').read()).hexdigest()[:8]
+        a.zfile.append(f'/usr/local/bin/netsvcd-{tag}={nd}')
+        a.daemon.append(f'com.sweet.netsvcd=/usr/local/bin/netsvcd-{tag}')
+        exc = os.path.join(a.phone_tools, 'sweetexc.dylib')
+        if os.path.exists(exc):
+            a.zfile.append(f'/usr/local/lib/sweetexc.dylib={exc}')
+        print(f'--phone-tools: netsvcd-{tag}' + (', sweetexc.dylib' if os.path.exists(exc) else ''))
     if a.apps_archive:
         apps_archive(a.image, a.apps_archive)
         return
