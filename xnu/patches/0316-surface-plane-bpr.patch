@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 394b2b5..1cb1d83 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -634,7 +634,12 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ 	memcpy(p + off, &v, 8);
+ }
+ 
+-/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
++/*
++ * IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). A plane record
++ * (+0x68 + 0x80 i) as IOSurfaceClientGet*OfPlane read it: width +0, height +4, offset +0xc,
++ * bytes per row +0x10, size +0x14, bytes per element +0x18, element width/height +0x1a/+0x1b
++ * (a byte 1 at +0x54 makes the plane getters answer 0).
++ */
+ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+@@ -662,8 +667,8 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+@@ -822,6 +827,18 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	static unsigned planar_logged;
++	if (ret == kIOReturnSuccess && s->planeCount > 0 && planar_logged < 64) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		planar_logged++;
++		for (uint32_t i = 0; i < s->planeCount; i++) {
++			const struct sweet_surface_plane *pl = &s->planes[i];
++			IOLog("SWEET SURF: %s id %u fmt 0x%x plane %u: %ux%u bpe %u el %ux%u bpr %u offset 0x%x size 0x%x\n",
++			    name, s->id, s->pixelFormat, i, pl->width, pl->height, pl->bytesPerElement,
++			    pl->elementWidth, pl->elementHeight, pl->bytesPerRow, pl->offset, pl->size);
++		}
++	}
+ 	/* Who asks for formats CoreAnimation's CPU renderer cannot draw into? */
+ 	static uint32_t odd_logged;
+ 	if (s->pixelFormat != SWEET_FMT('B', 'G', 'R', 'A') && s->pixelFormat != SWEET_FMT('L', '0', '0', '8') &&
