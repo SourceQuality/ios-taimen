@@ -4,9 +4,9 @@ The Metal driver of `docs/taimen-metal-plan.md` ("metal2gallium"). Flame's nativ
 and bridge run on a runtime of our own. The runtime uses the metal2vulkan translator for shaders
 and binding plans and Mesa's Gallium freedreno a5xx driver for the GPU.
 
-**Status (2026-10-25): phase 1, PC only.** The runtime, the Gallium shim and the bridge build for
-Linux x86_64 against a host Mesa. `host-check.sh` runs the bridge's self-test and an ABI test of
-every bridge call the frontend makes:
+**Status (2026-10-25): the PC checks pass, and the iOS test tools build in CI.** The runtime, the
+Gallium shim and the bridge build for Linux x86_64 against a host Mesa. `host-check.sh` runs the
+bridge's self-test and an ABI test of every bridge call the frontend makes:
 
 - on freedreno's **drm-shim** as an Adreno 540: everything records, compiles with ir3 for gpu 540
   and submits, and the submits are decoded with cffdump. drm-shim executes nothing, so values the
@@ -14,9 +14,9 @@ every bridge call the frontend makes:
 - on **softpipe**, Mesa's CPU driver, through the same runtime, translator and NIR lowering: there
   the values are checked.
 
-The Rust half also builds for `aarch64-apple-ios` on the PC. Nothing has run on the phone yet. The
-frontend, plugin, iOS build of the shim, CI and install are the next steps (see the iOS build and
-phone tests sections below).
+The GitHub job `.github/workflows/sweetmtl.yml` builds the same two test tools for iOS 16 arm64
+(`build-ios.sh`); they are ready for the phone. Nothing has run on the phone yet. The frontend,
+plugin and bundle (M1) come next (see the iOS build and phone tests sections below).
 
 ## Layers
 
@@ -202,10 +202,9 @@ softpipe:
   threadgroup memory, sampler arguments, events, and fences across queues. Heaps and archive
   serialization report not yet.
 
-iOS (Rust only): `cargo build --release --target aarch64-apple-ios` of the bridge works in WSL
-with conda-forge's `rust-std-aarch64-apple-ios` (same version as rustc). The static library's
-only unresolved externals are the `sg_*` shim calls, libSystem, the unwinder and
-`sys_dcache_flush` (which flame's plugin provides).
+iOS: see the iOS build section. The Rust half alone also builds in WSL
+(`cargo build --release --target aarch64-apple-ios` in `bridge/`, with conda-forge's
+`rust-std-aarch64-apple-ios` of rustc's version), which is a quick check before a CI run.
 
 Fixed on the way (worth knowing for the phone): `nir_rewrite_image_intrinsic` leaves the deref
 form's SRC_TYPE in the new RANGE_BASE slot (160 for float32), so `sg_shader.c` resets it.
@@ -217,94 +216,200 @@ nir_to_tgsi added it to the image index. ir3 does not read it.
 | --- | --- |
 | `bridge/` | flame's bridge (MIT, `LICENSE`), `build.rs` assembles the two fixtures with `LLVM_AS` (or takes `NMB_FIXTURE_AIR`/`NMB_FC_AIR`) |
 | `runtime/src/` | `device.rs` (device, answers, trace), `families.rs` (families, private selectors, format capabilities), `resource.rs` (buffers, textures, views, heaps), `library.rs`, `pipeline.rs` (pipelines, slots, variants, samplers, depth/stencil, archives), `encoder.rs`, `bind.rs` (binder), `command.rs` (queues, command buffers, replay, completion), `sync.rs`, `ffi.rs` (sg.h by hand), `error.rs` |
-| `gallium/` | `sg.h` (the ABI), `sg_device.c` (screen: sweet_drm on iOS, a render node or softpipe on Linux), `sg_resource.c`, `sg_shader.c`, `sg_replay.c`, `sg_format.c`, `sg_map.c`, `build-host.sh` |
+| `gallium/` | `sg.h` (the ABI), `sg_device.c` (screen: sweet_drm on iOS, a render node or softpipe on Linux), `sg_resource.c`, `sg_shader.c`, `sg_replay.c`, `sg_format.c`, `sg_map.c`, `build-host.sh` (the library, for the host or, with the iPhoneOS clang, for iOS) |
 | `profile/` | `a540-gallium.json` (the translator's device profile: M0's profile + freedreno's format table), `gen-formats.c`, `make-profile.py` |
-| `test/` | `mtlbridgetest.c` (runs `nmb_selftest`, like flame's `m2vtest.c`), `mtlabitest.c` (the ABI test) |
+| `test/` | `mtlbridgetest.c` (runs `nmb_selftest`, like flame's `m2vtest.c`), `mtlabitest.c` (the ABI test), `oneshot.h` (their `--daemon` mode), `mtltool-ents.plist` (their entitlements on iOS) |
 | `m0/` | M0: the CA shader qualification and `mesa-a5xx-ir3.patch` (`m0/README.md`) |
 | `m2v-fetch.sh`, `patches/` | the translator checkout at 720ef1ce with flame's patches 0001, 0004, 0005 (`m2v/`, not in git) |
 | `host-check.sh` | the PC check above |
+| `build-ios.sh` | the iOS build of the test tools (macOS; run by `.github/workflows/sweetmtl.yml`) |
 
-## iOS build (plan 4.4): next steps
+## iOS build (plan 4.4)
 
-The phone cannot be built for here: the PC has no iOS SDK. Builds go through a GitHub macOS
-runner, like `sweetgl.yml`.
+The PC has no iOS SDK, so the iOS binaries come from the GitHub job `.github/workflows/sweetmtl.yml`
+(macos-14, Xcode 15.4 with the iPhoneOS 17.5 SDK, deployment target 16.0). It runs on pushes to
+`taimen` and `metal-*` that touch `tools/sweetmtl/`, the workflow or the sweetgl files the build
+takes (the Mesa pin and patch, the cross setup, `sweet_drm.c`), and by hand (workflow_dispatch).
+The first green run is
+[40203190936](https://github.com/SourceQuality/ios-taimen/actions/runs/40203190936) (commit
+dad0d40, under 6 minutes).
 
-1. **Mesa for iOS.** A sweetmtl job, or a second build dir in `sweetgl.yml`. Run
-   `tools/sweetgl/mesa-fetch.sh` and `mesa-setup.sh` as sweetgl does, plus
-   `tools/sweetmtl/m0/mesa-a5xx-ir3.patch`. Build these targets with ninja:
-   - `libfreedreno.a`, `libfreedrenowinsys.a`;
-   - `libgallium.a`;
-   - `libvtn.a`, `libnir.a`, `libcompiler.a`;
-   - the ir3/isa/layout/common libraries;
-   - `libmesa_util*`, `libblake3.a`, `libmesa_util_c11.a`, `libxmlconfig.a`.
+1. **Mesa.** `tools/sweetgl/mesa-fetch.sh` and `mesa-setup.sh`, as sweetgl's job runs them, with
+   `MESA_SRC=research/mesa-mtl` and `MESA_BUILD=research/mesa-ios-mtl`, plus
+   `m0/mesa-a5xx-ir3.patch`. The trees are separate from sweetgl's because the patch's triops
+   change must not reach sweetgl before M0's open question is settled.
+2. **Translator.** `m2v-fetch.sh` clones the pin and applies the three patches. host-check gives
+   the same results with that checkout as with M0's.
+3. **`build-ios.sh`.**
+   - ninja builds Mesa's static libraries.
+   - `gallium/build-host.sh`, given the iPhoneOS clang, compiles the shim and
+     `tools/sweetgl/sweet_drm.c` with the flags of the iOS build's freedreno.
+   - cargo (Rust 1.99.1, the PC's) builds the bridge's static library for `aarch64-apple-ios`.
+   - llvm-as (brew `llvm@21`) assembles the fixtures. mtlabitest carries its three in the binary,
+     so it needs no fixture directory on the phone.
+   - clang links each tool with IOKit, CoreFoundation, IOSurface, libc++ and libz
+     (`-dead_strip`). The result is stripped (`strip -x`) and signed ad hoc with
+     `test/mtltool-ents.plist` (`platform-application`, as netsvcd has).
+   - The build fails if `nm -m` shows a weak import (`(undefined) weak external`): a symbol
+     newer than iOS 16.0 would be NULL on the phone (the strchrnul lesson).
+4. **Artifacts.**
+   - `sweetmtl`: `mtlbridgetest`, `mtlabitest`, `BUILDINFO.txt` and `SHA256SUMS`. BUILDINFO
+     records the commit, the run, Mesa, the patches, the translator, rustc, LLVM, Xcode and the
+     SDK, plus the mkrootfix arguments with this build's hashes.
+   - `sweetmtl-symbols`: unstripped copies for symbolication.
 
-   `gallium/build-host.sh` writes the list as `mesa-libs.txt`.
+Run 40203190936 made `mtlbridgetest` 23.4 MB and `mtlabitest` 23.6 MB. Compressed with zlib -9,
+which is what `--zfile` stores, each is 6.5 MiB. Both are arm64 with minos 16.0 and sdk 17.5. They
+link IOKit, CoreFoundation, IOSurface, libc++, libz and libSystem, carry an ad hoc signature with
+`platform-application`, and have no weak imports. On the PC, the same tools peak at 34 MB resident
+with the QuartzCore step included.
 
-   The patch's triops change (no bitwise triops before a6xx) also reaches sweetgl if both share
-   one tree. Keep a separate build dir until M0's open question is settled.
-2. **Shim.** `CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0"
-   gallium/build-host.sh MESA_SRC MESA_BUILD_IOS OUT`. It takes the flags from the iOS build's
-   `compile_commands.json`. Softpipe is left out because that build has none. Then compile
-   `tools/sweetgl/sweet_drm.c` with the same flags. `sg_device.c` already has the `__APPLE__` path:
-   `sweet_drm_open()`, the /dev/null log and the renderonly stubs.
-3. **Rust.**
-   `IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build --release --target aarch64-apple-ios` in
-   `bridge/`. The fixtures need `LLVM_AS` (brew llvm 21+) or prebuilt `.air` files through
-   `NMB_FIXTURE_AIR`/`NMB_FC_AIR`.
-4. **Test tools first.** Link `test/mtlbridgetest.c` and `test/mtlabitest.c` with the bridge,
-   `libsweetgallium.a`, `sweet_drm.o` and Mesa. They need no Metal.framework, no plugin and no
-   kernel patch: they open SweetGPU through `sweet_drm.c` as sweetgl does. Then `codesign -f -s -`
-   and the `nm -m | grep "weak external"` check.
-5. **Bundle (M1).**
-   - Copy `NativeBridgeMetalFrontend.{mm,h}`, `SweetMetal2.mm` (as `SweetMetal.mm`) and
-     `Info.plist` from flame (MIT) into `tools/sweetmtl/frontend/`, with the plan 4.3 deltas:
-     - ignore `loader`;
-     - `sys_dcache_flush` only for no-copy host memory;
-     - import IOSurfaces by ID;
-     - a client list in `/private/var/sweetmtl/clients`;
-     - a bounded wait for the GPU service.
-   - Build with `xcrun -sdk iphoneos clang++ -bundle` together with the libraries above.
-   - Upload `SweetMetal.bundle`, the two test tools, `BUILDINFO.txt` and SHA256SUMS as the
-     artifact.
-6. **IOSurface import by ID** (plan 4.3).
-   - In the shim, add `sg_buffer_import_iosurface(dev, surface_id)`: a `PIPE_BUFFER` imported
-     with `resource_from_handle` over the GEM handle from `sweet_drm_import_iosurface`.
-   - In the bridge, add `nmb_buffer_new_iosurface`.
+Left for M1:
 
-   Until then, the frontend's host-pointer import goes through the no-copy shadow, which is
-   correct but copies.
+- **Bundle.**
+  - Copy `NativeBridgeMetalFrontend.{mm,h}`, `SweetMetal2.mm` (as `SweetMetal.mm`) and
+    `Info.plist` from flame (MIT) into `tools/sweetmtl/frontend/`, with the plan 4.3 deltas:
+    - ignore `loader`;
+    - `sys_dcache_flush` only for no-copy host memory;
+    - import IOSurfaces by ID;
+    - a client list in `/private/var/sweetmtl/clients`;
+    - a bounded wait for the GPU service, like `oneshot.h`'s.
+  - Link it with `xcrun -sdk iphoneos clang++ -bundle` and the libraries `build-ios.sh` links.
+  - Add `SweetMetal.bundle` to the artifact.
+- **IOSurface import by ID** (plan 4.3).
+  - In the shim, add `sg_buffer_import_iosurface(dev, surface_id)`: a `PIPE_BUFFER` imported with
+    `resource_from_handle` over the GEM handle from `sweet_drm_import_iosurface`.
+  - In the bridge, add `nmb_buffer_new_iosurface`.
+
+  Until then, the frontend's host-pointer import goes through the no-copy shadow, which is correct
+  but copies.
 
 ## Phone tests (M1-M3)
 
-The runtime already covers M2 and most of M3's list, so the first phone run can skip straight to
-the self-test.
+The runtime already covers M2 and most of M3's list. The first phone runs are therefore the two
+test tools. They need no Metal.framework, no plugin and no kernel patch: they open SweetGPU
+through `sweet_drm.c`, as sweetgl does.
 
-1. **`mtlbridgetest` as a launchd job.** Install with ROOTFIX
-   `--zfile /usr/local/bin/mtlbridgetest-<hash>=... --daemon com.sweet.mtlbridgetest=/usr/local/bin/mtlbridgetest-<hash>,/private/var/sweetmtl/cache,/System/Library/Frameworks/QuartzCore.framework/default.metallib`,
-   or with `devd put/run` once M0b exists. Add it to `sweetnull=` so its stdout (/dev/null)
-   reaches the XNU log.
-   - The job is KeepAlive with a 10 s throttle. Give the tools an idle-after-run mode, or expect
-     the run to repeat.
-   - **Pass:** `compute bad 0/1000`, `render bad 0/64`, `import bad 0/4096`, the QuartzCore counts
-     as on the PC, no GPU hang, and sweetgl's backboardd unaffected. Unset `SWEETMTL_DRM_SHIM` on
-     the phone so the values are checked.
-2. **`mtlabitest`** the same way. It must print the same `ok` lines as softpipe does on the PC.
-   Things only hardware settles:
+### `--daemon`: one run per boot as a launchd job
+
+`mkrootfix.py --daemon` makes RunAtLoad + KeepAlive jobs (ThrottleInterval 10 s) with stdout and
+stderr on /dev/null. A tool that exits would therefore start again every 10 s. With `--daemon` as
+its first argument, a tool (`test/oneshot.h`):
+
+1. line-buffers stdout, so the log keeps every line written before a crash;
+2. turns the runtime's trace on, which logs each compiled stage and each completed command buffer;
+3. waits for the GPU service, 180 s at most. SweetGPU comes up 10-20 s into boot.
+4. runs once per boot. `/private/var/tmp/<tool>.ran` holds the boot time and is written just
+   before the run. If launchd restarts the tool after a crash, it finds the marker and does not
+   run again. Remove the marker, or reboot, to run it again.
+5. prints `<tool>: done, status N; idling` and stays in `pause()`.
+
+Without `--daemon` the tools run once and exit with their status, as on the PC.
+
+### Install and boot (one tool per boot)
+
+The output reaches the XNU log as `|mtlbridgetest| ...` lines when the process name is in boot-arg
+`sweetlogp` (xnu 0308). `sweetnull=backboardd,mtlbridgetest` (xnu 0048) works too. The binary
+goes in a directory named after its hash so that the process name stays `mtlbridgetest`; ROOTFIX
+writes only absent files, so a new build needs a new path.
+
+From the port checkout in WSL, with `RUN` the CI run id (`gh run list -w sweetmtl.yml`):
+
+```bash
+gh="/mnt/c/Program Files/GitHub CLI/gh.exe"
+d=../out/sweetmtl/run-$RUN; mkdir -p "$d"
+"$gh" run download $RUN -R SourceQuality/ios-taimen -n sweetmtl -D "$(wslpath -w "$d")"
+(cd "$d" && sha256sum -c SHA256SUMS)
+h=$(sha256sum "$d/mtlbridgetest" | cut -c1-8)
+tools=(); [ -f ../out/phone-tools/netsvcd ] && tools=(--phone-tools ../out/phone-tools)
+[ -f ../out/phone-tools/RedwoodAudio ] && tools+=(--hal-plugin ../out/phone-tools)
+python3 -I tools/taimen/mkrootfix.py ../research/ipsw-x/ios16-root.img ../research/taimen/rootfix-sweetmtl.bin \
+  "${tools[@]}" \
+  --zfile /usr/local/libexec/mtlbridgetest-$h/mtlbridgetest="$d/mtlbridgetest" \
+  --daemon com.sweet.mtlbridgetest=/usr/local/libexec/mtlbridgetest-$h/mtlbridgetest,--daemon,/private/var/sweetmtl/cache,/System/Library/Frameworks/QuartzCore.framework/default.metallib
+ROOT=1 ROOTFIX=../research/taimen/rootfix-sweetmtl.bin ROOTFIX_KEEP=1 \
+  tools/taimen/boot-xnu.sh KERNEL OUTDIR sweetlogp=mtlbridgetest
+```
+
+How the pieces fit:
+
+- **GPU boot.** It needs a GPU boot (ROOT=1, GPU=1, sweetgl installed). `ROOTFIX_KEEP=1` makes
+  boot-xnu.sh use this blob instead of sweetgl's.
+- **Size.** The blob leaves out sweetgl's `--zfile`, because the dylib is on the phone already and
+  ROOTFIX only writes absent files. That keeps the payload under ABL's ~35 MiB: the tool's 6.5 MiB
+  plus a development kernel's ~17 MB.
+- **Phone tools.** They are passed as `sweetgl-install.sh` passes them. mkrootfix rewrites
+  launchd.plist from the root image, so netsvcd's job must be in every blob.
+- **mtlabitest.** Install it the same way, in a later boot:
+  - `--zfile /usr/local/libexec/mtlabitest-$h/mtlabitest=...`
+  - `--daemon com.sweet.mtlabitest=/usr/local/libexec/mtlabitest-$h/mtlabitest,--daemon`
+  - boot-arg `sweetlogp=mtlabitest`
+- **Removal.** A later blob without the `--daemon` removes the job.
+
+### What the first mtlbridgetest run shows
+
+On success (trace lines abbreviated):
+
+```
+|mtlbridgetest| mtlbridgetest: GPU service up after 0.0 s
+|mtlbridgetest| mtlbridgetest: --daemon run, boot 1761400000.123456
+|mtlbridgetest| QuartzCore metallib: <size> bytes
+|mtlbridgetest| [  0.000 s] step 6501 device
+|mtlbridgetest| [  0.0xx s] step 6502 fixture library
+|mtlbridgetest| [  0.0xx s] step 6503 compute
+|mtlbridgetest| sweetmtl: kernel compiled: 60 ir3 instructions, 5 full registers, constlen 28, local size 1x1x1
+|mtlbridgetest| sweetmtl: command buffer Completed (1 commands, ... ms); device: 1 flushes, 2 dispatches, ...
+|mtlbridgetest| [  ...  s] step 6504 render
+|mtlbridgetest| [  ...  s] step 6505 import
+|mtlbridgetest| [  ...  s] step 6506 QuartzCore
+|mtlbridgetest| [  ...  s] step 650f done
+|mtlbridgetest| result 0 stage 0 (... s)
+|mtlbridgetest| compute bad 0/1000
+|mtlbridgetest| render bad 0/64
+|mtlbridgetest| import bad 0/4096
+|mtlbridgetest| QuartzCore: 141 functions, kernels 3 ok 4 failed, vertex/fragment pairs 13 ok 8 failed
+|mtlbridgetest| message:
+|mtlbridgetest| mtlbridgetest: done, status 0; idling
+```
+
+**Pass:**
+
+- `result 0`, and compute, render and import all bad 0;
+- the QuartzCore counts as on the PC (the failures are the self-test's minimal descriptors);
+- no GPU hang;
+- backboardd still drawing with sweetgl.
+
+This is the first time a second GPU client runs next to backboardd's sweetgl, and the first
+execution of the shim on the A540. The other outcomes and what they mean:
+
+| Log | Meaning |
+| --- | --- |
+| `no GPU service (SweetGPU) after 180 s; idling` | not a GPU boot (`sweetgpu=` missing), or SweetGPU did not start |
+| `result 6501 stage 6501`, a message | the device did not open; the message is the shim's reason |
+| `result 650x` with `compute/render/import bad N` | the step ran, and the GPU wrote wrong values: the first thing to debug, with the trace lines before it |
+| `command buffer Error` and `the GPU did not finish the command buffer in 10 s` | the runtime's completion timeout: a GPU hang. Until the A540 hang recovery (plan M4) the kernel keeps the GPU off for the rest of the boot, so backboardd's GLES stops too. |
+| `ran already this boot ...; idling` right after the first lines | the tool died (crash, jetsam) and launchd restarted it; the lines before the restart say where |
+
+### mtlabitest, then M1-M3
+
+1. **mtlabitest.** It must print the same lines as softpipe on the PC: every check `ok`, the
+   `stage_io` check `ran`, heaps and archive serialization `not yet`, `FAIL lines: 0`. Things
+   only hardware settles:
    - VS storage buffers read as UBOs;
-   - a5xx linear pitch and offset rules for textures over buffers (64 bytes);
+   - the 64-byte linear pitch and offset of textures over buffers (mesa.patch's pitchalign 6);
    - the CPU texture paths after `sync_all`;
    - the triops question;
-   - GPU timestamps (taken on the host today).
-3. **M1 proper.**
+   - GPU timestamps, which are taken on the host today.
+2. **M1 proper.**
    - The kernel patch `taimenmtl=SweetMetal-<hash>` sets `MetalPluginName/ClassName` on the
      `IOAcceleratorES`.
    - The bundle installs through `tools/taimen/sweetmtl-install.sh`.
    - `mtltest` (ObjC) checks `MTLCreateSystemDefaultDevice`: name, registryID, `supportsFamily`,
      `newBuffer`, `contents`, `gpuAddress`.
    - **Pass:** backboardd stays on GLES at ~60 frames/s.
-4. **M2.** `mtltest` clears a BGRA8 texture over an IOSurface and reads it back. This needs the
-   IOSurface import from step 6 above.
-5. **M3.** The self-test's 0x6506 with full descriptors (M0's `m0drive.py` pairing) instead of
+3. **M2.** `mtltest` clears a BGRA8 texture over an IOSurface and reads it back. This needs the
+   IOSurface import by ID from the iOS build section.
+4. **M3.** The self-test's 0x6506 with full descriptors (M0's `m0drive.py` pairing) instead of
    the minimal ones, and the compositor pair (`fixed_vert_lph_spc` + `fixed_frag_lph_cph`) drawn
    with CA-like buffers. The pipeline cache on disk (`binary_archive_serialize`, the translator's
    `to_bytes`) is the M3 runtime work left.
