@@ -80,6 +80,10 @@ if [ -n "$vd" ] && [ -b "/dev/$vd" ]; then
 		for f in /vendor/firmware/adsp.* /vendor/firmware/tas2557s_*.bin /vendor/etc/mixer_paths*.xml /vendor/etc/audio_platform_info*.xml; do
 			[ -f "$f" ] && cp "$f" "/out/fw-$(basename "$f")"
 		done
+		# the SLPI (sensor DSP) firmware, ~3.9 MB (docs/taimen-sensors-plan.md section 2.1)
+		for f in /vendor/firmware/slpi_v2.*; do
+			[ -f "$f" ] && cp "$f" "/out/fw-$(basename "$f")"
+		done
 		umount /vendor
 		log "vendor /dev/$vd: $(ls /out | grep -c '^fw-a5') GPU and $(ls /out | grep -c '^fw-wlanmdsp\|^fw-bdwlan\|^fw-modemuw') WLAN firmware files copied"
 	else
@@ -87,6 +91,26 @@ if [ -n "$vd" ] && [ -b "/dev/$vd" ]; then
 	fi
 else
 	log "vendor partition not found"
+fi
+
+# The sensor registry the SLPI asks the AP for (docs/taimen-sensors-plan.md 2.2: the phone's own
+# calibration in /persist/sensors/sns.reg), read-only, as fw-sns.reg with a listing.
+pd=
+for u in /sys/class/block/*/uevent; do
+	grep -q "^PARTNAME=persist\$" "$u" && pd=$(sed -n 's/^DEVNAME=//p' "$u")
+done
+if [ -n "$pd" ] && [ -b "/dev/$pd" ]; then
+	mkdir -p /persist
+	if mount -t ext4 -o ro,noload "/dev/$pd" /persist 2>> /out/reader.txt; then
+		ls -lR /persist/sensors > /out/fw-persist-sensors-list.txt 2>&1
+		[ -f /persist/sensors/sns.reg ] && cp /persist/sensors/sns.reg /out/fw-sns.reg
+		umount /persist
+		log "persist /dev/$pd: sensors listed$([ -f /out/fw-sns.reg ] && echo ', sns.reg copied')"
+	else
+		log "persist /dev/$pd: mount failed"
+	fi
+else
+	log "persist partition not found"
 fi
 
 dmesg > /out/dmesg.txt
