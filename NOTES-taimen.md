@@ -1194,3 +1194,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   0333: the remote `shot` copies the surface into kernel memory before sending it (~1.2 s over USB): the 3-9
   row strips across the still Haptic Touch menu in boots 162/164/165 sat at a different height each time,
   CA re-rendering that surface while it was being sent.
+- 2026-10-25 boots 167-169 (r152 = +0333, r153 = +0334): **the plain defaults without audio blobs** (boot-xnu.sh adds
+  them only with AUDIO=1 now): TaimenAudio read its 11 firmware files from the root in ~1.1 s, sessions played with 0
+  dropped, haptic taps and the 310 ms vibration at startup. Scripting lessons: SpringBoard blanks the panel early
+  ("SWEET FB: display off" before any touch), so a script waits for that line and sends `unlock` twice (the first
+  touch only wakes the panel); waiting on mediaserverd's Actuator line is too early (no surface swapped yet), and
+  60 s after it the panel was dark (167 long-pressed the lock screen: the wallpaper editor). Boot 169: three
+  Haptic Touch captures of the still menu, no strips (0333), Safari's MP4 sound, and taimengpuhang=200 again:
+  "the first unfinished submit (5044) is the kernel's" (0334), recovered in 3 ms, the home screen drawn after it.
+  AegirPoster still crashes 20-36 times a boot (Metal, M4).
