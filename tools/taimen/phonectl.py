@@ -9,6 +9,8 @@
     tools/taimen/phonectl.py type TEXT | enter | backspace [N] | tab | escape   (xnu 0307)
     tools/taimen/phonectl.py key power|volup|voldown|home
     tools/taimen/phonectl.py end                     end the boot now, as taimenreboot would (xnu 0331)
+    tools/taimen/phonectl.py accel X Y Z | orient portrait|upsidedown|left|right|faceup|facedown
+                                                     the synthetic accelerometer (xnu 0335, taimensensors=1)
     tools/taimen/phonectl.py run 'tapc 700 875' 'sleep 3' 'shot s.png' ...
 The canvas is scaled 2880/2436 onto the panel and centred: panel x = 55 + 1.182 x, y = 1.182 y.
 """
@@ -95,7 +97,7 @@ def run(p, words):
         p.cmd('swipe 720 2870 720 1300 250')
     elif op == 'sleep':
         time.sleep(float(words[1]))
-    elif op in ('tap', 'swipe', 'enter', 'backspace', 'tab', 'escape', 'key', 'end'):
+    elif op in ('tap', 'swipe', 'enter', 'backspace', 'tab', 'escape', 'key', 'end', 'accel', 'orient'):
         p.cmd(' '.join(words))
     elif op == 'type':
         p.cmd('type ' + ' '.join(words[1:]))

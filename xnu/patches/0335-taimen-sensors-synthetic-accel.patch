@@ -1,0 +1,280 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 21276af..203dc59 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1192,11 +1192,14 @@ ud_tcplog_thread(void *arg __unused, wait_result_t wr __unused)
+  *                               keyboard service registers on the first one)
+  *   enter | backspace [N] | tab | escape
+  *   key power|volup|voldown|home
++ *   accel X Y Z                 the accelerometer's sample in milli-g (0335, taimensensors=1)
++ *   orient portrait|upsidedown|left|right|faceup|facedown   gravity for a still phone held that way
+  * Only the PC at the other end of the phone's own USB cable can reach it. sweetusbctl=0: off.
+  */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern void sweet_hid_key(int key, int down);
+ extern void sweet_hid_kbd(uint32_t usage, int down);
++extern int sweet_hid_accel(int mx, int my, int mz);
+ extern bool sweet_fb_grab(uintptr_t *base, uint32_t *w, uint32_t *h, uint32_t *bpr, void **ref);
+ extern void sweet_fb_grab_release(void *ref);
+ 
+@@ -1399,6 +1402,47 @@ ctl_command(socket_t s, const char *line)
+ 			ctl_press(usage, false);
+ 		}
+ 		ctl_say(s, "OK\n");
++	} else if (strncmp(line, "accel ", 6) == 0 || strncmp(line, "orient ", 7) == 0) {
++		/* 0335: gravity in the phone's axes, milli-g (x right, y up the screen, z out of it) */
++		static const struct { const char *name; int v[3]; } o[] = {
++			{"portrait", {0, -1000, 0}}, {"upsidedown", {0, 1000, 0}}, {"left", {-1000, 0, 0}},
++			{"right", {1000, 0, 0}}, {"faceup", {0, 0, -1000}}, {"facedown", {0, 0, 1000}},
++		};
++		int v[3] = {0, 0, 0}, n = -1;
++		if (line[0] == 'a') {
++			char *p = line + 6;
++			for (n = 0; n < 3 && *p; n++) {
++				while (*p == ' ') {
++					p++;
++				}
++				int sign = 1;
++				if (*p == '-') {
++					sign = -1;
++					p++;
++				}
++				if (*p < '0' || *p > '9') {
++					break;
++				}
++				int x = 0;
++				while (*p >= '0' && *p <= '9') {
++					x = x * 10 + (*p++ - '0');
++				}
++				v[n] = sign * x;
++			}
++		} else {
++			for (unsigned i = 0; i < sizeof(o) / sizeof(o[0]); i++) {
++				if (strcmp(line + 7, o[i].name) == 0) {
++					v[0] = o[i].v[0], v[1] = o[i].v[1], v[2] = o[i].v[2], n = 3;
++				}
++			}
++		}
++		if (n != 3) {
++			ctl_say(s, "ERR accel X Y Z (milli-g) | orient portrait|upsidedown|left|right|faceup|facedown\n");
++		} else if (!sweet_hid_accel(v[0], v[1], v[2])) {
++			ctl_say(s, "ERR no accelerometer (boot-arg taimensensors=1)\n");
++		} else {
++			ctl_say(s, "OK\n");
++		}
+ 	} else if (strcmp(line, "end") == 0) {
+ 		/* 0331: end the boot now, as taimenreboot would (pet thread: report, screenshot, log, reset) */
+ 		extern void taimen_end_now(const char *why);
+@@ -1421,7 +1465,7 @@ ctl_command(socket_t s, const char *line)
+ 		sweet_hid_key(k, 0);
+ 		ctl_say(s, "OK\n");
+ 	} else {
+-		ctl_say(s, "ERR commands: tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot | type TEXT | enter | backspace [N] | key NAME | end\n");
++		ctl_say(s, "ERR commands: tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot | type TEXT | enter | backspace [N] | key NAME | accel X Y Z | orient NAME | end\n");
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 567b62d..c0e672c 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -11,6 +11,10 @@
+  *
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
++ *   SweetHIDAccel    an accelerometer (Apple vendor page 0xff00, usage 3, as the
++ *                    iPhone X's AOP publishes it), taimensensors=1 (0335): its
++ *                    samples come from sweet_hid_accel() (the USB control port's
++ *                    "accel"/"orient" today, the SLPI's sensor manager later)
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+  * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+@@ -20,6 +24,8 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
+@@ -408,6 +414,145 @@ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ static SweetHIDKeyboard *gSweetKeyboard;
+ 
++/*
++ * 0335 (docs/taimen-sensors-plan.md M0): the accelerometer locationd reads (CLAccelerometer, its
++ * orientation detector, then CoreMotion and backboardd's BKOrientationManager rotate the screen).
++ * Samples are in g (IOFixed): about (0, -1, 0) upright in portrait, z -1 lying face up. They stream
++ * while the event system asks for them (ReportInterval/BatchInterval in us, 0 = stop), at most
++ * 100 Hz, and copyEvent returns the last one.
++ */
++class SweetHIDAccel : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDAccel);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++	void sample(int mx, int my, int mz);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 3; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
++private:
++	static void tick(OSObject *owner, IOTimerEventSource *sender);
++	IOHIDEvent *event();
++	IOTimerEventSource *fTimer;
++	volatile int fMg[3];            /* the current sample, milli-g */
++	volatile UInt32 fIntervalUS;    /* 0: not streaming */
++	UInt32 fSent, fSaid;
++};
++OSDefineMetaClassAndStructors(SweetHIDAccel, IOHIDEventService);
++static SweetHIDAccel *gSweetAccel;
++
++bool
++SweetHIDAccel::start(IOService *provider)
++{
++	int level = 0;
++	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 1) {
++		return false;   /* no service: locationd sees no accelerometer, as before */
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	fMg[0] = 0;
++	fMg[1] = -1000;
++	fMg[2] = 0;
++	fTimer = IOTimerEventSource::timerEventSource(this, &SweetHIDAccel::tick);
++	if (!fTimer || _hidWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		return false;
++	}
++	gSweetAccel = this;
++	registerService();
++	IOLog("TAIMEN SENSORS: SweetHIDAccel up (0xff00/3, synthetic: the control port's accel/orient), portrait\n");
++	return true;
++}
++
++IOHIDEvent *
++SweetHIDAccel::event()
++{
++	return IOHIDEvent::accelerometerEvent(mach_absolute_time(), (IOFixed)(((int64_t)fMg[0] << 16) / 1000),
++	           (IOFixed)(((int64_t)fMg[1] << 16) / 1000), (IOFixed)(((int64_t)fMg[2] << 16) / 1000));
++}
++
++void
++SweetHIDAccel::tick(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDAccel *me = (SweetHIDAccel *)owner;
++	UInt32 us = me->fIntervalUS;
++	if (us == 0) {
++		return;
++	}
++	IOHIDEvent *e = me->event();
++	if (e) {
++		me->dispatchEvent(e);
++		e->release();
++		me->fSent++;
++	}
++	sender->setTimeoutUS(us);
++}
++
++IOReturn
++SweetHIDAccel::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *ri = OSDynamicCast(OSNumber, d->getObject(kIOHIDReportIntervalKey));
++	OSNumber *bi = OSDynamicCast(OSNumber, d->getObject("BatchInterval"));
++	if (fSaid < 24) {
++		fSaid++;
++		char keys[160] = "";
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		if (it) {
++			size_t n = 0;
++			for (OSString *k; (k = OSDynamicCast(OSString, it->getNextObject())) != NULL && n + 2 < sizeof(keys);) {
++				n += (size_t)snprintf(keys + n, sizeof(keys) - n, "%s%s", n ? " " : "", k->getCStringNoCopy());
++			}
++			it->release();
++		}
++		IOLog("SWEET HID: SweetHIDAccel properties [%s]: ReportInterval %lld, BatchInterval %lld (%u samples sent)\n",
++		    keys, ri ? (long long)ri->unsigned64BitValue() : -1LL, bi ? (long long)bi->unsigned64BitValue() : -1LL, fSent);
++	}
++	if (ri || bi) {
++		UInt64 us = ri ? ri->unsigned64BitValue() : bi->unsigned64BitValue();
++		if (ri && bi && bi->unsigned64BitValue() > us) {
++			us = bi->unsigned64BitValue();
++		}
++		UInt32 was = fIntervalUS;
++		fIntervalUS = us == 0 ? 0 : (UInt32)(us < 10000 ? 10000 : us > 1000000 ? 1000000 : us);
++		if (ri) {
++			setProperty(kIOHIDReportIntervalKey, ri->unsigned64BitValue(), 32);
++		}
++		if (fIntervalUS && !was) {
++			fTimer->setTimeoutUS(fIntervalUS);
++		} else if (!fIntervalUS) {
++			fTimer->cancelTimeout();
++		}
++	}
++	return kIOReturnSuccess;
++}
++
++IOHIDEvent *
++SweetHIDAccel::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	return type == kIOHIDEventTypeAccelerometer ? event() : NULL;
++}
++
++void
++SweetHIDAccel::sample(int mx, int my, int mz)
++{
++	fMg[0] = mx;
++	fMg[1] = my;
++	fMg[2] = mz;
++	IOLog("TAIMEN SENSORS: accel now %d %d %d mg (streaming every %u us, %u samples sent)\n", mx, my, mz,
++	    fIntervalUS, fSent);
++	IOHIDEvent *e = event();
++	if (e) {
++		dispatchEvent(e);
++		e->release();
++	}
++}
++
+ bool
+ SweetHIDKeyboard::start(IOService *provider)
+ {
+@@ -664,6 +809,17 @@ sweet_hid_kbd(uint32_t usage, int down)
+ 	}
+ }
+ 
++/* 0335: the accelerometer's sample, milli-g; returns 0 without the service (taimensensors=0) */
++extern "C" int
++sweet_hid_accel(int mx, int my, int mz)
++{
++	if (!gSweetAccel) {
++		return 0;
++	}
++	gSweetAccel->sample(mx, my, mz);
++	return 1;
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c91ee01..ae0b2cb 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -83,6 +83,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDKeyboard;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDAccel;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDAccel;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
