@@ -1203,3 +1203,16 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Haptic Touch captures of the still menu, no strips (0333), Safari's MP4 sound, and taimengpuhang=200 again:
   "the first unfinished submit (5044) is the kernel's" (0334), recovered in 3 ms, the home screen drawn after it.
   AegirPoster still crashes 20-36 times a boot (Metal, M4).
+- 2026-10-25 **boot 170 (r153): Metal M1-M2 on the phone.** The SweetMetal plug-in (sweetmtl run 40247149946,
+  /System/Library/Extensions/SweetMetal-719a6353.bundle, taimenmtl= on IOAcceleratorES) and mtltest: Metal.framework's
+  own MTLCreateSystemDefaultDevice returned "Adreno (TM) 540 (sweetmtl)" (class NativeBridgeMetalDevice < _MTLDevice,
+  755 ms, registryID that of the accelerator; supportsFamily apple1-3, common1-2); buffers with gpuAddress, fill and
+  copy blits, a BGRA8 clear read back, and clears into IOSurface textures imported by ID (64x64, 1125x48) and as
+  host pages: 0 FAIL lines. backboardd: "not in /private/var/sweetmtl/clients, so no Metal device", on sweetgl.
+- 2026-10-25 boot 171 (r153): Metal M4 try, clients AegirPoster and Preferences: **the phone hung hard at ~65 s**,
+  before any client logged a SweetMetal line: the USB link and the live log stopped together right after a
+  physical touch at the bottom-right edge (TAIMEN TOUCH; no script had touched it yet), no panic, no GPU hang
+  line, no watchdog reset, no USB device at all. Needs a power-button restart; the cause is open (pstore after
+  the restart, else a retry with one client at a time). sensors: docs/taimen-sensors-plan.md (b9c172d), 0335
+  (SweetHIDAccel, synthetic, taimensensors=1), 0336 (SLPI census, taimensensors>=2), reader pulls slpi_v2.* and
+  /persist/sensors/sns.reg.
