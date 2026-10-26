@@ -1,0 +1,365 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 4a156d6..f1bf592 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -58,6 +58,7 @@ extern void taimen_touch_init(void);
+ extern void sailfish_wlan_init(void);
+ extern void taimen_modem_init(void);    /* iokit/Kernel/arm/TaimenModem.cpp */
+ extern void taimen_audio_init(void);    /* iokit/Kernel/arm/TaimenAudio.cpp */
++extern void taimen_sensors_init(void);  /* iokit/Kernel/arm/TaimenSensors.cpp */
+ extern void taimen_haptic_init(void);   /* bsd/dev/taimen_haptic.c */
+ extern void sweet_usb_probe(void);
+ 
+@@ -768,6 +769,8 @@ sweet_ufs_init(void)
+ 	taimen_modem_init();
+ 	/* sound through the ADSP with taimenaudio=N (0317, docs/taimen-audio-plan.md) */
+ 	taimen_audio_init();
++	/* the SLPI (sensor DSP) census with taimensensors>=2 (0336, docs/taimen-sensors-plan.md M1) */
++	taimen_sensors_init();
+ 	/* USB: the state probe; with sweetusb=2 USB Ethernet to the PC (0297, sweet_usb.c) */
+ 	sweet_usb_probe();
+ #else
+diff --git a/iokit/Kernel/arm/TaimenSensors.cpp b/iokit/Kernel/arm/TaimenSensors.cpp
+new file mode 100644
+index 0000000..88aadf6
+--- /dev/null
++++ b/iokit/Kernel/arm/TaimenSensors.cpp
+@@ -0,0 +1,326 @@
++/*
++ * TaimenSensors: the SLPI (Snapdragon sensor DSP) side of docs/taimen-sensors-plan.md. The Pixel 2
++ * XL's accelerometer, gyro, compass, light and proximity sensors sit on the SSC's own buses, which
++ * the application processor cannot reach: only the SLPI firmware can, and it hands samples out over
++ * QMI (the Sensor Manager service) once it runs.
++ *
++ * 0336, plan M1 (taimensensors>=2; taimensensors=1 is the synthetic accelerometer of SweetHID.cpp
++ * alone): a read-only census of what booting the SLPI needs, nothing written:
++ *   - the APPS<->SLPI SMEM partition (hosts 0 and 3) and its items: SMP2P out 430 ("master-kernel",
++ *     ours to create) and in 481 (the SLPI's "slave-kernel"), GLINK 478/479/480, and global item
++ *     424 (the SLPI's crash reason);
++ *   - TrustZone's PAS support for the SLPI (id 12);
++ *   - the firmware and the sensor registry in the iOS root, /usr/standalone/firmware/taimen-sensors/
++ *     (slpi_v2.mdt, slpi_v2.bNN, sns.reg: mkrootfix.py --sensors-fw), the image's segments
++ *     against its carve-out (pil_slpi_region 0x94b00000 + 15 MB, below XNU's RAM).
++ * SMEM is read as TaimenAudio.cpp reads it; only a partition APPS is a host of is opened (another
++ * pair's header hung a CPU, boot 109).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++
++extern "C" int taimen_fw_load(const char *path, uint32_t max, void **data, uint32_t *len);   /* taimen_fwfile.c */
++extern "C" void taimen_fw_free(void *data, uint32_t len);
++extern "C" void taimen_sensors_init(void);
++
++#define LOG(fmt, ...)           IOLog("TAIMEN SENSORS: " fmt "\n", ##__VA_ARGS__)
++
++#define SMEM_PA                 0x86000000ull
++#define SMEM_SIZE               0x00200000u
++#define HOST_APPS               0
++#define HOST_SLPI               3
++#define SLPI_PAS_ID             12
++#define SLPI_PA                 0x94b00000ull
++#define SLPI_SIZE               0x00f00000u
++#define FW_DIR                  "/usr/standalone/firmware/taimen-sensors/"
++#define SCM_FN(svc, cmd)        (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++
++#define PT_LOAD                 1
++#define MDT_TYPE_MASK           (7u << 24)
++#define MDT_TYPE_HASH           (2u << 24)
++#define MDT_RELOCATABLE         (1u << 27)
++
++struct elf32_ehdr {
++	uint8_t  e_ident[16];
++	uint16_t e_type, e_machine;
++	uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
++	uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
++} __attribute__((packed));
++struct elf32_phdr {
++	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
++} __attribute__((packed));
++
++struct smem_global_entry { uint32_t allocated, offset, size, aux_base; } __attribute__((packed));
++struct smem_header {
++	uint32_t proc_comm[16];
++	uint32_t version[32];
++	uint32_t initialized, free_offset, available, reserved;
++	struct smem_global_entry toc[512];
++} __attribute__((packed));
++struct smem_pt_entry { uint32_t offset, size, flags; uint16_t host0, host1; uint32_t cacheline, rsvd[7]; } __attribute__((packed));
++struct smem_pt { uint8_t magic[4]; uint32_t version, num_entries, rsvd[5]; } __attribute__((packed));
++struct smem_part_hdr { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, free_uncached, free_cached, rsvd[3]; } __attribute__((packed));
++struct smem_priv_entry { uint16_t canary, item; uint32_t size; uint16_t pad_data, pad_hdr; uint32_t rsvd; } __attribute__((packed));
++
++static uint8_t *smem;
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++
++/* ---------------------------------------------------------------- TrustZone (as TaimenAudio.cpp) */
++
++static uint64_t
++smc(uint64_t a[8])
++{
++	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1], x2 __asm__("x2") = a[2],
++	    x3 __asm__("x3") = a[3], x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5], x6 __asm__("x6") = a[6],
++	    x7 __asm__("x7") = a[7];
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++            :
++            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
++	return x0;
++}
++
++static uint64_t
++scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++{
++	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
++
++	smc(args);
++	for (unsigned n = 0; args[0] == 1 && n < 100000; n++) {
++		uint64_t again[8] = { 1, arginfo, a, b, c, 0, args[6], 0 };
++		memcpy(args, again, sizeof(args));
++		smc(args);
++	}
++	if (res1 != NULL) {
++		*res1 = args[1];
++	}
++	return args[0];
++}
++
++/* ---------------------------------------------------------------- SMEM (as TaimenAudio.cpp, read only) */
++
++static struct smem_pt_entry *
++smem_pt_find(uint16_t a, uint16_t b)
++{
++	struct smem_pt *pt = (struct smem_pt *)(smem + SMEM_SIZE - 0x1000);
++	struct smem_pt_entry *e = (struct smem_pt_entry *)(pt + 1);
++
++	if (memcmp(pt->magic, "$TOC", 4) != 0 || pt->num_entries > 64) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i < pt->num_entries; i++) {
++		if (e[i].offset != 0 && e[i].size != 0 && e[i].offset < SMEM_SIZE &&
++		    ((e[i].host0 == a && e[i].host1 == b) || (e[i].host0 == b && e[i].host1 == a))) {
++			return &e[i];
++		}
++	}
++	return NULL;
++}
++
++static void *
++smem_part_get(struct smem_part_hdr *p, uint32_t cacheline, uint16_t item, uint32_t *size)
++{
++	uint8_t *e, *end;
++
++	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 || p->free_uncached > p->size ||
++	    p->free_cached > p->size || p->free_uncached > p->free_cached) {
++		return NULL;
++	}
++	e = (uint8_t *)p + sizeof(*p);
++	end = (uint8_t *)p + p->free_uncached;
++	while (e + sizeof(struct smem_priv_entry) <= end) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5) {
++			return NULL;
++		}
++		if (h->item == item) {
++			*size = h->size - h->pad_data;
++			return e + sizeof(*h) + h->pad_hdr;
++		}
++		e += sizeof(*h) + h->pad_hdr + h->size;
++	}
++	uint32_t cl = cacheline != 0 ? cacheline : 8;
++	uint32_t hdr = (uint32_t)((sizeof(struct smem_priv_entry) + cl - 1) / cl * cl);
++	e = (uint8_t *)p + p->size - hdr;
++	end = (uint8_t *)p + p->free_cached;
++	while (e > end && e >= (uint8_t *)p + sizeof(*p)) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5 || h->size > p->size) {
++			return NULL;
++		}
++		if (h->item == item) {
++			*size = h->size - h->pad_data;
++			return e - h->size;
++		}
++		e -= h->size + hdr;
++	}
++	return NULL;
++}
++
++static void
++smem_census(void)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SMEM_PA, SMEM_SIZE, kIODirectionIn);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache | kIOMapReadOnly) : NULL;
++	OSSafeReleaseNULL(md);
++	if (map == NULL) {
++		LOG("2: SMEM map failed");
++		return;
++	}
++	smem = (uint8_t *)map->getVirtualAddress();
++	struct smem_header *g = (struct smem_header *)smem;
++	char glob[48];
++	if (g->toc[424].allocated && g->toc[424].offset < SMEM_SIZE) {
++		snprintf(glob, sizeof(glob), "crash reason 424: %u bytes", g->toc[424].size);
++	} else {
++		snprintf(glob, sizeof(glob), "crash reason 424 absent");
++	}
++	struct smem_pt_entry *pe = smem_pt_find(HOST_APPS, HOST_SLPI);
++	if (pe == NULL) {
++		LOG("2: no APPS<->SLPI SMEM partition (hosts 0/3); %s", glob);
++		map->release();
++		smem = NULL;
++		return;
++	}
++	struct smem_part_hdr *p = (struct smem_part_hdr *)(smem + pe->offset);
++	static const uint16_t items[] = { 430, 481, 478, 479, 480 };
++	char line[160];
++	size_t n = 0;
++	bool stale = false;
++	for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]) && n + 24 < sizeof(line); i++) {
++		uint32_t size = 0;
++		void *v = smem_part_get(p, pe->cacheline, items[i], &size);
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " %u=%s", items[i], v != NULL ? "" : "absent");
++		if (v != NULL) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, "%u", size);
++			stale = stale || items[i] == 481;
++		}
++	}
++	LOG("2: APPS<->SLPI partition @%#x + %#x (header %.4s, hosts %u/%u, cacheline %u, used %u/%u); items%s; %s",
++	    pe->offset, pe->size, p->magic, p->host0, p->host1, pe->cacheline, p->free_uncached, p->size, line, glob);
++	if (stale) {
++		LOG("2: item 481 exists: the SLPI ran since the last reset (stale state: M2 would stop here)");
++	}
++	map->release();
++	smem = NULL;
++}
++
++/* ---------------------------------------------------------------- firmware and registry */
++
++static void
++fw_census(void)
++{
++	void *mdt = NULL;
++	uint32_t mdt_len = 0;
++	uint64_t t = now_ms();
++	int err = ENOENT;
++	/* on the install boot the files come with the ROOTFIX after launchd's remount */
++	while (now_ms() - t < 300000) {
++		err = taimen_fw_load(FW_DIR "slpi_v2.mdt", 1u << 20, &mdt, &mdt_len);
++		if (err == 0) {
++			break;
++		}
++		IOSleep(1000);
++	}
++	if (err != 0) {
++		LOG("4: no %sslpi_v2.mdt after %llu s (%d): mkrootfix.py --sensors-fw", FW_DIR, (now_ms() - t) / 1000, err);
++		return;
++	}
++	const struct elf32_ehdr *eh = (const struct elf32_ehdr *)mdt;
++	if (mdt_len < sizeof(*eh) || memcmp(eh->e_ident, "\177ELF", 4) != 0 || eh->e_ident[4] != 1 ||
++	    eh->e_phentsize != sizeof(struct elf32_phdr) ||
++	    eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr) > mdt_len) {
++		LOG("4: slpi_v2.mdt (%u bytes) is not a 32-bit ELF with its program headers", mdt_len);
++		taimen_fw_free(mdt, mdt_len);
++		return;
++	}
++	const struct elf32_phdr *ph = (const struct elf32_phdr *)((const uint8_t *)mdt + eh->e_phoff);
++	uint32_t lo = 0xffffffffu, hi = 0;
++	unsigned want = 0, have = 0, reloc = 0;
++	uint64_t total = mdt_len;
++	for (unsigned i = 0; i < eh->e_phnum; i++) {
++		if (ph[i].p_type != PT_LOAD || (ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || ph[i].p_memsz == 0) {
++			continue;
++		}
++		reloc |= (ph[i].p_flags & MDT_RELOCATABLE) != 0;
++		lo = ph[i].p_paddr < lo ? ph[i].p_paddr : lo;
++		hi = ph[i].p_paddr + ph[i].p_memsz > hi ? ph[i].p_paddr + ph[i].p_memsz : hi;
++		if (ph[i].p_filesz == 0) {
++			continue;
++		}
++		want++;
++		char path[96];
++		snprintf(path, sizeof(path), "%sslpi_v2.b%02u", FW_DIR, i);
++		void *seg = NULL;
++		uint32_t len = 0;
++		if (taimen_fw_load(path, 16u << 20, &seg, &len) == 0) {
++			if (len == ph[i].p_filesz) {
++				have++;
++				total += len;
++			} else {
++				LOG("4: segment %u: %u bytes, the header says %u", i, len, ph[i].p_filesz);
++			}
++			taimen_fw_free(seg, len);
++		} else {
++			LOG("4: segment %u (paddr %#x, filesz %#x): slpi_v2.b%02u missing", i, ph[i].p_paddr, ph[i].p_filesz, i);
++		}
++	}
++	bool fits = hi > lo && hi - lo <= SLPI_SIZE;
++	LOG("4: slpi_v2.mdt %u bytes, %u program headers, %u/%u segments (%llu bytes in all), %s, image %#x..%#x "
++	    "(%u KB) %s the carve-out %#llx + %u MB", mdt_len, eh->e_phnum, have, want, total,
++	    reloc ? "relocatable" : "NOT relocatable", lo, hi, (hi - lo) >> 10, fits ? "fits" : "does NOT fit",
++	    SLPI_PA, SLPI_SIZE >> 20);
++	taimen_fw_free(mdt, mdt_len);
++
++	void *reg = NULL;
++	uint32_t reg_len = 0;
++	if (taimen_fw_load(FW_DIR "sns.reg", 1u << 20, &reg, &reg_len) == 0) {
++		LOG("4: sns.reg %u bytes (the registry the SLPI will ask for, plan 2.2)", reg_len);
++		taimen_fw_free(reg, reg_len);
++	} else {
++		LOG("4: no %ssns.reg", FW_DIR);
++	}
++}
++
++static void
++sensors_thread(void *arg, wait_result_t)
++{
++	int level = (int)(intptr_t)arg;
++	LOG("1: census (taimensensors=%d): nothing is written", level);
++	smem_census();
++	uint64_t r1 = 0;
++	uint64_t r = scm(SCM_FN(2, 7), 1, SLPI_PAS_ID, 0, 0, &r1);  /* PAS_IS_SUPPORTED */
++	LOG("3: TZ pas supported(%u) -> %lld/%llu", SLPI_PAS_ID, (long long)r, r1);
++	fw_census();
++	LOG("5: census done");
++}
++
++void
++taimen_sensors_init(void)
++{
++	int level = 0;
++	thread_t t;
++	(void)PE_parse_boot_argn("taimensensors", &level, sizeof(level));
++	if (level < 2) {
++		return;
++	}
++	if (kernel_thread_start(sensors_thread, (void *)(intptr_t)level, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index ea58313..6576f94 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,6 +18,7 @@ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitc
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/TaimenModem.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/TaimenAudio.cpp                                 optional iokitcpp
++iokit/Kernel/arm/TaimenSensors.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

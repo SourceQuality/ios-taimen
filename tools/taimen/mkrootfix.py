@@ -197,6 +197,10 @@ def main():
                     help='install the ADSP and TAS2557 firmware from DIR (adsp.mdt, adsp.bNN, '
                          'tas2557s_PG21_uCDSP.bin, audio/tas2557_cal.bin) into '
                          '/usr/standalone/firmware/taimen-audio, where xnu 0330 reads it without payload blobs')
+    ap.add_argument('--sensors-fw', metavar='DIR',
+                    help='install the SLPI firmware and the sensor registry from DIR (slpi_v2.mdt, slpi_v2.bNN, '
+                         'sns.reg, as the log reader pulls them: fw-* names work too) into '
+                         '/usr/standalone/firmware/taimen-sensors, where xnu 0336 reads them')
     ap.add_argument('--daemon', action='append', default=[], metavar='LABEL=/PATH[,ARG...]',
                     help='add a launchd job of ours (RunAtLoad, KeepAlive, output to the console)')
     a = ap.parse_args()
@@ -237,6 +241,27 @@ def main():
         for f in fw:
             a.zfile.append(f'/usr/standalone/firmware/taimen-audio/{os.path.basename(f)}={f}')
         print(f'--audio-fw: {len(fw)} files into /usr/standalone/firmware/taimen-audio')
+    if a.sensors_fw:
+        import glob
+        def pick(name):
+            for n in (name, 'fw-' + name):
+                f = os.path.join(a.sensors_fw, n)
+                if os.path.exists(f):
+                    return f
+            return None
+        mdt = pick('slpi_v2.mdt')
+        assert mdt, 'no slpi_v2.mdt in ' + a.sensors_fw
+        fw = [mdt]
+        for i in range(2, 100):         # .b00 and .b01 are inside the mdt (headers, hash)
+            f = pick('slpi_v2.b%02d' % i)
+            if f and os.path.getsize(f) > 0:
+                fw.append(f)
+        reg = pick('sns.reg')
+        if reg:
+            fw.append(reg)
+        for f in fw:
+            a.zfile.append(f'/usr/standalone/firmware/taimen-sensors/{os.path.basename(f).removeprefix("fw-")}={f}')
+        print(f'--sensors-fw: {len(fw)} files into /usr/standalone/firmware/taimen-sensors{"" if reg else " (no sns.reg)"}')
     if a.apps_archive:
         apps_archive(a.image, a.apps_archive)
         return
