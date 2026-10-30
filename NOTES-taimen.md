@@ -1453,3 +1453,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   answered it). The Mail shot was the lock screen: the PMIC keys reported key 0 and key 3 down together (hands on
   the phone, or a glitch), backboardd locked with its click. 0360 logged swaps of mask 0x7 / 0x80000007 with
   surfaces on layer 0 only: every swap enables layers 0-2, so 0361 tests the layers' surfaces instead.
+- 2026-10-30 boot 211 (r172, the boot 209 blob plus oslogd on FaceTime, avconferenced, callservicesd, InCallService):
+  the survey's rest with the location prompts answered: Reminders, Wallet, Clock (World Clock), TV and Podcasts
+  (welcome screens), News (its News+ splash) open and draw; App Store asks for location, then "Cannot Connect to App
+  Store". **Maps at street level**: "Ferry Building San Francisco" opens its place card over the street map
+  (streets, points of interest, Lyft Bike), with photos; the Look Around thumbnail stays black while 12 command
+  buffers are refused for "an attachment without MTLTextureUsageRenderTarget" (ed8f80b drops that check: only
+  Metal's validation layer makes it). **FaceTime**: the app runs and logs normally (scene connected,
+  PhoneRootViewController appeared, AVConferencePreview set its front video layer: camera Invalid, no camera;
+  Supports Front/Back Camera: NO) and then goes quiet; the screen stays black but for the status bar, the scan
+  buffer too (FBRAM row 1440 sum 0). Next: sample its threads (sweetsample=FaceTime).
