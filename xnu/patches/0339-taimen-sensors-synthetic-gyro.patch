@@ -1,0 +1,90 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 03f163f..63eed01 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -15,6 +15,8 @@
+  *                    iPhone X's AOP publishes it), taimensensors=1 (0335): its
+  *                    samples come from sweet_hid_accel() (the USB control port's
+  *                    "accel"/"orient" today, the SLPI's sensor manager later)
++ *   SweetHIDGyro     a still gyro (0xff00/9, zero rates; 0339): locationd's orientation
++ *                    detector runs only with both ("No gyro; not detecting orientation!")
+  *   SweetHIDOrientation  the device orientation as a coprocessor reports it (0337:
+  *                    Sensor page 0x20 usage 0x8A, orientation events of type
+  *                    CMUsage), derived from SweetHIDAccel's samples
+@@ -557,9 +559,11 @@ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 3; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
++	/* 0339: the gyro below shares the streaming; these say what it sends */
++	virtual IOHIDEvent *event();
++	virtual IOHIDEventType eventType() { return kIOHIDEventTypeAccelerometer; }
+ private:
+ 	static void tick(OSObject *owner, IOTimerEventSource *sender);
+-	IOHIDEvent *event();
+ 	IOTimerEventSource *fTimer;
+ 	volatile int fMg[3];            /* the current sample, milli-g */
+ 	volatile UInt32 fIntervalUS;    /* 0: not streaming */
+@@ -585,9 +589,12 @@ SweetHIDAccel::start(IOService *provider)
+ 	if (!fTimer || _hidWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
+ 		return false;
+ 	}
+-	gSweetAccel = this;
++	if (eventType() == kIOHIDEventTypeAccelerometer) {
++		gSweetAccel = this;
++	}
+ 	registerService();
+-	IOLog("TAIMEN SENSORS: SweetHIDAccel up (0xff00/3, synthetic: the control port's accel/orient), portrait\n");
++	IOLog("TAIMEN SENSORS: %s up (0xff00/%u, synthetic: the control port's accel/orient)\n", getName(),
++	    (unsigned)getPrimaryUsage());
+ 	return true;
+ }
+ 
+@@ -635,8 +642,8 @@ SweetHIDAccel::setProperties(OSObject *properties)
+ 			}
+ 			it->release();
+ 		}
+-		IOLog("SWEET HID: SweetHIDAccel properties [%s]: ReportInterval %lld, BatchInterval %lld (%u samples sent)\n",
+-		    keys, ri ? (long long)ri->unsigned64BitValue() : -1LL, bi ? (long long)bi->unsigned64BitValue() : -1LL, fSent);
++		IOLog("SWEET HID: %s properties [%s]: ReportInterval %lld, BatchInterval %lld (%u samples sent)\n",
++		    getName(), keys, ri ? (long long)ri->unsigned64BitValue() : -1LL, bi ? (long long)bi->unsigned64BitValue() : -1LL, fSent);
+ 	}
+ 	if (ri || bi) {
+ 		UInt64 us = ri ? ri->unsigned64BitValue() : bi->unsigned64BitValue();
+@@ -660,9 +667,20 @@ SweetHIDAccel::setProperties(OSObject *properties)
+ IOHIDEvent *
+ SweetHIDAccel::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
+ {
+-	return type == kIOHIDEventTypeAccelerometer ? event() : NULL;
++	return type == eventType() ? event() : NULL;
+ }
+ 
++/* 0339: a gyro that never turns: zero rad/s, streamed as the accelerometer streams (its ReportInterval). */
++class SweetHIDGyro : public SweetHIDAccel {
++	OSDeclareDefaultStructors(SweetHIDGyro);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 9; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 6; }
++	virtual IOHIDEvent *event() APPLE_KEXT_OVERRIDE { return IOHIDEvent::gyroEvent(mach_absolute_time(), 0, 0, 0); }
++	virtual IOHIDEventType eventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeGyro; }
++};
++OSDefineMetaClassAndStructors(SweetHIDGyro, SweetHIDAccel);
++
+ void
+ SweetHIDAccel::sample(int mx, int my, int mz)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 8628164..6ea05ba 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -93,6 +93,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDOrientation;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDGyro;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDGyro;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
