@@ -1,0 +1,714 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9855d15..5bcd2ba 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,8 @@ bsd/dev/taimen_i2c.c			standard
+ bsd/dev/taimen_tas2557.c		standard
+ bsd/dev/taimen_haptic.c			standard
+ bsd/dev/taimen_fwfile.c			standard
++bsd/dev/taimen_slim.c			standard
++bsd/dev/taimen_wcd934x.c		standard
+ bsd/dev/sailfish_wlan.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/taimen_slim.c b/bsd/dev/taimen_slim.c
+new file mode 100644
+index 0000000..bd9989b
+--- /dev/null
++++ b/bsd/dev/taimen_slim.c
+@@ -0,0 +1,390 @@
++/*
++ * Pixel 2 XL (taimen, MSM8998) SLIMbus for the microphones: the non-ported generic device (NGD) of
++ * the audio SLIMbus as a satellite of the ADSP, which is the bus's manager and framer
++ * (docs/taimen-mic-plan.md section 2; WH = the wahoo kernel's drivers/slimbus/slim-msm-ngd.c,
++ * slim-msm.c, slimbus.c).
++ *   block      slimbus_physical 0x171C0000: version = register 0 >> 16; the NGD of cell-index 1 at
++ *              +0x1000 (+0x800 on a version-0 block: WH NGD_BASE)
++ *   mode       register mode (NGD_CFG = 1: no BAM message queues), polled (SPI 163 stays masked)
++ *   TX         the message's (RL + 3) / 4 words to NGD_TX_MSG, then INT_STAT bit 31 (sent) or one
++ *              of 25/26/27/29 (NACKed, buffer contention, invalid, device error), 1 s (WH
++ *              msm_send_msg_buf, ngd_slim_interrupt)
++ *   RX         INT_STAT bit 30: word 0 of NGD_RX_MSG has RL in bits 4:0; (RL + 3) / 4 words, then
++ *              INT_CLR bit 30 (WH qcom,rxreg-access)
++ *   messages   word 0 = RL | MT << 5 | MC << 8 | LA << 16, the payload from byte 3, RL = 3 + payload
++ * The ADSP powers and clocks the block: the caller has had QMI POWER(ACTIVE) answered 0 before
++ * taimen_slim_up, and each new register block is announced in the log before its first access.
++ * Every wait is bounded; three TX timeouts in a row end all SLIMbus traffic for the boot. One
++ * caller (the audio thread), one transaction at a time.
++ */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_spi_mask(uint32_t intid, bool masked);      /* pexpert/arm/pe_fiq.c */
++
++typedef void (*taimen_slim_idle_t)(void);
++bool taimen_slim_up(taimen_slim_idle_t idle);
++bool taimen_slim_ready(void);
++void taimen_mic_msleep(unsigned ms);
++uint64_t taimen_mic_now_ms(void);
++
++#define LOG(fmt, ...)           printf("TAIMEN MIC: " fmt "\n", ##__VA_ARGS__)
++
++#define SLIM_PA                 0x171C0000u     /* slimbus_physical, 0x2C000 (live.dts slim@171c0000) */
++#define SLIM_MAP                0x2000u
++#define NGD_BASE_V2             0x1000u         /* WH NGD_BASE_V2(1): cell-index 1 */
++#define NGD_BASE_V1             0x0800u         /* WH NGD_BASE_V1(1) */
++#define NGD_INTID               (32u + 163u)    /* SPI 163: polled, so it stays masked */
++
++#define NGD_CFG                 0x00u
++#define NGD_STATUS              0x04u
++#define NGD_RX_MSGQ_CFG         0x08u
++#define NGD_INT_EN              0x10u
++#define NGD_INT_STAT            0x14u
++#define NGD_INT_CLR             0x18u
++#define NGD_TX_MSG              0x30u
++#define NGD_RX_MSG              0x70u
++
++#define NGD_CFG_ENABLE          1u              /* bit 1 RX msgq, bit 2 TX msgq: both off */
++#define NGD_LADDR               (1u << 1)       /* STATUS: the manager gave us a logical address */
++#define RX_MSGQ_TIMEOUT         0x10000u        /* WH SLIM_RX_MSGQ_TIMEOUT_VAL */
++#define INT_RECFG_DONE          (1u << 24)
++#define INT_TX_NACKED           (1u << 25)
++#define INT_BUF_CONTE           (1u << 26)
++#define INT_TX_INVAL            (1u << 27)
++#define INT_IE_VE_CHG           (1u << 28)
++#define INT_DEV_ERR             (1u << 29)
++#define INT_RX_RCVD             (1u << 30)
++#define INT_TX_SENT             (1u << 31)
++#define INT_TX_ERR              (INT_TX_NACKED | INT_BUF_CONTE | INT_TX_INVAL | INT_DEV_ERR)
++#define INT_EN_ALL              0xFF000000u     /* L DEF_NGD_INT_MASK plus RECFG_DONE */
++
++#define MT_CORE                 0u
++#define MT_DEST_USER            2u
++#define MT_SRC_USER             6u
++#define MC_MASTER_CAP           0x00u
++#define MC_REPORT_SAT           0x01u
++#define MC_ADDR_QUERY           0x0Du
++#define MC_ADDR_REPLY           0x0Eu
++#define MC_REQUEST_VALUE        0x60u
++#define MC_REPLY_VALUE          0x64u
++#define MC_CHANGE_VALUE         0x68u
++#define LA_MGR                  0xFFu
++
++#define TX_WAIT_MS              1000u
++#define VALUE_WAIT_MS           200u
++#define ADDR_WAIT_MS            200u
++#define RW_TRIES                3u              /* WH WCD9XXX_SLIM_RW_MAX_TRIES, 5 ms apart */
++
++static vm_offset_t slim_base, ngd;
++static uint32_t slim_ver;
++static bool ngd_up, slim_dead;
++static taimen_slim_idle_t slim_idle;
++static int want_mc = -1;                /* the reply in flight: its MC (-1: none) and TID */
++static uint8_t want_tid;
++static bool got;
++static uint8_t got_buf[40];
++static unsigned got_rl;
++static bool cap_seen;
++static uint8_t cap_buf[40];
++static unsigned cap_rl;
++static unsigned n_nacks, n_timeouts, n_rx, n_stray, n_ieve, n_txerr, tx_timeouts_row;
++static int mic_sleep_chan;
++
++void
++taimen_mic_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	if (ms != 0) {
++		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&mic_sleep_chan, THREAD_UNINT, deadline);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++uint64_t
++taimen_mic_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++static unsigned
++since(uint64_t t)
++{
++	return (unsigned)(taimen_mic_now_ms() - t);
++}
++
++static uint32_t
++ngd_r(uint32_t off)
++{
++	return *(volatile uint32_t *)(ngd + off);
++}
++
++static void
++ngd_w(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(ngd + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* One step of a wait: 50 short spins first (a message takes a few 250 us superframes), then the
++ * caller's idle (the audio thread's GLINK poll, ~1 ms) */
++static void
++step(unsigned *spins)
++{
++	if (*spins < 50) {
++		(*spins)++;
++		delay(20);
++	} else if (slim_idle != NULL) {
++		slim_idle();
++	} else {
++		taimen_mic_msleep(1);
++	}
++}
++
++static void
++regs_log(const char *why)
++{
++	LOG("slim: %s: cfg %#x status %#x int_stat %#x int_en %#x rx_msgq %#x rx word0 %#x", why, ngd_r(NGD_CFG),
++	    ngd_r(NGD_STATUS), ngd_r(NGD_INT_STAT), ngd_r(NGD_INT_EN), ngd_r(NGD_RX_MSGQ_CFG), ngd_r(NGD_RX_MSG));
++}
++
++static void
++rx_dispatch(const uint8_t *b, unsigned rl)
++{
++	unsigned mt = (b[0] >> 5) & 7u, mc = b[1];
++
++	n_rx++;
++	if (mt == MT_SRC_USER && mc == MC_MASTER_CAP) {
++		memcpy(cap_buf, b, sizeof(cap_buf));
++		cap_rl = rl;
++		cap_seen = true;
++		return;
++	}
++	if (want_mc >= 0 && mc == (unsigned)want_mc && rl >= 4 && b[3] == want_tid &&
++	    mt == (mc == MC_REPLY_VALUE ? MT_CORE : MT_SRC_USER)) {
++		memcpy(got_buf, b, sizeof(got_buf));
++		got_rl = rl;
++		got = true;
++		return;
++	}
++	if (n_stray++ < 16) {
++		LOG("slim: rx RL %u MT %u MC %#x, not waited for (want MC %d TID %u): %02x %02x %02x %02x %02x %02x %02x %02x",
++		    rl, mt, mc, want_mc, want_tid, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++	}
++}
++
++/* Every message waiting in the RX register (at most 8 a call). */
++static void
++rx_drain(void)
++{
++	unsigned k;
++
++	for (k = 0; k < 8; k++) {
++		uint32_t w[10];
++		unsigned rl, nw, i;
++		if ((ngd_r(NGD_INT_STAT) & INT_RX_RCVD) == 0) {
++			break;
++		}
++		bzero(w, sizeof(w));
++		w[0] = ngd_r(NGD_RX_MSG);
++		rl = w[0] & 0x1Fu;
++		nw = (rl + 3) / 4;
++		for (i = 1; i < nw && i < 10; i++) {
++			w[i] = ngd_r(NGD_RX_MSG + 4 * i);
++		}
++		ngd_w(NGD_INT_CLR, INT_RX_RCVD);
++		rx_dispatch((const uint8_t *)w, rl);
++	}
++}
++
++/* m: the message, RL bytes. 0, EIO (NACKed), EINVAL (other TX error), ETIMEDOUT, ENODEV. */
++static int
++tx(const uint8_t *m, unsigned rl)
++{
++	uint32_t w[8], s = 0;
++	unsigned i, nw = (rl + 3) / 4, spins = 0;
++	uint64_t t;
++
++	if (!ngd_up || slim_dead || rl > 31) {
++		return ENODEV;
++	}
++	bzero(w, sizeof(w));
++	memcpy(w, m, rl);
++	ngd_w(NGD_INT_CLR, INT_TX_SENT | INT_TX_ERR);   /* this message's status only */
++	for (i = 0; i < nw; i++) {
++		ngd_w(NGD_TX_MSG + 4 * i, w[i]);
++	}
++	t = taimen_mic_now_ms();
++	for (;;) {
++		s = ngd_r(NGD_INT_STAT);
++		if ((s & (INT_TX_SENT | INT_TX_ERR)) != 0) {
++			break;
++		}
++		if (since(t) >= TX_WAIT_MS) {
++			n_timeouts++;
++			if (++tx_timeouts_row == 1 || tx_timeouts_row == 3) {
++				LOG("slim: TX of %08x %08x (RL %u) not sent in %u ms", w[0], w[1], rl, TX_WAIT_MS);
++				regs_log("after the TX timeout");
++			}
++			if (tx_timeouts_row >= 3) {
++				slim_dead = true;
++				LOG("slim: three TX timeouts in a row: no more SLIMbus messages this boot");
++			}
++			return ETIMEDOUT;
++		}
++		if ((s & INT_RX_RCVD) != 0) {
++			rx_drain();             /* a reply may come before we look */
++			continue;
++		}
++		step(&spins);
++	}
++	tx_timeouts_row = 0;
++	if ((s & INT_IE_VE_CHG) != 0) {
++		n_ieve++;
++	}
++	ngd_w(NGD_INT_CLR, s & (INT_TX_SENT | INT_TX_ERR | INT_IE_VE_CHG));
++	if ((s & INT_TX_ERR) != 0) {
++		n_nacks += (s & INT_TX_NACKED) != 0;
++		if (n_txerr++ < 12) {
++			LOG("slim: TX of %08x %08x (RL %u): int_stat %#x (%s)", w[0], w[1], rl, s,
++			    (s & INT_TX_NACKED) ? "NACKed" : (s & INT_TX_INVAL) ? "invalid message" :
++			    (s & INT_DEV_ERR) ? "device error" : "buffer contention");
++		}
++		return (s & INT_TX_NACKED) ? EIO : EINVAL;
++	}
++	return 0;
++}
++
++static unsigned
++hdr(uint8_t *m, unsigned mt, unsigned mc, uint8_t la, unsigned payload)
++{
++	unsigned rl = 3 + payload;
++	m[0] = (uint8_t)(rl | (mt << 5));
++	m[1] = (uint8_t)mc;
++	m[2] = la;
++	return rl;
++}
++
++bool
++taimen_slim_ready(void)
++{
++	return ngd_up && !slim_dead;
++}
++
++/*
++ * M1 after POWER(ACTIVE): the version, the NGD on in register mode, our logical address, the
++ * manager's MASTER_CAPABILITY and our REPORT_SATELLITE (WH ngd_slim_power_up, ngd_slim_rx_msgq_thread).
++ */
++bool
++taimen_slim_up(taimen_slim_idle_t idle)
++{
++	uint32_t ver_reg, cfg, st, ien, nbase;
++	uint64_t t0;
++	unsigned tries, spins, laddr_ms = 0, n;
++	bool laddr = false;
++	int err = ENODEV;
++	uint8_t m[8];
++
++	slim_idle = idle;
++	if (ngd_up) {
++		return !slim_dead;
++	}
++	if (slim_base == 0) {
++		slim_base = ml_io_map(SLIM_PA, SLIM_MAP);
++	}
++	if (slim_base == 0) {
++		LOG("1: no mapping for the SLIMbus block at %#x", SLIM_PA);
++		return false;
++	}
++	sweet_spi_mask(NGD_INTID, true);
++	LOG("1: first access to the SLIMbus block: its version register at %#x", SLIM_PA);
++	taimen_mic_msleep(30);
++	ver_reg = *(volatile uint32_t *)slim_base;
++	slim_ver = ver_reg >> 16;
++	nbase = slim_ver != 0 ? NGD_BASE_V2 : NGD_BASE_V1;
++	ngd = slim_base + nbase;
++	LOG("1: SLIMbus version register %#x; first access to the NGD registers at %#x", ver_reg, SLIM_PA + nbase);
++	taimen_mic_msleep(30);
++	cfg = ngd_r(NGD_CFG);
++	st = ngd_r(NGD_STATUS);
++	ien = ngd_r(NGD_INT_EN);
++	LOG("1: NGD hw %#x; status %#x cfg %#x int_en %#x int_stat %#x", slim_ver, st, cfg, ien, ngd_r(NGD_INT_STAT));
++	if ((st & NGD_LADDR) != 0 && ien != 0) {
++		/* WH: an ADSP power collapse that kept the hardware: enable, no capability exchange */
++		if (cfg != NGD_CFG_ENABLE) {
++			ngd_w(NGD_CFG, NGD_CFG_ENABLE);
++		}
++		ngd_up = true;
++		LOG("1: M1 NGD kept by the hardware (LADDR set, int_en %#x): enabled (register mode), no capability "
++		    "exchange", ien);
++		return true;
++	}
++	for (tries = 0; tries < 3 && !cap_seen; tries++) {
++		ngd_w(NGD_INT_EN, INT_EN_ALL);
++		ngd_w(NGD_RX_MSGQ_CFG, ngd_r(NGD_RX_MSGQ_CFG) | RX_MSGQ_TIMEOUT);
++		if (ngd_r(NGD_CFG) != NGD_CFG_ENABLE) {
++			ngd_w(NGD_CFG, NGD_CFG_ENABLE);
++		}
++		t0 = taimen_mic_now_ms();
++		spins = 0;
++		while (!cap_seen && since(t0) < 1000) {
++			if (!laddr && (ngd_r(NGD_STATUS) & NGD_LADDR) != 0) {
++				laddr = true;
++				laddr_ms = tries * 1000 + since(t0);
++			}
++			if ((ngd_r(NGD_INT_STAT) & INT_RX_RCVD) != 0) {
++				rx_drain();
++				continue;
++			}
++			step(&spins);
++		}
++		if (!cap_seen) {
++			LOG("1: no MASTER_CAPABILITY in 1 s (try %u, LADDR %s)", tries + 1, laddr ? "set" : "NOT set");
++			regs_log("waiting for MASTER_CAPABILITY");
++		}
++	}
++	if (!laddr && (ngd_r(NGD_STATUS) & NGD_LADDR) != 0) {
++		laddr = true;
++		laddr_ms = tries * 1000;
++	}
++	if (!cap_seen) {
++		LOG("1: the NGD got %s and no MASTER_CAPABILITY: %s", laddr ? "a logical address" : "NO logical address",
++		    laddr ? "RX in register mode does not work (INT_STAT bit 30 never set)" :
++		    "the manager did not take the NGD (register mode?)");
++		return false;
++	}
++	ngd_up = true;
++	for (n = 0; n < 4; n++) {           /* WH: up to INIT_MX_RETRIES more on a NACK, 10 ms apart */
++		unsigned rl = hdr(m, MT_SRC_USER, MC_REPORT_SAT, LA_MGR, 4);
++		m[3] = 0xD9;                    /* SAT_MAGIC_LSB, MSB, SAT_MSG_VER, SAT_MSG_PROT */
++		m[4] = 0xC5;
++		m[5] = 0x01;
++		m[6] = 0x01;
++		err = tx(m, rl);
++		if (err != EIO) {
++			break;
++		}
++		taimen_mic_msleep(10);
++	}
++	if (err != 0) {
++		LOG("1: MASTER_CAPABILITY (RL %u) came, but REPORT_SATELLITE failed (%d, %u tries)", cap_rl, err, n < 4 ? n + 1 : 4);
++		ngd_up = false;
++		return false;
++	}
++	LOG("1: M1 NGD enabled (register mode); LADDR after %u ms; MASTER_CAPABILITY (RL %u: %02x %02x %02x %02x %02x "
++	    "%02x %02x %02x); REPORT_SATELLITE sent%s", laddr_ms, cap_rl, cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3],
++	    cap_buf[4], cap_buf[5], cap_buf[6], cap_buf[7], n != 0 ? " after NACKs" : "");
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/bsd/dev/taimen_wcd934x.c b/bsd/dev/taimen_wcd934x.c
+new file mode 100644
+index 0000000..93c37e7
+--- /dev/null
++++ b/bsd/dev/taimen_wcd934x.c
+@@ -0,0 +1,75 @@
++/*
++ * Pixel 2 XL (taimen, MSM8998) WCD9340 (Tavil) codec on the SLIMbus (bsd/dev/taimen_slim.c), for
++ * the microphones (docs/taimen-mic-plan.md section 3; WH = the wahoo kernel: drivers/mfd/
++ * wcd9xxx-core.c, wcd9xxx-utils.c, wcd934x-regmap.c, sound/soc/codecs/wcd934x/wcd934x.c,
++ * wcd9xxx-resmgr-v2.c). Registers are 16-bit page << 8 | offset: value element 0x800 + offset of
++ * the generic device (LA 0xCF on Android), the page in register 0x00 (element 0x800) when it
++ * changes; the interface device's port registers are elements 0x800 + reg, unpaged (LA 0xCE).
++ *   census (taimenmic>=1)  TLMM gpio64 (codec reset), gpio54 (codec IRQ), PM8998 GPIO13 (MCLK out):
++ *                          read only
++ * Call from the audio thread, after taimen_slim_up.
++ */
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++void taimen_wcd_census(void);
++
++#define LOG(fmt, ...)           printf("TAIMEN MIC: " fmt "\n", ##__VA_ARGS__)
++
++#define TLMM_PA(g)              (0x03500000u + 0x1000u * (g))   /* the WEST tile: CFG +0, IN_OUT +4 */
++#define CDC_RST_GPIO            64u             /* qcom,cdc-rst-n-gpio (live.dts cdc_reset_ctrl) */
++#define CDC_IRQ_GPIO            54u             /* wcd9xxx-irq, qcom,gpio-connect */
++#define TLMM_OE                 (1u << 9)
++#define MCLK_PPID               0x0CCu          /* PM8998 GPIO 13, SPMI 0xCC00 (live.dts gpio@cc00) */
++
++static vm_offset_t rst_pin;
++
++struct pmg {                    /* PM8998 GPIO: subtype, mode, vin, pull, LV/MV source, out, enable */
++	uint8_t sub, mode, vin, pull, src, out, en;
++	bool ok;
++};
++
++static uint32_t
++rd32(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static void
++pmg_read(struct pmg *g)
++{
++	bzero(g, sizeof(*g));
++	g->ok = sweet_pmic_read(MCLK_PPID, 0x05, &g->sub) && sweet_pmic_read(MCLK_PPID, 0x40, &g->mode) &&
++	    sweet_pmic_read(MCLK_PPID, 0x41, &g->vin) && sweet_pmic_read(MCLK_PPID, 0x42, &g->pull) &&
++	    sweet_pmic_read(MCLK_PPID, 0x44, &g->src) && sweet_pmic_read(MCLK_PPID, 0x45, &g->out) &&
++	    sweet_pmic_read(MCLK_PPID, 0x46, &g->en);
++}
++
++/* M1: what the boot left on the codec's pins (read only). */
++void
++taimen_wcd_census(void)
++{
++	vm_offset_t irq = ml_io_map(TLMM_PA(CDC_IRQ_GPIO), 0x1000);
++	struct pmg g;
++
++	if (rst_pin == 0) {
++		rst_pin = ml_io_map(TLMM_PA(CDC_RST_GPIO), 0x1000);
++	}
++	pmg_read(&g);
++	if (rst_pin == 0 || irq == 0) {
++		LOG("1: census: no TLMM mapping (gpio%u %#lx, gpio%u %#lx)", CDC_RST_GPIO, (unsigned long)rst_pin,
++		    CDC_IRQ_GPIO, (unsigned long)irq);
++		return;
++	}
++	LOG("1: census: tlmm64 cfg %#x io %#x, tlmm54 cfg %#x io %#x, pm8998 gpio13%s subtype %#x mode %#x vin %#x "
++	    "pull %#x src %#x out %#x en %#x", rd32(rst_pin), rd32(rst_pin + 4), rd32(irq), rd32(irq + 4),
++	    g.ok ? "" : " (SPMI READ FAILED)", g.sub, g.mode, g.vin, g.pull, g.src, g.out, g.en);
++}
++#endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 932e0be..d729c23 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -41,6 +41,14 @@
+  * SMEM, the hwlock and SMP2P as TaimenModem.cpp (from ios-topaz TopazModem.cpp), with the ADSP's
+  * host id, items and doorbell bits. Only partitions APPS is a host of are read (another pair's
+  * header hung a CPU, boot 109).
++ *
++ * Microphones (docs/taimen-mic-plan.md section 6): boot-arg taimenmic=N (default 0: nothing runs)
++ * runs the microphone stages 1..N once, at the end of the stage 4 setup above (the speaker's
++ * feeder decided, its port stopped), with lines "TAIMEN MIC:". The SLIMbus NGD is
++ * bsd/dev/taimen_slim.c, the WCD9340 bsd/dev/taimen_wcd934x.c; the QMI client lives here.
++ * 1 (0346): census of the codec's pins; the ADSP's slimbus QMI service (0x301 v1 inst 0, from its
++ *   NEW_SERVER) from our port 0x4002: SELECT_INSTANCE(0, MASTER), POWER(ACTIVE); then the NGD in
++ *   register mode, its logical address, MASTER_CAPABILITY and our REPORT_SATELLITE.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -70,6 +78,11 @@ bool taimen_tas2557_init(const uint8_t *fw, uint32_t fw_len, const uint8_t *cal,
+ bool taimen_tas2557_power(bool on);
+ void taimen_tas2557_status(void);
+ }
++extern "C" {                                    /* bsd/dev/taimen_slim.c, taimen_wcd934x.c (taimenmic) */
++typedef void (*taimen_slim_idle_t)(void);
++bool taimen_slim_up(taimen_slim_idle_t idle);
++void taimen_wcd_census(void);
++}
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -1348,6 +1361,13 @@ static uint32_t q_ver = 1, q_node = 0xFFFFFFFFu;
+ static bool q_hello_rx, q_hello_sent, q_announced;
+ static uint32_t q_services, q_lookups, q_pdreqs, q_other, q_resumes;
+ 
++/* the ADSP's slimbus QMI service (WH slim-msm.h SLIMBUS_QMI_SVC_ID, v1, instance 0), for taimenmic */
++#define SVC_SLIM            0x301
++#define SVC_SLIM_WORD       0x0001              /* version 1, instance 0 << 8 */
++#define PORT_MIC            0x4002              /* our QMI client port */
++static uint32_t slim_qnode = 0xFFFFFFFFu, slim_qport;
++static void mic_qmi_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len);
++
+ static void
+ qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
+ {
+@@ -1518,6 +1538,10 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			break;
+ 		}
+ 		q_services++;
++		if (c.a == SVC_SLIM && c.b == SVC_SLIM_WORD) {
++			slim_qnode = c.c;
++			slim_qport = c.d;
++		}
+ 		LOG("t=%u.%03u ADSP service %x v%u inst %x node %u port %x", T, c.a, c.b & 0xFF, c.b >> 8, c.c, c.d);
+ 		break;
+ 	case QRTR_TYPE_NEW_LOOKUP:
+@@ -1534,6 +1558,8 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 		}
+ 		if (dst_port == PORT_PDM && size >= 7 && p[hlen] == QMI_REQ) {
+ 			pdm_rx(src_node, src_port, *(const uint16_t *)(p + hlen + 1), *(const uint16_t *)(p + hlen + 3), p + hlen, size);
++		} else if (dst_port == PORT_MIC && size >= 7) {
++			mic_qmi_rx(src_node, src_port, p + hlen, size);
+ 		} else if (q_other++ < 16) {
+ 			LOG("t=%u.%03u qrtr DATA %u:%x -> port %x, %u B", T, src_node, src_port, dst_port, size);
+ 		}
+@@ -2631,6 +2657,137 @@ feeder_poll(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- microphones (taimenmic=N) */
++
++#define MLOG(fmt, ...)          IOLog("TAIMEN MIC: " fmt "\n", ##__VA_ARGS__)
++#define SLIM_QMI_SELECT_INST    0x20            /* WH slim-msm.c SLIMBUS_QMI_SELECT_INSTANCE_REQ_V01 */
++#define SLIM_QMI_POWER          0x21            /* SLIMBUS_QMI_POWER_REQ_V01 */
++#define SLIM_MODE_MASTER        2u              /* SLIMBUS_MODE_MASTER_V01: the ADSP is the bus master */
++#define SLIM_PM_ACTIVE          2u              /* SLIMBUS_PM_ACTIVE_V01 (INACTIVE 1 is never sent) */
++#define SLIM_QMI_WAIT_MS        1000            /* WH SLIM_QMI_RESP_TOUT */
++
++static int mic_level;                   /* taimenmic=N, default 0 */
++static uint16_t mic_txn = 1, mic_wait_txn, mic_wait_msg;
++static bool mic_qmi_got;
++static uint32_t mic_qmi_res, mic_qmi_err, mic_qmi_stray;
++
++static inline uint16_t mic_ld16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
++static inline void mic_st16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
++
++/* GLINK and QRTR keep running while a microphone stage waits (also the SLIMbus code's idle) */
++static void
++mic_idle(void)
++{
++	if (!glink_poll()) {
++		IOSleep(1);
++	}
++	qrtr_poll();
++}
++
++/* QRTR DATA to port 0x4002: the response in flight, or a stray */
++static void
++mic_qmi_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	uint16_t txn = mic_ld16(d + 1), msg = mic_ld16(d + 3), tl = 0;
++	if (d[0] != QMI_RESP || txn != mic_wait_txn || msg != mic_wait_msg || mic_qmi_got) {
++		if (mic_qmi_stray++ < 8) {
++			MLOG("QMI type %u msg %#x txn %u from %u:%#x, %u bytes: not expected", d[0], msg, txn, node, port, len);
++		}
++		return;
++	}
++	const uint8_t *r = qm_find(d, len, 0x02, &tl);          /* the result TLV: u16 result, u16 error */
++	mic_qmi_res = r != NULL && tl >= 2 ? mic_ld16(r) : 0xFFFFu;
++	mic_qmi_err = r != NULL && tl >= 4 ? mic_ld16(r + 2) : 0xFFFFu;
++	mic_qmi_got = true;
++}
++
++/* m: a request, its TLVs from byte 7, n bytes in all. 0 when answered (mic_qmi_res/err), -1 not. */
++static int
++mic_qmi_call(uint16_t msg, uint8_t *m, uint32_t n, unsigned *took)
++{
++	mic_wait_txn = mic_txn++;
++	if (mic_txn == 0) {
++		mic_txn = 1;
++	}
++	mic_wait_msg = msg;
++	mic_qmi_got = false;
++	m[0] = QMI_REQ;
++	mic_st16(m + 1, mic_wait_txn);
++	mic_st16(m + 3, msg);
++	mic_st16(m + 5, (uint16_t)(n - 7));
++	uint64_t t = now_ms();
++	qrtr_send(QRTR_TYPE_DATA, PORT_MIC, slim_qnode, slim_qport, m, n);
++	while (!mic_qmi_got && now_ms() - t < SLIM_QMI_WAIT_MS) {
++		mic_idle();
++	}
++	*took = (unsigned)(now_ms() - t);
++	return mic_qmi_got ? 0 : -1;
++}
++
++/*
++ * M1: the census, the slimbus QMI handshake (WH msm_slim_qmi_init, msm_slim_qmi_power_request),
++ * then the NGD (taimen_slim_up), whose registers are touched only after POWER(ACTIVE) said 0.
++ */
++static bool
++mic_m1(void)
++{
++	uint8_t m[32];
++	uint32_t inst = 0, mode = SLIM_MODE_MASTER, pm = SLIM_PM_ACTIVE, n;
++	unsigned took = 0;
++	int rc = -1;
++
++	taimen_wcd_census();
++	uint64_t t = now_ms();
++	while (slim_qnode == 0xFFFFFFFFu && now_ms() - t < 5000) {
++		mic_idle();
++	}
++	if (slim_qnode == 0xFFFFFFFFu) {
++		MLOG("1: the ADSP announced no slimbus QMI service (0x301 v1 inst 0) in 5 s");
++		return false;
++	}
++	MLOG("1: slimbus QMI 0x301 v1 inst 0 at node %u port %#x", slim_qnode, slim_qport);
++	n = qm_tlv(m, 7, 0x01, &inst, 4);                       /* instance: cell-index 1 >> 1 */
++	n = qm_tlv(m, n, 0x10, &mode, 4);
++	if (mic_qmi_call(SLIM_QMI_SELECT_INST, m, n, &took) != 0) {
++		MLOG("1: SELECT_INSTANCE(0, MASTER): no answer in %u ms", took);
++		return false;
++	}
++	MLOG("1: SELECT_INSTANCE(0, MASTER) -> %u/%u in %u ms", mic_qmi_res, mic_qmi_err, took);
++	if (mic_qmi_res != 0) {
++		return false;
++	}
++	for (unsigned i = 0; i < 3; i++) {
++		n = qm_tlv(m, 7, 0x01, &pm, 4);
++		rc = mic_qmi_call(SLIM_QMI_POWER, m, n, &took);
++		if (rc == 0 && mic_qmi_res == 0) {
++			break;
++		}
++		MLOG("1: POWER(ACTIVE) try %u: %s %u/%u after %u ms", i + 1, rc == 0 ? "answered" : "NO answer", mic_qmi_res,
++		    mic_qmi_err, took);
++		rc = -1;
++	}
++	if (rc != 0) {
++		MLOG("1: POWER(ACTIVE) failed: the NGD's registers are not touched");
++		return false;
++	}
++	MLOG("1: POWER(ACTIVE) -> %u/%u in %u ms", mic_qmi_res, mic_qmi_err, took);
++	return taimen_slim_up(mic_idle);
++}
++
++/* The microphone stages 1..taimenmic, once; a failure ends them and nothing else. */
++static void
++mic_stages(void)
++{
++	MLOG("t=%u.%03u taimenmic=%d: stage 1", T, mic_level);
++	if (!mic_m1()) {
++		MLOG("1: M1 NOT reached; the microphone stages end here (the speaker is not affected)");
++		return;
++	}
++	if (mic_level > 1) {
++		MLOG("taimenmic=%d: stages 2 and up are not built yet", mic_level);
++	}
++}
++
+ /* ---------------------------------------------------------------- the thread */
+ 
+ static void
+@@ -2639,6 +2796,10 @@ audio_thread(void *arg, wait_result_t)
+ 	int level = (int)(intptr_t)arg;
+ 	unsigned last_status = 0;
+ 	LOG("taimenaudio=%d", level);
++	(void)PE_parse_boot_argn("taimenmic", &mic_level, sizeof(mic_level));
++	if (mic_level > 0 && level < 4) {
++		MLOG("taimenmic=%d needs taimenaudio>=4 (GLINK, QRTR, APR): no microphone stage runs", mic_level);
++	}
+ 	/* the device first: mediaserverd's plug-in opens it when the HAL starts, long before the ADSP */
+ 	if (level >= 9) {
+ 		(void)audio_dev_init();
+@@ -2734,6 +2895,9 @@ audio_thread(void *arg, wait_result_t)
+ 				afe_clock(false);
+ 				pins_mi2s(false);
+ 			}
++			if (mic_level > 0) {
++				mic_stages();           /* after the speaker's setup: its failures stay its own */
++			}
+ 		}
+ 		if (slave != NULL && (*slave & SLAVE_ERR_FATAL) != 0) {
+ 			LOG("t=%u.%03u *** ADSP FATAL (slave-kernel %#x) ***", T, *slave);
