@@ -94,26 +94,29 @@ main(int argc, char **argv)
 {
 	__block unsigned long shown = 0;        /* before any goto: a jump may not skip a __block variable */
 	bool debug = false, daemon = false;
-	const char *list = NULL;
+	char list[512] = "";
+	/* every other argument names processes, alone or comma-separated: mkrootfix --daemon splits its
+	 * arguments on commas, so "--daemon,locationd,backboardd" arrives as two (boot 181 kept only the last) */
+	names = calloc((size_t)argc * 64, sizeof(char *));
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--debug") == 0) {
 			debug = true;
 		} else if (strcmp(argv[i], "--daemon") == 0) {
 			daemon = true;
 		} else {
-			list = argv[i];
+			char *copy = strdup(argv[i]);
+			for (char *s = copy, *t; (t = strsep(&s, ",")) != NULL;) {
+				if (*t && nnames < argc * 64) {
+					names[nnames++] = t;
+					strlcat(list, list[0] ? "," : "", sizeof(list));
+					strlcat(list, t, sizeof(list));
+				}
+			}
 		}
 	}
-	if (list == NULL) {
-		fprintf(stderr, "usage: oslogd [--debug] [--daemon] PROC[,PROC...]\n");
+	if (nnames == 0) {
+		fprintf(stderr, "usage: oslogd [--debug] [--daemon] PROC[,PROC...] [PROC...]\n");
 		return 2;
-	}
-	char *copy = strdup(list);
-	names = calloc(strlen(list) + 1, sizeof(char *));
-	for (char *s = copy, *t; (t = strsep(&s, ",")) != NULL;) {
-		if (*t) {
-			names[nnames++] = t;
-		}
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
