@@ -2488,10 +2488,22 @@ sweetgl_eagl_install(void)
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	sgl_gap_ticks = gap_ms * 1000000ull * tb.denom / tb.numer;
+	/*
+	 * One display layer. CA's IOMFB display puts a layer the display could scan out by
+	 * itself (Maps' CAMetalLayer drawable, video) on a swap layer of its own, under its
+	 * composite, and punches a transparent hole for it in the composite (a blend-off
+	 * 0,0,0,0 quad). The taimen present (xnu taimen_present_scaled) shows swap layer 0
+	 * only: Maps showed its bare drawable, without the status bar and the chrome that
+	 * the composite on layer 1 held (boots 202-205). CA's debug option
+	 * CA_DISABLE_DETACHED (QuartzCore reads its options with getenv the first time it
+	 * needs them, after this constructor) keeps every layer in the composite.
+	 * CA_DISABLE_DETACHED=0 in the sweetenv leaves detaching on.
+	 */
+	setenv("CA_DISABLE_DETACHED", "1", 0);
 	Dl_info di;
 	if (dladdr((void *)sgl_gap, &di)) {
-		sweet_drm_log("sweetgl: loaded at %p, gaps over %llu ms logged%s", di.dli_fbase, gap_ms,
-		    flush_waits ? "" : ", flush without finish");
+		sweet_drm_log("sweetgl: loaded at %p, gaps over %llu ms logged%s, CA_DISABLE_DETACHED=%s", di.dli_fbase,
+		    gap_ms, flush_waits ? "" : ", flush without finish", getenv("CA_DISABLE_DETACHED"));
 	}
 	sgl_install_texfns();
 	if (trace_left > 0) {
