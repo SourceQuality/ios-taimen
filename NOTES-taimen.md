@@ -1239,3 +1239,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   AegirPoster crashes. Rotation: backboardd opened SweetHIDOrientation (0x20/0x8a) and took the CMUsage orientation
   events (0x67, 0x68, 0x65, one client), but Safari's full-screen video stayed portrait; locationd's own detector
   wants a gyro ("No gyro; not detecting orientation!", strings). Next: is portrait lock on (boot 171's hand use)?
+- 2026-10-30 boot 175 (r156, clients AegirPoster, Preferences, Weather, Maps): Control Center shows portrait lock
+  **off**, so that is not why the orientation events rotate nothing. Weather opens and draws its list (no data:
+  its service is not reachable), Maps aborts at launch (SIGABRT): neither had sweetlogp, so whether Weather took
+  the Metal device and why Maps aborted are open. The r157 kernel build (0338) was cancelled twice without a
+  runner (GitHub's macOS queue), so the SLPI boot waits for boot 176. sweetlogp mirrors only Error-level os_log;
+  boot-xnu.sh SWEETENV_EXTRA (edfd37d) adds e.g. locationd:OS_ACTIVITY_MODE=info through the ADT boot-args.
+  0339: a still synthetic gyro (locationd's detector wants one).
