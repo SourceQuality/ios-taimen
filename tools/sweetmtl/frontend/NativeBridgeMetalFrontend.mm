@@ -661,7 +661,11 @@ static void waitForResource(id resource) {
 @end
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
- if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+ if(![(id)state isKindOfClass:[NBRenderPipeline class]]){
+  [self.commandBuffer refuse:state?[NSString stringWithFormat:@"foreign render pipeline (%s)",object_getClassName((id)state)]
+                                  :@"no render pipeline (nil: its creation failed)"];
+  return;
+ }
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -1037,7 +1041,11 @@ static void completed(void *context) {
 @end
 
 // ---- the device ----
+// The first 32 creation failures also go to the log (boot 171: AegirPoster's command buffers were refused for a nil render
+// pipeline whose creation had failed, and only the on-phone journal said why).
+static std::atomic<unsigned> gFailsLogged;
 template <typename T> static T failWith(NSError **error,NSString *what,T value) {
+ if(gFailsLogged++<32)NBINFO(@"native-metal: %@ refused: %@",what,lastError());
  noteProblem([NSString stringWithFormat:@"%@: %@",what,lastError()]);
  if(error)*error=nbError([NSString stringWithFormat:@"%@: %@",what,lastError()]);
  return value;
