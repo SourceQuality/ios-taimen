@@ -1339,3 +1339,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-30 boot 191 (r163, SweetMetal-ae4624e1 = 8f3d06c): Maps no longer crashes, but its screen stays black:
   22 command buffers refused for metal2vulkan's sRGB ColorWriteTable binding, 32 render pipelines for
   B8G8R8A8_SRGB not blendable (freedreno a5xx never answers PIPE_BIND_BLENDABLE). Both in 8be925c.
+- 2026-10-30 **boot 192 (r164 = +0346-0349, taimenmic=4): microphones M1-M4, the codec talks.** Every stage of
+  docs/taimen-mic-plan.md passed the first time. M1: the ADSP's QMI slimbus service 0x301 (node 5 port 0xb) took
+  SELECT_INSTANCE(0, MASTER) and POWER(ACTIVE) (0/0, 1 and 5 ms); the SLIMbus block (version 0x2000000) and the NGD
+  (hw 0x200) answered without a hang; register-mode messaging got LADDR at once and MASTER_CAPABILITY (RL 7), and
+  REPORT_SATELLITE went out. M2: after a 20 ms reset pulse on gpio64 the WCD9340 took logical addresses 0xcf
+  (generic) and 0xce (interface); the WCD9335 query stays absent. M3: chip id 01 00 08 01, WCD9340 v1.1, 0 NACKs,
+  0 timeouts. M4: MCLK from the RPM's DIV_CLK1 out of PM8998 GPIO13, the codec clock, 34+24+6 defaults and the CPR,
+  and the TX7 path (DMIC0 -> DEC7 -> TX7, MICB1 on): 82 registers read back as written, then all of it down again.
+  The speaker kept working (a 148,480-frame session, 0 dropped). Next: M5-M7 (AFE SLIMBUS_0_TX, the ASM record
+  stream, /dev/redwood-mic).
