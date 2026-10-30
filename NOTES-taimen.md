@@ -1255,3 +1255,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Weather never asked for a device. Rotation: SweetHIDGyro (0339) opened by backboardd too, nothing rotated, and
   locationd with OS_ACTIVITY_MODE=info still printed only objc warnings: sweetlogp mirrors no os_log (the
   "<Error>" lines in mediaserverd were CFLog). oslogd (0dc3a71) streams the unified log of named processes instead.
+- 2026-10-30 boot 177 (r157, taimensensors=3 again): the SLPI boot is repeatable (READY 38 ms after the reset) and
+  SMEM comes back clean after a reset (430/481/478-480 absent, no crash reason): 0338's stale-state guard does
+  not get in the way of the next boot.
+- 2026-10-30 boot 178 (r157): **a 15-minute soak**: the SLPI running, Metal clients (m4c), sound; eight rounds of unlock,
+  Settings, Weather, lock and wake, the poster gallery. No panic, no GPU hang, no Metal refusal, **not one crash**
+  (not even driverkitd's), hottest sensor 53-57 C. But the poster gallery drew the poster only in round 1
+  (171 KB shot, as boot 174); rounds 2-8 showed black cards (54,129 B, as boot 167) while AegirPoster stayed up
+  (one exec, no crash): later frames from it never arrive. Next with oslogd and AegirPoster's stderr.
