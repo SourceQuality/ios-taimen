@@ -1,0 +1,935 @@
+diff --git a/iokit/Kernel/arm/TaimenSensors.cpp b/iokit/Kernel/arm/TaimenSensors.cpp
+index caf19cf..2846228 100644
+--- a/iokit/Kernel/arm/TaimenSensors.cpp
++++ b/iokit/Kernel/arm/TaimenSensors.cpp
+@@ -33,6 +33,17 @@
+  * TaimenAudio.cpp's lpass GLINK/QRTR code with this edge's partition and doorbell; the audio code is
+  * untouched. Polled: 2 ms for the first 20 s (then the "M3:" summary), 20 ms after that, serving the
+  * registry for as long as the SLPI runs. Stage numbers: 7 GLINK, 8 QRTR, 9 registry.
++ * Boot 180: all of it worked; the SLPI is QRTR node 9, SNS_SMGR v1 inst 50.
++ *
++ * 0341, plan M4 (taimensensors>=5): a QMI client of SNS_SMGR (0x100) on our port 0x4003, once SMGR
++ * is up and its registry reads went quiet: ALL_SENSOR_INFO (0x05), then SINGLE_SENSOR_INFO (0x06)
++ * for each sensor, one log line per data type (stage 10). Messages as the Linux qcom_smgr driver
++ * describes them (plan 2.2, re-typed); TLVs it does not describe are logged, not refused.
++ * Plan M5 (taimensensors>=6): BUFFERING (0x21) add for the accelerometer (the sensor whose type is
++ * "ACCEL", data type 0) at 50 Hz (taimenaccelhz=N), one sample per report; its BUFFERING_REPORT
++ * indications (0x22) carry Q16.16 samples, mapped to iOS milli-g by one table (taimenaccelmap=,
++ * default "+y+x-z" from the plan: Linux's SMGR mount matrix, then iOS = -Android / 9.80665) into
++ * SweetHID's accelerometer (sweet_hid_accel_sample) (stage 11).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -81,6 +92,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ extern "C" bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
+ extern "C" bool sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++extern "C" int sweet_hid_accel_sample(int mx, int my, int mz);        /* hid/SweetHID.cpp, 0341 */
+ 
+ #define PT_LOAD                 1
+ #define MDT_TYPE_MASK           (7u << 24)
+@@ -1298,8 +1310,10 @@ enum {
+ #define SNS_REG_WORD            QRTR_INSTANCE(2, 0)     /* 0x0002: REG/ qmi_add_server(0x10f, 2, 0) */
+ #define PORT_SNS_REG            0x4002
+ #define SVC_SNS_SMGR            0x0100
++#define PORT_SMGR_CLIENT        0x4003          /* 0341: our end of the SNS_SMGR conversation */
+ #define QMI_REQ                 0
+ #define QMI_RESP                2
++#define QMI_IND                 4
+ 
+ struct qrtr_v1 { uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port; } __attribute__((packed));
+ struct qrtr_v2 { uint8_t version, type, flags, optlen; uint32_t size; uint16_t src_node, src_port, dst_node, dst_port; } __attribute__((packed));
+@@ -1321,6 +1335,9 @@ static uint32_t q_nsrv;
+ 
+ /* SNS_SMGR, the Sensor Manager: M4 talks to it from here (taimensensors>=5) */
+ static uint32_t smgr_node = 0xFFFFFFFFu, smgr_port, smgr_word;
++static uint64_t smgr_up_ms;                     /* now_ms() when it appeared */
++static uint64_t reg_last_ms;                    /* now_ms() of the last registry group read */
++static int sens_level;                          /* taimensensors */
+ 
+ static void
+ qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
+@@ -1427,6 +1444,7 @@ pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *
+ }
+ 
+ static void reg_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len);
++static void smgr_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len);
+ 
+ static void
+ srv_add(uint32_t svc, uint32_t word, uint32_t node, uint32_t port)
+@@ -1469,8 +1487,9 @@ smgr_appeared(uint32_t word, uint32_t node, uint32_t port)
+ 	smgr_node = node;
+ 	smgr_port = port;
+ 	smgr_word = word;
+-	LOG("8: t=%u.%03u SNS_SMGR (svc 0x100) up: v%u inst %u (QRTR instance %#x), node %u port %#x; not used before M4",
+-	    T, word & 0xFF, word >> 8, word, node, port);
++	smgr_up_ms = now_ms();
++	LOG("8: t=%u.%03u SNS_SMGR (svc 0x100) up: v%u inst %u (QRTR instance %#x), node %u port %#x; %s", T,
++	    word & 0xFF, word >> 8, word, node, port, sens_level >= 5 ? "M4 asks it for its sensors" : "not used before M4");
+ }
+ 
+ static void
+@@ -1569,6 +1588,8 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			pdm_rx(src_node, src_port, ld16(p + hlen + 1), ld16(p + hlen + 3), p + hlen, size);
+ 		} else if (dst_port == PORT_SNS_REG && size >= 7) {
+ 			reg_rx(src_node, src_port, p + hlen, size);
++		} else if (dst_port == PORT_SMGR_CLIENT && size >= 7) {
++			smgr_rx(src_node, src_port, p + hlen, size);
+ 		} else if (q_other++ < 32) {
+ 			LOG("8: t=%u.%03u DATA %u:%#x -> port %#x, %u bytes (QMI type %u msg %#x)", T, src_node, src_port, dst_port,
+ 			    size, size >= 7 ? p[hlen] : 0xFFu, size >= 7 ? ld16(p + hlen + 3) : 0xFFFFu);
+@@ -1807,6 +1828,7 @@ reg_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+ 	qrtr_send(QRTR_TYPE_DATA, PORT_SNS_REG, node, port, m, n);
+ 
+ 	reg_reqs++;
++	reg_last_ms = now_ms();
+ 	if (ok) {
+ 		reg_req_ok++;
+ 	} else {
+@@ -1822,6 +1844,721 @@ reg_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- M4/M5: the SNS_SMGR client (0341) */
++
++/*
++ * SNS_SMGR's messages as the Linux qcom_smgr driver describes them (plan 2.2; facts re-typed). A QMI
++ * message is a 7-byte header {u8 type, u16 txn, u16 msg, u16 length} and TLVs {u8 type, u16 length,
++ * value}; the counts of arrays inside these values are one byte.
++ *   0x05 ALL_SENSOR_INFO: no request TLVs. Response: 0x02 result, 0x03 {n, n x {u8 id, u8 len, type}}.
++ *   0x06 SINGLE_SENSOR_INFO: request 0x01 u8 sensor id. Response: 0x02 result, 0x03 {n, n x {u8 sensor
++ *        id, u8 data type, u8 len, name, u8 len, vendor, u32 val1, u16 max rate Hz, u16 val2, u16
++ *        current uA, u32 range, u32 resolution}}, 0x10 {n, u32[n]}, 0x11 u32, 0x12 {n, u64[n]},
++ *        0x13 native rates {n, n x {u8 count, u16 rates[count]}}, 0x14 {n, u32[n]}.
++ *   0x21 BUFFERING: request 0x01 u8 report id, 0x02 u8 action (1 add, 2 delete), 0x03 u32 report
++ *        rate (Hz x 65536: one sample per report), 0x04 {n, n x {u8 sensor id, u8 data type, u16 3,
++ *        u16 sample rate Hz, u16 1}}; an optional 0x10 {u16 proc type, u16 send during suspend} that
++ *        Linux leaves out, as we do. Response: 0x02 result, 0x10 u8 report id, 0x11 u8 ack/nak.
++ *   0x22 BUFFERING_REPORT (indication): 0x01 u8 report id, 0x02 {u32, u8 sample count, u32
++ *        timestamp (32768 Hz ticks), u32}, 0x03 {n, n x {s32 x, y, z (Q16.16), u8, u8, u16}}, 0x10 u8.
++ * The result TLV is read as a u16 result, plus a u16 error when it is 4 bytes long.
++ */
++#define SMGR_MSG_ALL_INFO       0x05
++#define SMGR_MSG_ONE_INFO       0x06
++#define SMGR_MSG_BUFFERING      0x21
++#define SMGR_MSG_REPORT         0x22
++#define SMGR_MAX_SENSORS        24
++#define SMGR_MAX_DT             4
++#define SMGR_MAX_RATES          12
++#define SMGR_WAIT_MS            5000
++#define Q16_G                   642690          /* 9.80665 m/s^2 in Q16.16 (642689.6) */
++
++struct smgr_dt {
++	uint8_t  dt, nrates;
++	char     name[48], vendor[48];
++	uint32_t val1, range, res;
++	uint16_t max_hz, val2, cur_ua;
++	uint16_t rates[SMGR_MAX_RATES];
++};
++struct smgr_sensor {
++	uint8_t  id, ndt;
++	bool     info;
++	char     type[20];
++	struct smgr_dt dt[SMGR_MAX_DT];
++};
++
++enum { SM_IDLE, SM_WAIT_ALL, SM_RETRY_ALL, SM_INFO, SM_WAIT_ONE, SM_PICK, SM_WAIT_BUF, SM_STREAM, SM_DONE };
++
++static struct smgr_sensor *smgr_s;              /* SMGR_MAX_SENSORS */
++static uint32_t smgr_ns, smgr_cur, smgr_tries, smgr_state = SM_IDLE, smgr_stray;
++static uint16_t smgr_txn = 1, smgr_wait_txn;
++static uint64_t smgr_sent_ms, smgr_next_ms;
++
++/*
++ * M5's axis map: iOS x, y, z (milli-g) from the SMGR sample's axes. The plan's default, unverified:
++ * Linux's SMGR mount matrix (Android x = -SMGR y, Android y = -SMGR x, Android z = SMGR z), then
++ * iOS = -Android / 9.80665, so "+y+x-z". taimenaccelmap=SASASA overrides it (S sign, A axis).
++ */
++struct amap_e { uint8_t src; int8_t sign; };
++static struct amap_e amap[3] = { { 1, 1 }, { 0, 1 }, { 2, -1 } };
++static char amap_str[8] = "+y+x-z";
++
++static int accel_sid = -1, accel_hz;
++static uint64_t acc_t0, acc_win_ms, acc_next_ms;
++static uint32_t acc_samples, acc_reports, acc_win, acc_win_reports, acc_logged, acc_other_ids, acc_odd_tlvs;
++static uint32_t acc_hid_missing, acc_last_ts;
++static int32_t acc_raw[3];
++static int acc_mg[3];
++
++/* a Q16.16 value as text, with 3 or 6 decimals */
++static void
++q16_fmt(char *b, size_t n, int32_t v, unsigned decimals)
++{
++	uint64_t a = v < 0 ? (uint64_t)(-(int64_t)v) : (uint64_t)v;
++	if (decimals >= 6) {
++		snprintf(b, n, "%s%llu.%06llu", v < 0 ? "-" : "", a >> 16, ((a & 0xFFFF) * 1000000) >> 16);
++	} else {
++		snprintf(b, n, "%s%llu.%03llu", v < 0 ? "-" : "", a >> 16, ((a & 0xFFFF) * 1000) >> 16);
++	}
++}
++
++static uint64_t
++isqrt64(uint64_t v)
++{
++	uint64_t r = 0, b = 1ull << 62;
++	while (b > v) {
++		b >>= 2;
++	}
++	while (b != 0) {
++		if (v >= r + b) {
++			v -= r + b;
++			r = (r >> 1) + b;
++		} else {
++			r >>= 1;
++		}
++		b >>= 2;
++	}
++	return r;
++}
++
++static char
++lower(char c)
++{
++	return c >= 'A' && c <= 'Z' ? (char)(c + ('a' - 'A')) : c;
++}
++
++/* s contains w, ignoring case */
++static bool
++ci_has(const char *s, const char *w)
++{
++	size_t n = strlen(w);
++	for (; *s != 0; s++) {
++		size_t i = 0;
++		while (i < n && s[i] != 0 && lower(s[i]) == lower(w[i])) {
++			i++;
++		}
++		if (i == n) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* a counted string from a message, printable characters only */
++static void
++cpy_str(char *dst, size_t cap, const uint8_t *src, uint32_t n)
++{
++	size_t k = 0;
++	for (uint32_t i = 0; i < n && k + 1 < cap; i++) {
++		if (src[i] == 0) {
++			break;
++		}
++		dst[k++] = (src[i] >= 0x20 && src[i] < 0x7f) ? (char)src[i] : '.';
++	}
++	dst[k] = 0;
++}
++
++/* the next TLV of a QMI message at *o; false at the end or on a TLV that overruns the message */
++static bool
++qm_next(const uint8_t *d, uint32_t len, uint32_t *o, uint8_t *type, const uint8_t **v, uint16_t *l)
++{
++	if (*o + 3 > len) {
++		return false;
++	}
++	*type = d[*o];
++	*l = ld16(d + *o + 1);
++	if (*o + 3 + *l > len) {
++		return false;
++	}
++	*v = d + *o + 3;
++	*o += 3u + *l;
++	return true;
++}
++
++static void
++qm_result(const uint8_t *v, uint16_t l, uint32_t *res, uint32_t *err)
++{
++	*res = l >= 2 ? ld16(v) : 0xFFFFu;
++	*err = l >= 4 ? ld16(v + 2) : 0;
++}
++
++/* m: a QMI request with its TLVs from byte 7 on, n bytes in all */
++static void
++smgr_send(uint8_t *m, uint32_t n, uint16_t msg)
++{
++	smgr_wait_txn = smgr_txn++;
++	if (smgr_txn == 0) {
++		smgr_txn = 1;
++	}
++	m[0] = QMI_REQ;
++	st16(m + 1, smgr_wait_txn);
++	st16(m + 3, msg);
++	st16(m + 5, (uint16_t)(n - 7));
++	qrtr_send(QRTR_TYPE_DATA, PORT_SMGR_CLIENT, smgr_node, smgr_port, m, n);
++	smgr_sent_ms = now_ms();
++}
++
++static void
++smgr_ask_all(void)
++{
++	uint8_t m[8];
++	smgr_send(m, 7, SMGR_MSG_ALL_INFO);
++	smgr_state = SM_WAIT_ALL;
++	LOG("10: t=%u.%03u smgr: ALL_SENSOR_INFO (txn %u, try %u) to %u:%#x from port %#x", T, smgr_wait_txn,
++	    smgr_tries + 1, smgr_node, smgr_port, PORT_SMGR_CLIENT);
++}
++
++static void
++smgr_ask_one(uint8_t id)
++{
++	uint8_t m[16];
++	uint32_t n = qm_tlv(m, 7, 0x01, &id, 1);
++	smgr_send(m, n, SMGR_MSG_ONE_INFO);
++	smgr_state = SM_WAIT_ONE;
++}
++
++static void
++smgr_all_rx(const uint8_t *d, uint32_t len)
++{
++	uint32_t o = 7, res = 0xFFFFu, err = 0, listed = 0;
++	uint8_t t = 0;
++	const uint8_t *v = NULL;
++	uint16_t l = 0;
++
++	smgr_ns = 0;
++	while (qm_next(d, len, &o, &t, &v, &l)) {
++		if (t == 0x02) {
++			qm_result(v, l, &res, &err);
++		} else if (t == 0x03 && l >= 1) {
++			uint32_t k = 1;
++			listed = v[0];
++			for (uint32_t i = 0; i < v[0] && smgr_ns < SMGR_MAX_SENSORS; i++) {
++				if (k + 2 > l || k + 2 + v[k + 1] > l) {
++					LOG("10: smgr: ALL_SENSOR_INFO item %u overruns its TLV (%u bytes)", i, l);
++					break;
++				}
++				struct smgr_sensor *s = &smgr_s[smgr_ns++];
++				bzero(s, sizeof(*s));
++				s->id = v[k];
++				cpy_str(s->type, sizeof(s->type), v + k + 2, v[k + 1]);
++				k += 2u + v[k + 1];
++			}
++		} else {
++			LOG("10: smgr: ALL_SENSOR_INFO TLV %#x, %u bytes (not decoded)", t, l);
++		}
++	}
++	LOG("10: t=%u.%03u smgr: ALL_SENSOR_INFO result %u error %u: %u sensors listed, %u kept", T, res, err, listed,
++	    smgr_ns);
++	for (uint32_t i = 0; i < smgr_ns; i++) {
++		LOG("10: smgr sensor id 0x%02x type '%s'", smgr_s[i].id, smgr_s[i].type);
++	}
++	if (res != 0 || smgr_ns == 0) {
++		if (++smgr_tries < 5) {
++			smgr_state = SM_RETRY_ALL;
++			smgr_next_ms = now_ms() + 2000;
++			LOG("10: smgr: no sensors yet; asking again in 2 s");
++		} else {
++			smgr_state = SM_DONE;
++			LOG("10: smgr: no sensor list after %u tries; M4 stops", smgr_tries);
++		}
++		return;
++	}
++	smgr_cur = 0;
++	smgr_state = SM_INFO;
++}
++
++static void
++smgr_one_rx(const uint8_t *d, uint32_t len)
++{
++	struct smgr_sensor *s = &smgr_s[smgr_cur];
++	uint32_t o = 7, res = 0xFFFFu, err = 0;
++	uint8_t t = 0;
++	const uint8_t *v = NULL;
++	uint16_t l = 0;
++	char extra[200];
++	size_t el = 0;
++
++	extra[0] = 0;
++	s->ndt = 0;
++	while (qm_next(d, len, &o, &t, &v, &l)) {
++		if (t == 0x02) {
++			qm_result(v, l, &res, &err);
++		} else if (t == 0x03 && l >= 1) {
++			uint32_t k = 1, i;
++			for (i = 0; i < v[0]; i++) {
++				if (k + 3 > l) {
++					break;
++				}
++				uint8_t sid = v[k], dt = v[k + 1], nl = v[k + 2];
++				uint32_t kn = k + 3;
++				if (kn + nl + 1 > l) {
++					break;
++				}
++				uint8_t vl = v[kn + nl];
++				uint32_t kv = kn + nl + 1;
++				if (kv + vl + 18 > l) {
++					break;
++				}
++				const uint8_t *f = v + kv + vl;
++				if (s->ndt < SMGR_MAX_DT) {
++					struct smgr_dt *x = &s->dt[s->ndt++];
++					bzero(x, sizeof(*x));
++					x->dt = dt;
++					cpy_str(x->name, sizeof(x->name), v + kn, nl);
++					cpy_str(x->vendor, sizeof(x->vendor), v + kv, vl);
++					x->val1 = ld32(f);
++					x->max_hz = ld16(f + 4);
++					x->val2 = ld16(f + 6);
++					x->cur_ua = ld16(f + 8);
++					x->range = ld32(f + 10);
++					x->res = ld32(f + 14);
++				}
++				if (sid != s->id) {
++					LOG("10: smgr id 0x%02x: data type %u says sensor id 0x%02x", s->id, dt, sid);
++				}
++				k = kv + vl + 18;
++			}
++			if (i < v[0]) {
++				LOG("10: smgr id 0x%02x: data type %u of %u overruns TLV 0x03 (%u bytes)", s->id, i, v[0], l);
++			}
++		} else if (t == 0x13 && l >= 1) {
++			uint32_t k = 1;
++			for (uint32_t i = 0; i < v[0] && k + 1 <= l; i++) {
++				uint8_t rc = v[k];
++				if (k + 1 + 2u * rc > l) {
++					break;
++				}
++				if (i < s->ndt) {
++					struct smgr_dt *x = &s->dt[i];
++					x->nrates = (uint8_t)(rc < SMGR_MAX_RATES ? rc : SMGR_MAX_RATES);
++					for (uint32_t j = 0; j < x->nrates; j++) {
++						x->rates[j] = ld16(v + k + 1 + 2 * j);
++					}
++				}
++				k += 1u + 2u * rc;
++			}
++		} else if ((t == 0x10 || t == 0x14) && l >= 1) {
++			if (el + 16 < sizeof(extra)) {
++				el += (size_t)snprintf(extra + el, sizeof(extra) - el, " %#x[%u]:", t, v[0]);
++			}
++			for (uint32_t i = 0; i < v[0] && i < 4 && 1 + 4 * (i + 1) <= l && el + 16 < sizeof(extra); i++) {
++				el += (size_t)snprintf(extra + el, sizeof(extra) - el, " %#x", ld32(v + 1 + 4 * i));
++			}
++		} else if (t == 0x11 && l >= 4) {
++			if (el + 24 < sizeof(extra)) {
++				el += (size_t)snprintf(extra + el, sizeof(extra) - el, " 0x11: %#x", ld32(v));
++			}
++		} else if (t == 0x12 && l >= 1) {
++			if (el + 16 < sizeof(extra)) {
++				el += (size_t)snprintf(extra + el, sizeof(extra) - el, " 0x12[%u]:", v[0]);
++			}
++			for (uint32_t i = 0; i < v[0] && i < 4 && 1 + 8 * (i + 1) <= l && el + 24 < sizeof(extra); i++) {
++				el += (size_t)snprintf(extra + el, sizeof(extra) - el, " %#llx",
++				    (unsigned long long)ld32(v + 1 + 8 * i) | ((unsigned long long)ld32(v + 5 + 8 * i) << 32));
++			}
++		} else if (el + 24 < sizeof(extra)) {
++			el += (size_t)snprintf(extra + el, sizeof(extra) - el, " %#x(%u bytes, not decoded)", t, l);
++		}
++	}
++	s->info = true;
++	LOG("10: t=%u.%03u smgr id 0x%02x '%s': SINGLE_SENSOR_INFO result %u error %u, %u data types", T, s->id, s->type,
++	    res, err, s->ndt);
++	for (uint32_t i = 0; i < s->ndt; i++) {
++		struct smgr_dt *x = &s->dt[i];
++		char rng[24], rs[24], rates[80];
++		size_t rl = 0;
++		q16_fmt(rng, sizeof(rng), (int32_t)x->range, 3);
++		q16_fmt(rs, sizeof(rs), (int32_t)x->res, 6);
++		rates[0] = 0;
++		for (uint32_t j = 0; j < x->nrates && rl + 8 < sizeof(rates); j++) {
++			rl += (size_t)snprintf(rates + rl, sizeof(rates) - rl, " %u", x->rates[j]);
++		}
++		LOG("10: smgr id 0x%02x %s dt %u: name '%s' vendor '%s', max %u Hz, %u uA, range %#x (%s as Q16), "
++		    "resolution %#x (%s as Q16), val1 %#x val2 %#x, native rates:%s", s->id, s->type, x->dt, x->name,
++		    x->vendor, x->max_hz, x->cur_ua, x->range, rng, x->res, rs, x->val1, x->val2, x->nrates != 0 ? rates : " none");
++	}
++	if (el != 0) {
++		LOG("10: smgr id 0x%02x other TLVs:%s", s->id, extra);
++	}
++	smgr_cur++;
++	smgr_state = SM_INFO;
++}
++
++static void
++m4_summary(void)
++{
++	char line[200];
++	size_t n = 0;
++	uint32_t answered = 0;
++	line[0] = 0;
++	for (uint32_t i = 0; i < smgr_ns; i++) {
++		answered += smgr_s[i].info ? 1 : 0;
++		if (n + 40 < sizeof(line)) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " 0x%02x %s%s%s", smgr_s[i].id, smgr_s[i].type,
++			    smgr_s[i].ndt != 0 ? "/" : "", smgr_s[i].ndt != 0 ? smgr_s[i].dt[0].name : "");
++		}
++	}
++	LOG("10: t=%u.%03u M4: SMGR census: %u sensors, %u answered SINGLE_SENSOR_INFO:%s", T, smgr_ns, answered, line);
++}
++
++/* taimenaccelmap=SASASA: for iOS x, y, z an optional sign (+/-) and the SMGR axis (x/y/z) */
++static void
++amap_load(void)
++{
++	char s[16];
++	struct amap_e m[3];
++	uint32_t i = 0, used = 0;
++
++	bzero(s, sizeof(s));
++	if (!PE_parse_boot_arg_str("taimenaccelmap", s, (int)sizeof(s))) {
++		LOG("11: axis map %s (iOS x y z from SMGR's; the plan's default, unverified)", amap_str);
++		return;
++	}
++	bool ok = true;
++	for (unsigned k = 0; k < 3 && ok; k++) {
++		int8_t sign = 1;
++		if (s[i] == '+' || s[i] == '-') {
++			sign = s[i] == '-' ? -1 : 1;
++			i++;
++		}
++		char c = lower(s[i]);
++		ok = c >= 'x' && c <= 'z' && (used & (1u << (c - 'x'))) == 0;
++		if (ok) {
++			used |= 1u << (c - 'x');
++			m[k].src = (uint8_t)(c - 'x');
++			m[k].sign = sign;
++			i++;
++		}
++	}
++	if (!ok || s[i] != 0) {
++		LOG("11: taimenaccelmap=%s not understood (want e.g. +y+x-z: sign and SMGR axis for iOS x, y, z); "
++		    "keeping %s", s, amap_str);
++		return;
++	}
++	memcpy(amap, m, sizeof(amap));
++	for (unsigned k = 0; k < 3; k++) {
++		amap_str[2 * k] = amap[k].sign < 0 ? '-' : '+';
++		amap_str[2 * k + 1] = (char)('x' + amap[k].src);
++	}
++	amap_str[6] = 0;
++	LOG("11: axis map %s from taimenaccelmap (iOS x y z from SMGR's)", amap_str);
++}
++
++static void
++accel_buffering(void)
++{
++	uint8_t m[48], it[9];
++	uint8_t rid = (uint8_t)accel_sid, act = 1;
++	uint32_t rate = (uint32_t)accel_hz << 16, n = 7;
++
++	n = qm_tlv(m, n, 0x01, &rid, 1);
++	n = qm_tlv(m, n, 0x02, &act, 1);
++	n = qm_tlv(m, n, 0x03, &rate, 4);
++	it[0] = 1;
++	it[1] = rid;
++	it[2] = 0;                                  /* data type 0, the primary */
++	st16(it + 3, 3);
++	st16(it + 5, (uint16_t)accel_hz);
++	st16(it + 7, 1);
++	n = qm_tlv(m, n, 0x04, it, 9);
++	smgr_send(m, n, SMGR_MSG_BUFFERING);
++	smgr_state = SM_WAIT_BUF;
++	LOG("11: t=%u.%03u smgr: BUFFERING add (txn %u): report id 0x%02x, report rate %#x (%d Hz x 65536), "
++	    "item {0x%02x, 0, 3, %d, 1}", T, smgr_wait_txn, rid, rate, accel_hz, rid, accel_hz);
++}
++
++/* M5: the accelerometer is the sensor of type ACCEL, else the one whose data type 0 is named so */
++static void
++accel_start(void)
++{
++	struct smgr_sensor *a = NULL;
++	const char *why = "";
++
++	for (uint32_t i = 0; i < smgr_ns && a == NULL; i++) {
++		if (strlen(smgr_s[i].type) == 5 && ci_has(smgr_s[i].type, "accel")) {
++			a = &smgr_s[i];
++			why = "its ALL_SENSOR_INFO type is ACCEL";
++		}
++	}
++	for (uint32_t i = 0; i < smgr_ns && a == NULL; i++) {
++		if (smgr_s[i].ndt != 0 && ci_has(smgr_s[i].dt[0].name, "accel")) {
++			a = &smgr_s[i];
++			why = "its data type 0 is named accel...";
++		}
++	}
++	if (a == NULL) {
++		LOG("11: t=%u.%03u no accelerometer among %u sensors (no type ACCEL, no data type 0 named accel); M5 stops", T,
++		    smgr_ns);
++		smgr_state = SM_DONE;
++		return;
++	}
++	int hz = 50;
++	(void)PE_parse_boot_argn("taimenaccelhz", &hz, sizeof(hz));
++	if (hz < 1 || hz > 1000) {
++		hz = 50;
++	}
++	uint32_t max = a->ndt != 0 ? a->dt[0].max_hz : 0;
++	if (max != 0 && (uint32_t)hz > max) {
++		hz = (int)max;
++	}
++	accel_hz = hz;
++	accel_sid = a->id;
++	smgr_tries = 0;
++	LOG("11: t=%u.%03u accel: sensor id 0x%02x, because %s: data type 0 '%s' vendor '%s', max %u Hz; %d Hz, one sample "
++	    "per report, report id = sensor id; axis map %s", T, a->id, why, a->ndt != 0 ? a->dt[0].name : "?",
++	    a->ndt != 0 ? a->dt[0].vendor : "?", max, hz, amap_str);
++	accel_buffering();
++}
++
++static void
++smgr_buf_rx(const uint8_t *d, uint32_t len)
++{
++	uint32_t o = 7, res = 0xFFFFu, err = 0;
++	int rid = -1, ack = -1;
++	uint8_t t = 0;
++	const uint8_t *v = NULL;
++	uint16_t l = 0;
++
++	while (qm_next(d, len, &o, &t, &v, &l)) {
++		if (t == 0x02) {
++			qm_result(v, l, &res, &err);
++		} else if (t == 0x10 && l >= 1) {
++			rid = v[0];
++		} else if (t == 0x11 && l >= 1) {
++			ack = v[0];
++		} else {
++			LOG("11: smgr: BUFFERING response TLV %#x, %u bytes (not decoded)", t, l);
++		}
++	}
++	LOG("11: t=%u.%03u smgr: BUFFERING add -> result %u error %u, report id %d, ack/nak %d", T, res, err, rid, ack);
++	if (res != 0) {
++		smgr_state = SM_DONE;
++		LOG("11: the SMGR refused the accelerometer stream; M5 stops");
++		return;
++	}
++	smgr_state = SM_STREAM;
++	acc_t0 = acc_win_ms = now_ms();
++	acc_next_ms = acc_t0 + 1000;
++}
++
++static void
++accel_sample(const int32_t r[3], uint32_t ts, const uint8_t *meta, const uint8_t *s)
++{
++	int mg[3];
++	for (unsigned i = 0; i < 3; i++) {
++		int64_t q = (int64_t)r[amap[i].src] * amap[i].sign;
++		mg[i] = (int)(q * 1000 / Q16_G);
++	}
++	acc_samples++;
++	acc_win++;
++	memcpy(acc_raw, r, sizeof(acc_raw));
++	memcpy(acc_mg, mg, sizeof(acc_mg));
++	if (acc_logged < 8) {
++		acc_logged++;
++		char a[3][24], m[24];
++		uint64_t sq = (uint64_t)((int64_t)r[0] * r[0]) + (uint64_t)((int64_t)r[1] * r[1]) +
++		    (uint64_t)((int64_t)r[2] * r[2]);
++		uint64_t mag = isqrt64(sq);
++		for (unsigned i = 0; i < 3; i++) {
++			q16_fmt(a[i], sizeof(a[i]), r[i], 3);
++		}
++		q16_fmt(m, sizeof(m), mag > 0x7FFFFFFFull ? 0x7FFFFFFF : (int32_t)mag, 3);
++		LOG("11: t=%u.%03u accel sample %u: raw %d %d %d = %s %s %s, |a| %s (Q16.16; m/s2 if about 9.8 at rest), "
++		    "ts %u (+%u ticks), meta %#x %u %#x, extra %u %u %#x -> iOS %d %d %d mg", T, acc_samples, r[0], r[1], r[2],
++		    a[0], a[1], a[2], m, ts, acc_samples > 1 ? ts - acc_last_ts : 0, meta != NULL ? ld32(meta) : 0,
++		    meta != NULL ? meta[4] : 0, meta != NULL ? ld32(meta + 9) : 0, s[12], s[13], ld16(s + 14), mg[0], mg[1], mg[2]);
++	}
++	acc_last_ts = ts;
++	if (sweet_hid_accel_sample(mg[0], mg[1], mg[2]) == 0) {
++		acc_hid_missing++;
++	}
++}
++
++static void
++smgr_report_rx(const uint8_t *d, uint32_t len)
++{
++	uint32_t o = 7;
++	int rid = -1;
++	uint8_t t = 0;
++	const uint8_t *v = NULL, *meta = NULL, *smp = NULL;
++	uint16_t l = 0, sl = 0;
++
++	while (qm_next(d, len, &o, &t, &v, &l)) {
++		if (t == 0x01 && l >= 1) {
++			rid = v[0];
++		} else if (t == 0x02 && l >= 13) {
++			meta = v;
++		} else if (t == 0x03 && l >= 1) {
++			smp = v;
++			sl = l;
++		} else if (t != 0x10 && acc_odd_tlvs++ < 8) {
++			LOG("11: smgr report: TLV %#x, %u bytes (not decoded)", t, l);
++		}
++	}
++	if (accel_sid < 0 || rid != accel_sid) {
++		if (acc_other_ids++ < 8) {
++			LOG("11: t=%u.%03u smgr report for id %d (ours %d), %u bytes: ignored", T, rid, accel_sid, len);
++		}
++		return;
++	}
++	acc_reports++;
++	acc_win_reports++;
++	if (smp == NULL) {
++		return;
++	}
++	uint32_t ts = meta != NULL ? ld32(meta + 5) : 0;
++	for (uint32_t i = 0; i < smp[0] && 1 + 16 * (i + 1) <= sl; i++) {
++		const uint8_t *s = smp + 1 + 16 * i;
++		int32_t r[3] = { (int32_t)ld32(s), (int32_t)ld32(s + 4), (int32_t)ld32(s + 8) };
++		accel_sample(r, ts, meta, s);
++	}
++}
++
++/* responses to our requests and the SMGR's indications, on port 0x4003 */
++static void
++smgr_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	uint8_t type = d[0];
++	uint16_t txn = ld16(d + 1), msg = ld16(d + 3), ql = ld16(d + 5);
++
++	if (7u + ql < len) {
++		len = 7u + ql;
++	}
++	if (type == QMI_IND && msg == SMGR_MSG_REPORT) {
++		smgr_report_rx(d, len);
++		return;
++	}
++	bool want = type == QMI_RESP && txn == smgr_wait_txn &&
++	    ((msg == SMGR_MSG_ALL_INFO && smgr_state == SM_WAIT_ALL) ||
++	    (msg == SMGR_MSG_ONE_INFO && smgr_state == SM_WAIT_ONE) ||
++	    (msg == SMGR_MSG_BUFFERING && smgr_state == SM_WAIT_BUF));
++	if (!want) {
++		if (smgr_stray++ < 16) {
++			LOG("10: t=%u.%03u smgr: QMI type %u msg %#x txn %u from %u:%#x, %u bytes: not expected (state %u, txn %u)",
++			    T, type, msg, txn, node, port, len, smgr_state, smgr_wait_txn);
++		}
++		return;
++	}
++	if (msg == SMGR_MSG_ALL_INFO) {
++		smgr_all_rx(d, len);
++	} else if (msg == SMGR_MSG_ONE_INFO) {
++		smgr_one_rx(d, len);
++	} else {
++		smgr_buf_rx(d, len);
++	}
++}
++
++static void
++accel_stats(uint64_t now)
++{
++	if (now < acc_next_ms) {
++		return;
++	}
++	char m[24];
++	uint64_t sq = (uint64_t)((int64_t)acc_raw[0] * acc_raw[0]) + (uint64_t)((int64_t)acc_raw[1] * acc_raw[1]) +
++	    (uint64_t)((int64_t)acc_raw[2] * acc_raw[2]);
++	uint64_t mag = isqrt64(sq);
++	q16_fmt(m, sizeof(m), mag > 0x7FFFFFFFull ? 0x7FFFFFFF : (int32_t)mag, 3);
++	LOG("11: t=%u.%03u accel %d Hz: %u samples in %llu ms (%u reports), last iOS %d %d %d mg, |a| %s, raw %d %d %d; "
++	    "%u samples in %u reports in all%s", T, accel_hz, acc_win, now - acc_win_ms, acc_win_reports, acc_mg[0], acc_mg[1],
++	    acc_mg[2], m, acc_raw[0], acc_raw[1], acc_raw[2], acc_samples, acc_reports,
++	    acc_hid_missing != 0 ? " (no SweetHIDAccel to take them)" : "");
++	acc_win = 0;
++	acc_win_reports = 0;
++	acc_win_ms = now;
++	acc_next_ms = now + (now - acc_t0 < 10000 ? 1000 : 60000);
++}
++
++/* M4 and M5, a step per loop pass */
++static void
++smgr_poll(void)
++{
++	if (sens_level < 5 || smgr_s == NULL || smgr_node == 0xFFFFFFFFu || !glink_chan_up(QCHAN)) {
++		return;
++	}
++	uint64_t now = now_ms();
++	switch (smgr_state) {
++	case SM_IDLE:
++		/* the SMGR reads its registry first: 1 s after it appeared and 1 s without a group read */
++		if (now - smgr_up_ms >= 1000 && now - reg_last_ms >= 1000) {
++			smgr_ask_all();
++		}
++		break;
++	case SM_RETRY_ALL:
++		if (now >= smgr_next_ms) {
++			smgr_ask_all();
++		}
++		break;
++	case SM_WAIT_ALL:
++		if (now - smgr_sent_ms >= SMGR_WAIT_MS) {
++			LOG("10: t=%u.%03u smgr: no answer to ALL_SENSOR_INFO (txn %u) in %u ms", T, smgr_wait_txn, SMGR_WAIT_MS);
++			if (++smgr_tries < 5) {
++				smgr_state = SM_RETRY_ALL;
++				smgr_next_ms = now;
++			} else {
++				smgr_state = SM_DONE;
++				LOG("10: smgr: never answered; M4 stops");
++			}
++		}
++		break;
++	case SM_INFO:
++		if (smgr_cur < smgr_ns) {
++			smgr_ask_one(smgr_s[smgr_cur].id);
++		} else {
++			m4_summary();
++			smgr_state = sens_level >= 6 ? SM_PICK : SM_DONE;
++		}
++		break;
++	case SM_WAIT_ONE:
++		if (now - smgr_sent_ms >= SMGR_WAIT_MS) {
++			LOG("10: t=%u.%03u smgr id 0x%02x: no answer to SINGLE_SENSOR_INFO (txn %u) in %u ms", T,
++			    smgr_s[smgr_cur].id, smgr_wait_txn, SMGR_WAIT_MS);
++			smgr_cur++;
++			smgr_state = SM_INFO;
++		}
++		break;
++	case SM_PICK:
++		accel_start();
++		break;
++	case SM_WAIT_BUF:
++		if (now - smgr_sent_ms >= SMGR_WAIT_MS) {
++			LOG("11: t=%u.%03u smgr: no answer to BUFFERING (txn %u) in %u ms", T, smgr_wait_txn, SMGR_WAIT_MS);
++			if (++smgr_tries < 3) {
++				accel_buffering();
++			} else {
++				smgr_state = SM_DONE;
++				LOG("11: no accelerometer stream; M5 stops");
++			}
++		}
++		break;
++	case SM_STREAM:
++		accel_stats(now);
++		break;
++	default:
++		break;
++	}
++}
++
+ /* ---------------------------------------------------------------- M3: the loop (0340) */
+ 
+ #define M3_WINDOW_MS            20000
+@@ -1860,7 +2597,16 @@ m3_run(int level)
+ {
+ 	LOG("7: M3 (taimensensors=%d): GLINK on the dsps edge (APCS bit %u), QRTR, SNS_REG; t= is from AUTH_AND_RESET",
+ 	    level, SLPI_GLINK_BIT);
++	sens_level = level;
+ 	reg_load();
++	if (level >= 5) {
++		smgr_s = (struct smgr_sensor *)IOMallocZero(SMGR_MAX_SENSORS * sizeof(struct smgr_sensor));
++		LOG("10: M4 (taimensensors>=5): the SMGR census once SMGR is up and its registry reads are done%s%s",
++		    level >= 6 ? "; M5: the accelerometer stream" : "", smgr_s == NULL ? " (NO MEMORY: off)" : "");
++		if (level >= 6) {
++			amap_load();
++		}
++	}
+ 	if (!glink_init()) {
+ 		return;
+ 	}
+@@ -1874,6 +2620,7 @@ m3_run(int level)
+ 	for (;;) {
+ 		bool busy = glink_poll();
+ 		qrtr_poll();
++		smgr_poll();
+ 		if (!summary && now_ms() - start >= M3_WINDOW_MS) {
+ 			summary = true;
+ 			m3_summary("");
+@@ -1903,7 +2650,8 @@ m3_run(int level)
+ 		if (busy) {
+ 			IODelay(200);
+ 		} else {
+-			IOSleep(summary ? 20 : 2);
++			/* 0341: 5 ms while the accelerometer streams (plan risk 11) */
++			IOSleep(!summary ? 2 : smgr_state == SM_STREAM ? 5 : 20);
+ 		}
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 63eed01..068d684 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -555,6 +555,7 @@ public:
+ 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
+ 	void sample(int mx, int my, int mz);
++	void realSample(int mx, int my, int mz);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 3; }
+@@ -568,6 +569,8 @@ private:
+ 	volatile int fMg[3];            /* the current sample, milli-g */
+ 	volatile UInt32 fIntervalUS;    /* 0: not streaming */
+ 	UInt32 fSent, fSaid;
++	volatile uint64_t fRealAt;      /* 0341: mach time of the last real sensor sample (0: synthetic only) */
++	UInt32 fCandidate, fSteady;     /* 0341: the orientation the real samples settle on */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDAccel, IOHIDEventService);
+ static SweetHIDAccel *gSweetAccel;
+@@ -613,6 +616,13 @@ SweetHIDAccel::tick(OSObject *owner, IOTimerEventSource *sender)
+ 	if (us == 0) {
+ 		return;
+ 	}
++	/* 0341: while a real sensor delivers (realSample), its samples are the stream */
++	uint64_t stale;
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &stale);
++	if (me->fRealAt != 0 && mach_absolute_time() - me->fRealAt < stale) {
++		sender->setTimeoutUS(us);
++		return;
++	}
+ 	IOHIDEvent *e = me->event();
+ 	if (e) {
+ 		me->dispatchEvent(e);
+@@ -699,6 +709,35 @@ SweetHIDAccel::sample(int mx, int my, int mz)
+ 	}
+ }
+ 
++/*
++ * 0341: a real sensor's sample (TaimenSensors.cpp M5, about 50 Hz): no log line; dispatched only while
++ * a client streams (ReportInterval > 0), and then the timer stops resending the last sample; the
++ * orientation follows once it held for 10 samples.
++ */
++void
++SweetHIDAccel::realSample(int mx, int my, int mz)
++{
++	fMg[0] = mx;
++	fMg[1] = my;
++	fMg[2] = mz;
++	fRealAt = mach_absolute_time();
++	if (fIntervalUS != 0) {
++		IOHIDEvent *e = event();
++		if (e) {
++			dispatchEvent(e);
++			e->release();
++			fSent++;
++		}
++	}
++	UInt32 o = orientation_of(mx, my, mz);
++	if (o != fCandidate) {
++		fCandidate = o;
++		fSteady = 0;
++	} else if (fSteady < 10 && ++fSteady == 10 && gSweetOrientation) {
++		gSweetOrientation->update(o);
++	}
++}
++
+ bool
+ SweetHIDKeyboard::start(IOService *provider)
+ {
+@@ -966,6 +1005,18 @@ sweet_hid_accel(int mx, int my, int mz)
+ 	return 1;
+ }
+ 
++/* 0341: the same from a real sensor (TaimenSensors.cpp M5), quiet for 50 Hz */
++extern "C" int sweet_hid_accel_sample(int mx, int my, int mz);
++extern "C" int
++sweet_hid_accel_sample(int mx, int my, int mz)
++{
++	if (!gSweetAccel) {
++		return 0;
++	}
++	gSweetAccel->realSample(mx, my, mz);
++	return 1;
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
