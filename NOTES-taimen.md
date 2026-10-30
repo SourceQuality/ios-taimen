@@ -1439,3 +1439,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   under them. Tapping the search field aborted Maps (as in boot 203): CoreImage, from MapKit, asked the device for
   Metal's private -sharedMemorySize. The frontend now answers it (physical memory) and dedicatedMemorySize (0)
   (8330efe). M4 again 0 PMIC retries; one driverkitd crash; hottest 55.0 C.
+- 2026-10-30 **boot 209 (r171, SweetMetal-33832561 = 8330efe, sweetgl b1c81af): Maps searches.** The search field
+  opens the sheet (Find Nearby: Restaurants, Gas Stations, ...) with the keyboard; "Coffee" finds 50 places through
+  the PC's proxy, pins them on the map with clustered counts, and lists them with hours, Yelp ratings and photos.
+  No crash. Still refused: one metallib of LibraryKind(1) (a dynamic library) and 26 render pipelines whose
+  fragment functions read the framebuffer in a multisampled pass: metal2vulkan's per-sample storage form needs
+  sampleRateShading, which the a540 profile does not have. Nothing visible missed them at continent scale.
