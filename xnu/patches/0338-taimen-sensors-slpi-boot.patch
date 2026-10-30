@@ -1,0 +1,436 @@
+diff --git a/iokit/Kernel/arm/TaimenSensors.cpp b/iokit/Kernel/arm/TaimenSensors.cpp
+index 88aadf6..ab16131 100644
+--- a/iokit/Kernel/arm/TaimenSensors.cpp
++++ b/iokit/Kernel/arm/TaimenSensors.cpp
+@@ -15,6 +15,14 @@
+  *     against its carve-out (pil_slpi_region 0x94b00000 + 15 MB, below XNU's RAM).
+  * SMEM is read as TaimenAudio.cpp reads it; only a partition APPS is a host of is opened (another
+  * pair's header hung a CPU, boot 109).
++ *
++ * 0338, plan M2 (taimensensors>=3): boot it, as TaimenAudio.cpp's stage 2 boots the ADSP. Never over
++ * stale state (item 481 present: the SLPI ran since the reset). Proxy votes: SSC CX at turbo (RPM
++ * "rwsc" level 0x180) and the LVS2 1.8 V switch (RPM "vsa" 2, swen). Our SMP2P out item 430 with
++ * "master-kernel" = 0 (doorbell APCS IPC bit 26). Then TZ PAS 12: the metadata from a pool in free
++ * low RAM (0x8a800000, after TaimenAudio's at 0x8a000000), PAS_INIT_IMAGE, PAS_MEM_SETUP over the
++ * carve-out, the segments copied to paddr - lo, PAS_AUTH_AND_RESET; then 5 s for the SLPI's SMP2P
++ * item 481 and its "slave-kernel" READY bit, else its crash reason (item 424).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -29,6 +37,7 @@
+ extern "C" int taimen_fw_load(const char *path, uint32_t max, void **data, uint32_t *len);   /* taimen_fwfile.c */
+ extern "C" void taimen_fw_free(void *data, uint32_t len);
+ extern "C" void taimen_sensors_init(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN SENSORS: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -41,6 +50,26 @@ extern "C" void taimen_sensors_init(void);
+ #define SLPI_SIZE               0x00f00000u
+ #define FW_DIR                  "/usr/standalone/firmware/taimen-sensors/"
+ #define SCM_FN(svc, cmd)        (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++#define TCSR_MUTEX_PA           0x01F40000ull
++#define SMEM_HWLOCK             3
++#define APCS_GLB_PA             0x17911000ull
++#define APCS_IPC                0x008
++#define SLPI_SMP2P_BIT          26
++#define ITEM_SMP2P_OUT          430             /* apps -> slpi */
++#define ITEM_SMP2P_IN           481             /* slpi -> apps */
++#define ITEM_CRASH              424
++#define POOL_PA                 0x8A800000ull   /* free low RAM (88f00000-8aafffff), after TaimenAudio's pool */
++#define POOL_SIZE               0x00100000ull
++#define SMP2P_MAGIC             0x504D5324u     /* "$SMP" */
++#define SMP2P_MAX_ENTRY         16
++#define SLAVE_ERR_FATAL         (1u << 0)
++#define SLAVE_READY             (1u << 1)
++#define RPM_RWSC                0x63737772u     /* "rwsc" */
++#define RPM_VSA                 0x00617376u     /* "vsa" */
++#define RPM_SWEN                0x6e657773u     /* "swen" */
++
++extern "C" bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
++extern "C" bool sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+ 
+ #define PT_LOAD                 1
+ #define MDT_TYPE_MASK           (7u << 24)
+@@ -68,6 +97,10 @@ struct smem_pt_entry { uint32_t offset, size, flags; uint16_t host0, host1; uint
+ struct smem_pt { uint8_t magic[4]; uint32_t version, num_entries, rsvd[5]; } __attribute__((packed));
+ struct smem_part_hdr { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, free_uncached, free_cached, rsvd[3]; } __attribute__((packed));
+ struct smem_priv_entry { uint16_t canary, item; uint32_t size; uint16_t pad_data, pad_hdr; uint32_t rsvd; } __attribute__((packed));
++struct smp2p_hdr { uint32_t magic; uint8_t version, features[3]; uint16_t local_pid, remote_pid, total, valid; uint32_t flags; } __attribute__((packed));
++struct smp2p_entry { char name[16]; uint32_t value; } __attribute__((packed));
++
++static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
+ 
+ static uint8_t *smem;
+ 
+@@ -297,6 +330,360 @@ fw_census(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- M2: the SLPI by PAS (0338) */
++
++static IOMemoryMap *rw_map, *pool_map;
++static uint8_t *pool;
++static uint64_t pool_used;
++static volatile uint32_t *smem_mutex, *apcs;
++static struct smem_part_hdr *slpi_part;
++static uint32_t slpi_cacheline;
++
++static bool
++open_rw(void)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SMEM_PA, SMEM_SIZE, kIODirectionInOut);
++	rw_map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	md = IOMemoryDescriptor::withPhysicalAddress(POOL_PA, POOL_SIZE, kIODirectionInOut);
++	pool_map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	smem_mutex = (volatile uint32_t *)ml_io_map(TCSR_MUTEX_PA + SMEM_HWLOCK * 0x1000, 0x1000);
++	apcs = (volatile uint32_t *)ml_io_map(APCS_GLB_PA, 0x1000);
++	if (rw_map == NULL || pool_map == NULL || smem_mutex == NULL || apcs == NULL) {
++		LOG("6: maps failed (smem %p, pool %p, mutex %p, apcs %p)", rw_map, pool_map, smem_mutex, apcs);
++		return false;
++	}
++	smem = (uint8_t *)rw_map->getVirtualAddress();
++	pool = (uint8_t *)pool_map->getVirtualAddress();
++	struct smem_pt_entry *pe = smem_pt_find(HOST_APPS, HOST_SLPI);
++	if (pe == NULL) {
++		LOG("6: no APPS<->SLPI partition");
++		return false;
++	}
++	slpi_part = (struct smem_part_hdr *)(smem + pe->offset);
++	slpi_cacheline = pe->cacheline;
++	return memcmp(slpi_part->magic, "$PRT", 4) == 0;
++}
++
++static void *
++pool_alloc(uint64_t size, uint64_t *pa)
++{
++	size = (size + 0xfff) & ~0xfffull;
++	if (pool == NULL || pool_used + size > POOL_SIZE) {
++		return NULL;
++	}
++	*pa = POOL_PA + pool_used;
++	void *va = pool + pool_used;
++	pool_used += size;
++	bzero(va, size);
++	return va;
++}
++
++/* The TCSR hwlock: write the APPS id 1, ours if it reads back (shared with TaimenAudio and TaimenModem). */
++static bool
++smem_lock(void)
++{
++	for (unsigned i = 0; i < 100000; i++) {
++		*smem_mutex = 1;
++		mb();
++		if (*smem_mutex == 1) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static void
++smem_unlock(void)
++{
++	mb();
++	*smem_mutex = 0;
++	mb();
++}
++
++static void *
++smem_alloc(uint16_t item, uint32_t size)
++{
++	struct smem_part_hdr *p = slpi_part;
++	uint32_t aligned = (size + 7) & ~7u, need = sizeof(struct smem_priv_entry) + aligned, n = 0;
++	void *v = smem_part_get(p, slpi_cacheline, item, &n);
++	if (v != NULL || !smem_lock()) {
++		return v;
++	}
++	v = smem_part_get(p, slpi_cacheline, item, &n);
++	if (v == NULL && p->free_uncached + need <= p->free_cached) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)((uint8_t *)p + p->free_uncached);
++		h->canary = 0xA5A5;
++		h->item = item;
++		h->size = aligned;
++		h->pad_data = (uint16_t)(aligned - size);
++		h->pad_hdr = 0;
++		h->rsvd = 0;
++		v = h + 1;
++		bzero(v, aligned);
++		mb();
++		p->free_uncached += need;
++		mb();
++	} else if (v == NULL) {
++		LOG("6: SMEM partition full: %#x..%#x, need %#x", p->free_uncached, p->free_cached, need);
++	}
++	smem_unlock();
++	return v;
++}
++
++static void
++apcs_kick(unsigned bit)
++{
++	mb();
++	apcs[APCS_IPC / 4] = 1u << bit;
++	mb();
++}
++
++static volatile uint32_t *
++smp2p_find(struct smp2p_hdr *h, const char *name)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(h + 1);
++	char want[16] = {};
++	memcpy(want, name, strlen(name) < 16 ? strlen(name) : 15);
++	for (uint32_t i = 0; i < h->valid && i < SMP2P_MAX_ENTRY; i++) {
++		if (memcmp(e[i].name, want, 16) == 0) {
++			return &e[i].value;
++		}
++	}
++	return NULL;
++}
++
++static struct smp2p_hdr *
++smp2p_create_out(void)
++{
++	struct smp2p_hdr *o = (struct smp2p_hdr *)smem_alloc(ITEM_SMP2P_OUT,
++	    sizeof(struct smp2p_hdr) + SMP2P_MAX_ENTRY * sizeof(struct smp2p_entry));
++	if (o == NULL || o->version != 0) {
++		return o;
++	}
++	o->magic = SMP2P_MAGIC;
++	o->local_pid = HOST_APPS;
++	o->remote_pid = HOST_SLPI;
++	o->total = SMP2P_MAX_ENTRY;
++	o->valid = 0;
++	o->features[0] = 1;                         /* SSR_ACK */
++	mb();
++	o->version = 1;                             /* validates the item */
++	apcs_kick(SLPI_SMP2P_BIT);
++	return o;
++}
++
++static bool
++smp2p_add(struct smp2p_hdr *o, const char *name, uint32_t value)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(o + 1);
++	if (smp2p_find(o, name) != NULL) {
++		return true;
++	}
++	if (o->valid >= o->total || o->valid >= SMP2P_MAX_ENTRY) {
++		return false;
++	}
++	bzero(e[o->valid].name, sizeof(e[o->valid].name));
++	memcpy(e[o->valid].name, name, strlen(name) < 16 ? strlen(name) : 15);
++	e[o->valid].value = value;
++	mb();
++	o->valid++;
++	apcs_kick(SLPI_SMP2P_BIT);
++	return true;
++}
++
++static void
++crash_reason(void)
++{
++	struct smem_header *g = (struct smem_header *)smem;
++	uint32_t n = 0;
++	const char *r = NULL;
++	if (g->toc[ITEM_CRASH].allocated && g->toc[ITEM_CRASH].offset < SMEM_SIZE) {
++		r = (const char *)(smem + g->toc[ITEM_CRASH].offset);
++		n = g->toc[ITEM_CRASH].size;
++	} else {
++		r = (const char *)smem_part_get(slpi_part, slpi_cacheline, ITEM_CRASH, &n);
++	}
++	if (r == NULL || n == 0) {
++		LOG("6: no crash reason (item %u)", ITEM_CRASH);
++		return;
++	}
++	char buf[160];
++	uint32_t k = 0;
++	for (uint32_t i = 0; i < n && k + 1 < sizeof(buf); i++) {
++		if (r[i] == 0) {
++			break;
++		}
++		buf[k++] = (r[i] >= 0x20 && r[i] < 0x7f) ? r[i] : '.';
++	}
++	buf[k] = 0;
++	LOG("6: crash reason (item %u, %u bytes): %s", ITEM_CRASH, n, buf);
++}
++
++/* mainline qcom_mdt_load + qcom_scm_pas_auth_and_reset, the segments from the root */
++static bool
++pas_boot(void)
++{
++	void *mdt = NULL;
++	uint32_t mdt_len = 0;
++	if (taimen_fw_load(FW_DIR "slpi_v2.mdt", 1u << 20, &mdt, &mdt_len) != 0) {
++		LOG("6: no slpi_v2.mdt");
++		return false;
++	}
++	const struct elf32_ehdr *eh = (const struct elf32_ehdr *)mdt;
++	const struct elf32_phdr *ph = (const struct elf32_phdr *)((const uint8_t *)mdt + eh->e_phoff);
++	uint64_t meta_pa = 0, r1 = 0;
++	uint8_t *meta = (uint8_t *)pool_alloc(mdt_len, &meta_pa);
++	if (meta == NULL) {
++		LOG("6: no pool room for the %u-byte metadata", mdt_len);
++		taimen_fw_free(mdt, mdt_len);
++		return false;
++	}
++	memcpy(meta, mdt, mdt_len);
++	mb();
++	uint64_t r = scm(SCM_FN(2, 1), 2u | (2u << 6), SLPI_PAS_ID, meta_pa, 0, &r1);
++	LOG("6: PAS_INIT_IMAGE(%u, meta %#llx, %u bytes) -> %lld/%llu", SLPI_PAS_ID, meta_pa, mdt_len, (long long)r, r1);
++	if (r != 0 || r1 != 0) {
++		taimen_fw_free(mdt, mdt_len);
++		return false;
++	}
++	uint32_t lo = ~0u, hi = 0;
++	for (unsigned i = 0; i < eh->e_phnum; i++) {
++		if (ph[i].p_type != PT_LOAD || (ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || ph[i].p_memsz == 0) {
++			continue;
++		}
++		lo = ph[i].p_paddr < lo ? ph[i].p_paddr : lo;
++		uint32_t end = (ph[i].p_paddr + ph[i].p_memsz + 0xfff) & ~0xfffu;
++		hi = end > hi ? end : hi;
++	}
++	if (hi <= lo || hi - lo > SLPI_SIZE) {
++		LOG("6: image %#x..%#x does not fit the carve-out", lo, hi);
++		taimen_fw_free(mdt, mdt_len);
++		return false;
++	}
++	r = scm(SCM_FN(2, 2), 3, SLPI_PAS_ID, SLPI_PA, hi - lo, &r1);
++	LOG("6: PAS_MEM_SETUP(%#llx + %#x) for %#x..%#x -> %lld/%llu", SLPI_PA, hi - lo, lo, hi, (long long)r, r1);
++	if (r != 0 || r1 != 0) {
++		taimen_fw_free(mdt, mdt_len);
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SLPI_PA, SLPI_SIZE, kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	if (map == NULL) {
++		LOG("6: carve-out map failed");
++		taimen_fw_free(mdt, mdt_len);
++		return false;
++	}
++	uint8_t *region = (uint8_t *)map->getVirtualAddress();
++	bool ok = true;
++	uint64_t copied = 0, t0 = now_ms();
++	for (unsigned i = 0; i < eh->e_phnum && ok; i++) {
++		if (ph[i].p_type != PT_LOAD || (ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || ph[i].p_memsz == 0) {
++			continue;
++		}
++		uint64_t off = (uint64_t)ph[i].p_paddr - lo;
++		if (off + ph[i].p_memsz > SLPI_SIZE || ph[i].p_filesz > ph[i].p_memsz) {
++			LOG("6: segment %u (paddr %#x, memsz %#x) does not fit", i, ph[i].p_paddr, ph[i].p_memsz);
++			ok = false;
++			break;
++		}
++		if (ph[i].p_filesz != 0) {
++			char path[96];
++			snprintf(path, sizeof(path), "%sslpi_v2.b%02u", FW_DIR, i);
++			void *seg = NULL;
++			uint32_t len = 0;
++			if (taimen_fw_load(path, 16u << 20, &seg, &len) != 0 || len != ph[i].p_filesz) {
++				LOG("6: slpi_v2.b%02u missing or %u bytes (want %u)", i, len, ph[i].p_filesz);
++				if (seg != NULL) {
++					taimen_fw_free(seg, len);
++				}
++				ok = false;
++				break;
++			}
++			memcpy(region + off, seg, len);
++			copied += len;
++			taimen_fw_free(seg, len);
++		}
++		if (ph[i].p_memsz > ph[i].p_filesz) {
++			bzero(region + off + ph[i].p_filesz, ph[i].p_memsz - ph[i].p_filesz);
++		}
++	}
++	mb();
++	map->release();
++	taimen_fw_free(mdt, mdt_len);
++	if (!ok) {
++		return false;
++	}
++	LOG("6: %llu bytes of segments into the carve-out in %llu ms", copied, now_ms() - t0);
++	r = scm(SCM_FN(2, 5), 1, SLPI_PAS_ID, 0, 0, &r1);
++	LOG("6: PAS_AUTH_AND_RESET(%u) -> %lld/%llu", SLPI_PAS_ID, (long long)r, r1);
++	return r == 0 && r1 == 0;
++}
++
++static void
++slpi_boot(void)
++{
++	if (!open_rw()) {
++		return;
++	}
++	uint32_t n = 0;
++	if (smem_part_get(slpi_part, slpi_cacheline, ITEM_SMP2P_IN, &n) != NULL) {
++		LOG("6: item %u exists: the SLPI ran since the reset; not booting it over stale state", ITEM_SMP2P_IN);
++		return;
++	}
++	bool cx = sweet_rpm_rail_level(RPM_RWSC, 0x180);
++	bool px = sweet_rpm_kv_both("lvs2 (SLPI px)", RPM_VSA, 2, RPM_SWEN, 1);
++	LOG("6: proxy votes: SSC CX turbo %s, LVS2 %s", cx ? "ok" : "FAILED", px ? "ok" : "FAILED");
++	struct smp2p_hdr *out = smp2p_create_out();
++	if (out == NULL || !smp2p_add(out, "master-kernel", 0)) {
++		LOG("6: SMP2P out (item %u) failed", ITEM_SMP2P_OUT);
++		return;
++	}
++	uint64_t tstart = now_ms();
++	if (!pas_boot()) {
++		crash_reason();
++		return;
++	}
++	uint64_t t1 = now_ms(), seen = 0;
++	struct smp2p_hdr *in = NULL;
++	volatile uint32_t *slave = NULL;
++	while (now_ms() - t1 < 5000) {
++		if (in == NULL && (in = (struct smp2p_hdr *)smem_part_get(slpi_part, slpi_cacheline, ITEM_SMP2P_IN, &n)) != NULL) {
++			seen = now_ms() - t1;
++		}
++		if (in != NULL && in->magic == SMP2P_MAGIC && slave == NULL) {
++			slave = smp2p_find(in, "slave-kernel");
++		}
++		if (slave != NULL && (*slave & (SLAVE_READY | SLAVE_ERR_FATAL)) != 0) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (in == NULL) {
++		LOG("6: no SMP2P from the SLPI (item %u) within 5 s of the reset", ITEM_SMP2P_IN);
++		crash_reason();
++		return;
++	}
++	LOG("6: SLPI SMP2P item %u after %llu ms: v%u features %#x pids %u->%u, %u/%u entries", ITEM_SMP2P_IN, seen,
++	    in->version, in->features[0], in->local_pid, in->remote_pid, in->valid, in->total);
++	struct smp2p_entry *e = (struct smp2p_entry *)(in + 1);
++	for (uint32_t i = 0; i < in->valid && i < SMP2P_MAX_ENTRY; i++) {
++		char nm[17] = {};
++		memcpy(nm, e[i].name, 16);
++		LOG("6:   entry '%s' = %#x", nm, e[i].value);
++	}
++	if (slave == NULL || (*slave & SLAVE_ERR_FATAL) != 0 || (*slave & SLAVE_READY) == 0) {
++		LOG("6: SLPI not ready: slave-kernel %s %#x", slave != NULL ? "=" : "absent", slave != NULL ? *slave : 0);
++		crash_reason();
++		return;
++	}
++	LOG("6: M2 SLPI READY %llu ms after AUTH_AND_RESET (%llu ms from the first SCM call)", now_ms() - t1,
++	    now_ms() - tstart);
++}
++
+ static void
+ sensors_thread(void *arg, wait_result_t)
+ {
+@@ -308,6 +695,9 @@ sensors_thread(void *arg, wait_result_t)
+ 	LOG("3: TZ pas supported(%u) -> %lld/%llu", SLPI_PAS_ID, (long long)r, r1);
+ 	fw_census();
+ 	LOG("5: census done");
++	if (level >= 3) {
++		slpi_boot();
++	}
+ }
+ 
+ void
