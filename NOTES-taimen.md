@@ -1369,3 +1369,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   recording up in 30 ms, first samples 0.06 s after the input started, 1,058,880 frames, 0 skipped, 0 overflows, a
   quiet room at -61 to -67 dBFS. Compass: Use True North was already off, yet no heading on screen while
   SweetHIDHeading streams: locationd's per-sample lines are debug-level (next: oslogd --debug on locationd).
+- 2026-10-30 boot 196 (r167, oslogd --debug on locationd and Compass): the heading path works up to the app:
+  locationd sent the Compass app 986 kCLConnectionMessageHeading messages (and dropped 1,305 more as within the
+  heading filter: the phone lay still), yet the dial stays at north with no heading text. locationd's device motion
+  is what is missing: it adds match entries for the AOP's {0xff0c, 1}, {0xff0c, 4}, {0xff0c, 7} (and our {0xff0c, 8}),
+  {0xff0c, 1} stays "not ready" and "[CLDeviceMotionControl] Configure failed". Next: emulate the AOP's
+  device-motion service (attitude from the gyro, accelerometer and magnetometer) in SweetHID.
