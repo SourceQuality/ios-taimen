@@ -1209,10 +1209,23 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   755 ms, registryID that of the accelerator; supportsFamily apple1-3, common1-2); buffers with gpuAddress, fill and
   copy blits, a BGRA8 clear read back, and clears into IOSurface textures imported by ID (64x64, 1125x48) and as
   host pages: 0 FAIL lines. backboardd: "not in /private/var/sweetmtl/clients, so no Metal device", on sweetgl.
-- 2026-10-25 boot 171 (r153): Metal M4 try, clients AegirPoster and Preferences: **the phone hung hard at ~65 s**,
-  before any client logged a SweetMetal line: the USB link and the live log stopped together right after a
-  physical touch at the bottom-right edge (TAIMEN TOUCH; no script had touched it yet), no panic, no GPU hang
-  line, no watchdog reset, no USB device at all. Needs a power-button restart; the cause is open (pstore after
-  the restart, else a retry with one client at a time). sensors: docs/taimen-sensors-plan.md (b9c172d), 0335
-  (SweetHIDAccel, synthetic, taimensensors=1), 0336 (SLPI census, taimensensors>=2), reader pulls slpi_v2.* and
-  /persist/sensors/sns.reg.
+- 2026-10-25 boot 171 (r153): Metal M4 try, clients AegirPoster and Preferences. **Not a hang** (first read as one):
+  the USB link dropped at 64.75 s (DWC3 link state 3) and the phone was then used by hand (touches, Control
+  Center, audio), so the PC lost the live log and never saw the reader; the kernel ran to taimenreboot=900 and its
+  log ring (sweetlog.bin, pulled by the reader after the restart on 10-30) has it all. **AegirPoster got the Metal
+  device** (91 ms, IOSurfaces imported by ID) **and stopped crash-looping** (0 crashes in 900 s; 20-36 a boot
+  without a device); 5 command buffers were refused as "foreign render pipeline", most likely a nil pipeline whose
+  creation failed (b2f1cec logs the reason now). Preferences ran but never asked for a device. The end shot has two
+  black bands across the lock screen (the poster's refused draws, or the kernel end-shot's own capture race: 0333
+  only copies the remote shot). sensors: docs/taimen-sensors-plan.md (b9c172d), 0335 (SweetHIDAccel, synthetic,
+  taimensensors=1), 0336 (SLPI census, taimensensors>=2), reader pulls slpi_v2.* and /persist/sensors/sns.reg.
+- 2026-10-30 boot 172 (r155 = +0335, +0336): **sensors M0 and M1.** backboardd's HID event system opened
+  SweetHIDAccel and pushed DeviceOpenedByEventSystem, MotionEventRestricted, PreserveTimestamp, Shake, then
+  ReportInterval/BatchInterval pairs (20 ms, 10 ms, 0): samples streamed (15,000+ sent). But `orient left/right` did not
+  rotate Safari's full-screen video, and locationd printed nothing about accelerometers or orientation (only objc
+  duplicate-class lines with sweetlogp; its os_log is probably below the default level). Next: locationd/CoreMotion
+  debug logging, or the AOP-style orientation event (kIOHIDEventTypeOrientation, type CMUsage with an
+  AppleVendorMotion DeviceOrientation usage) that a coprocessor phone may expect instead of raw samples. Census: the
+  APPS<->SLPI SMEM partition exists and is clean (@0x19f000 + 0x30000, cacheline 32, items 430/481/478-480 absent,
+  no crash reason 424); TZ PAS_IS_SUPPORTED(12) -> 0/0, as for the ADSP, which boots fine, so not a refusal. The new
+  reader pulled slpi_v2.mdt + .b00-.b14 (3.9 MB) and sns.reg (28174 B) into ../research/taimen/firmware/sensors.
