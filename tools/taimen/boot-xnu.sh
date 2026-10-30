@@ -62,7 +62,11 @@ if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 	# argument the command line lacks.
 	senv="sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB"
 	if [ -n "${SWEETENV_EXTRA:-}" ]; then
-		export TAIMEN_ADT_ARGS="${TAIMEN_ADT_ARGS:-} $senv;$SWEETENV_EXTRA"
+		# XNU takes the first entry of a process only (kern_exec.c sweet_exec_env): a backboardd entry of
+		# SWEETENV_EXTRA joins the sweetgl one, VAR=VAL,VAR=VAL (boot 204 lost SWEETGL_TRACE otherwise)
+		bb=$(printf '%s' "$SWEETENV_EXTRA" | tr ';' '\n' | sed -n 's/^backboardd://p' | paste -sd, -)
+		rest=$(printf '%s' "$SWEETENV_EXTRA" | tr ';' '\n' | grep -v '^backboardd:' | paste -sd';' -)
+		export TAIMEN_ADT_ARGS="${TAIMEN_ADT_ARGS:-} $senv${bb:+,$bb}${rest:+;$rest}"
 		senv=
 	fi
 	args="sweetgpu=8 sweetgpuclk=710 taimengpucopy=1 taimengpuheap=256 $senv sweetnull=backboardd ${args}"
