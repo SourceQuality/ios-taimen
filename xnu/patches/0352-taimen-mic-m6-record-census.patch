@@ -1,0 +1,634 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index a5939e9..94aa812 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -62,6 +62,14 @@
+  *   135, 48 kHz; DEVICE_START), the codec's clock and TX path, its TX port 7 connected to channel 135
+  *   and the channel defined and activated (SLIMbus user messages to the ADSP, GENERIC_ACK each); 2 s
+  *   running, the port's status; then all of it down. POWER(ACTIVE) again before each session.
++ * 6 (0352): a recording into our pool (plan 4.2-4.4): ASM session 2 (port 0x0201) mapped, OPEN_READ
++ *   (PCM v2, 16 bit), ENC_CFG (1 channel, 48 kHz, FC), ADM TX COPP on 0x4001 routed to it, the AFE
++ *   port and channel 135, RUN, 8 READs of 20 ms (token 0x40000000 | period) re-sent as each
++ *   READ_DONE comes back; unmute at 40 ms, HPF corner at 300 ms. The census: MIC BIAS 1/3/4 and the
++ *   DMIC0-2 clocks on, a quiet second on DMIC0, then stage 8's 1 kHz tone at -20 dBFS on the
++ *   speakers while DMIC MUX7 steps through DMIC0, 1, 2, 4 (a second each); levels and the 1 kHz bin
++ *   per window. Pass: 250 full reads, samples not constant, the bottom mic (DMIC0 or 1) 20 dB over
++ *   quiet at 1 kHz.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -104,6 +112,9 @@ void taimen_wcd_down(unsigned st, bool verbose);
+ bool taimen_wcd_port_up(unsigned st, bool verbose);
+ void taimen_wcd_port_down(unsigned st, bool verbose);
+ bool taimen_wcd_port_log(unsigned st, const char *what);
++void taimen_wcd_mute(bool mute);
++void taimen_wcd_settle(void);
++bool taimen_wcd_select(int dmic);
+ }
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+@@ -1654,7 +1665,7 @@ static bool apr_versions_done;
+ static unsigned apr_last_ask, apr_asks;
+ 
+ static bool
+-apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len)
++apr_send_tok(uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t len)
+ {
+ 	uint8_t buf[sizeof(struct apr_hdr) + 256];
+ 	if (len > 256) {
+@@ -1670,7 +1681,7 @@ apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint3
+ 	h->dest_domain = APR_DOMAIN_ADSP;
+ 	h->dest_port = apr_next_dst >= 0 ? (uint16_t)apr_next_dst : port;
+ 	apr_next_dst = -1;
+-	h->token = apr_token++;
++	h->token = token;
+ 	h->opcode = opcode;
+ 	if (len != 0) {
+ 		memcpy(buf + sizeof(*h), payload, len);
+@@ -1679,8 +1690,18 @@ apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint3
+ 	return glink_send(ACHAN, buf, sizeof(*h) + len);
+ }
+ 
++static bool
++apr_send(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len)
++{
++	if (len > 256) {
++		return false;
++	}
++	return apr_send_tok(svc, port, apr_token++, opcode, payload, len);
++}
++
+ static void apr_answer(const struct apr_hdr *h, const uint32_t *p, uint32_t plen);
+ static bool asm_event(const struct apr_hdr *h, const uint32_t *p, uint32_t plen);
++static bool mic_read_result(const struct apr_hdr *h, const uint32_t *p, uint32_t plen);
+ 
+ static void
+ apr_rx(const uint8_t *d, uint32_t len)
+@@ -1710,6 +1731,9 @@ apr_rx(const uint8_t *d, uint32_t len)
+ 		break;
+ 	}
+ 	case APR_BASIC_RSP_RESULT:
++		if (mic_read_result(h, p, plen)) {
++			break;
++		}
+ 		LOG("t=%u.%03u apr: svc %u port %u: result of %#x = %#x", T, h->src_svc, h->src_port,
+ 		    plen >= 4 ? p[0] : 0, plen >= 8 ? p[1] : 0);
+ 		break;
+@@ -2248,6 +2272,17 @@ period_send(unsigned i)
+ 	return apr_send(APR_SVC_ASM, ASM_PORT, ASM_DATA_CMD_WRITE_V2, &w, sizeof(w));
+ }
+ 
++/* the microphone's reads (taimenmic>=6): their READ_DONE comes here like WRITE_DONE (HK hakios.mic.c mic_events) */
++#define ASM_DATA_CMD_READ_V2                0x00010DACu
++#define ASM_DATA_EVENT_READ_DONE_V2         0x00010D9Au
++#define ASM_SESSION_EVENT_TX_OVERFLOW       0x00010C18u
++#define MIC_READ_TOKEN                      0x40000000u     /* | the period */
++#define MIC_PERIODS                         8
++
++static uint32_t mic_ready;              /* periods the DSP gave back, a bit each */
++static uint32_t mic_size[MIC_PERIODS], mic_offset[MIC_PERIODS];
++static uint32_t mic_dones, mic_errors, mic_overflows, mic_rsp_logged;
++
+ /* ASM events outside a call: write done (refill), underflow. From apr_rx's default case. */
+ static bool
+ asm_event(const struct apr_hdr *h, const uint32_t *p, uint32_t plen)
+@@ -2263,11 +2298,44 @@ asm_event(const struct apr_hdr *h, const uint32_t *p, uint32_t plen)
+ 		underflows++;
+ 		return true;
+ 	}
+-	(void)p;
+-	(void)plen;
++	if (h->opcode == ASM_DATA_EVENT_READ_DONE_V2 && (h->token & MIC_READ_TOKEN) != 0 &&
++	    (h->token & 0xFFFFu) < MIC_PERIODS) {
++		/* {status, buf lsw, msw, handle, size, offset, ts lsw, msw, flags, frames, seq} */
++		uint32_t i = h->token & 0xFFFFu;
++		bool ok = plen >= 24 && p[0] == 0;
++		mic_dones++;
++		mic_errors += !ok;
++		mic_size[i] = ok ? p[4] : 0;
++		mic_offset[i] = ok ? p[5] : 0;
++		mic_ready |= 1u << i;
++		return true;
++	}
++	if (h->opcode == ASM_SESSION_EVENT_TX_OVERFLOW) {
++		mic_overflows++;
++		return true;
++	}
+ 	return false;
+ }
+ 
++/* a READ_V2 refused (APR_BASIC_RSP_RESULT with a read token): that period comes back empty */
++static bool
++mic_read_result(const struct apr_hdr *h, const uint32_t *p, uint32_t plen)
++{
++	if ((h->token & MIC_READ_TOKEN) == 0 || (h->token & 0xFFFFu) >= MIC_PERIODS) {
++		return false;
++	}
++	uint32_t i = h->token & 0xFFFFu;
++	mic_errors++;
++	mic_size[i] = 0;
++	mic_offset[i] = 0;
++	mic_ready |= 1u << i;
++	if (mic_rsp_logged++ < 4) {
++		IOLog("TAIMEN MIC: READ_V2 of period %u refused: result of %#x = %#x\n", i, plen >= 4 ? p[0] : 0,
++		    plen >= 8 ? p[1] : 0);
++	}
++	return true;
++}
++
+ static bool
+ stage8(void)
+ {
+@@ -2927,9 +2995,464 @@ mic_m5(void)
+ 	return ok;
+ }
+ 
++/* ---------------------------------------------------------------- microphones: the record stream (M6) */
++
++#define MIC_ASM_PORT                        0x0201  /* session 2 << 8 | stream 1 (playback has 0x0101) */
++#define ASM_STREAM_CMD_OPEN_READ_V3         0x00010DB4u
++#define ASM_STREAM_CMD_SET_ENCDEC_PARAM     0x00010C10u
++#define ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2  0x00010DA3u
++#define ADM_MODE_TX_LIVE                    2       /* ADM_CMD_COPP_OPEN_MODE_OF_OPERATION_TX_PATH_LIVE_COPP */
++#define ADM_MATRIX_AUDIO_TX                 1
++#define PCM_CHANNEL_FC                      3
++#define MIC_PERIOD_FRAMES                   960     /* 20 ms of mono 16-bit */
++#define MIC_PERIOD_BYTES                    (MIC_PERIOD_FRAMES * 2)
++#define MIC_UNMUTE_MS                       40      /* WH tx_unmute_delay */
++#define MIC_SETTLE_MS                       300     /* WH: the HPF corner back after 300 ms */
++
++struct asm_open_read_v3 {
++	uint32_t mode_flags, src_endpoint, preproc_topo, enc_cfg_id;
++	uint16_t bits, reserved;
++} __attribute__((packed));
++struct asm_enc_cfg_v2 {
++	uint32_t param_id, param_size, frames_per_buf, blk_size;
++	uint16_t channels, bits;
++	uint32_t rate;
++	uint16_t is_signed, reserved;
++	uint8_t  map[8];
++} __attribute__((packed));
++struct asm_read_v2 {
++	uint32_t lsw, msw, handle, size, seq;
++} __attribute__((packed));
++
++typedef void (*mic_sink_t)(const int16_t *s, uint32_t n);
++
++static uint8_t *mic_buf;                /* MIC_PERIODS x 4 KB of the pool, write-combined */
++static uint64_t mic_buf_pa;
++static uint32_t mic_handle, mic_good;
++static uint16_t mic_copp;
++static bool mic_mapped, mic_stream_open, mic_copp_open, mic_running, mic_unmuted, mic_settled;
++static unsigned mic_next;
++static uint64_t mic_t0;                 /* RUN */
++
++static bool
++mic_read(unsigned i)
++{
++	struct asm_read_v2 r;
++	uint64_t a = dsp_addr(mic_buf_pa + (uint64_t)i * 0x1000);
++	r.lsw = (uint32_t)a;
++	r.msw = (uint32_t)(a >> 32);
++	r.handle = mic_handle;
++	r.size = MIC_PERIOD_BYTES;
++	r.seq = i;
++	return apr_send_tok(APR_SVC_ASM, MIC_ASM_PORT, MIC_READ_TOKEN | i, ASM_DATA_CMD_READ_V2, &r, sizeof(r));
++}
++
++/*
++ * A recording up, in the plan's order (4.4): the codec's clock and TX path (muted), ASM map, OPEN_READ,
++ * ENC_CFG, ADM open (TX live, 0x4001) and matrix, the AFE port, the codec's port on channel 135, RUN,
++ * 8 READs. False with part of it up: mic_session_down() takes down whatever is.
++ */
++static bool
++mic_session_up(unsigned st, int dmic, bool census, bool verbose)
++{
++	if (!mic_power_active(st) || !taimen_wcd_up(st, dmic, census, verbose)) {
++		return false;
++	}
++	if (mic_buf == NULL) {
++		uint64_t pa = 0;
++		mic_buf = (uint8_t *)pool_alloc((uint64_t)MIC_PERIODS * 0x1000, &pa);
++		mic_buf_pa = pa;
++		if (mic_buf == NULL) {
++			MLOG("%u: no pool room for the microphone's periods", st);
++			return false;
++		}
++	}
++	uint64_t a = dsp_addr(mic_buf_pa);
++	struct asm_map_regions mr = { SHMEM8_4K_POOL, 1, 0, { (uint32_t)a, (uint32_t)(a >> 32), MIC_PERIODS * 0x1000 } };
++	if (apr_call("ASM map mic periods", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &mr, sizeof(mr), 1000) != 0 ||
++	    apr_wait_opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS || apr_wait_len < 4) {
++		MLOG("%u: ASM map of %#llx (DSP %#llx) failed", st, mic_buf_pa, a);
++		return false;
++	}
++	mic_mapped = true;
++	mic_handle = apr_wait_payload[0];
++	struct asm_open_read_v3 orv = { 0, 0, ASM_NULL_POPP_TOPOLOGY, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2, 16, 0 };
++	if (apr_call("ASM OPEN_READ_V3 (session 2)", APR_SVC_ASM, MIC_ASM_PORT, ASM_STREAM_CMD_OPEN_READ_V3, &orv, sizeof(orv),
++	    1000) != 0) {
++		return false;
++	}
++	mic_stream_open = true;
++	struct asm_enc_cfg_v2 enc;
++	bzero(&enc, sizeof(enc));
++	enc.param_id = ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2;
++	enc.param_size = sizeof(enc) - 8;
++	enc.frames_per_buf = 0;
++	enc.blk_size = sizeof(enc) - 16;
++	enc.channels = 1;
++	enc.bits = 16;
++	enc.rate = 48000;
++	enc.is_signed = 1;
++	enc.map[0] = PCM_CHANNEL_FC;
++	if (apr_call("ASM ENC_CFG (1 ch, 16 bit, 48000)", APR_SVC_ASM, MIC_ASM_PORT, ASM_STREAM_CMD_SET_ENCDEC_PARAM, &enc,
++	    sizeof(enc), 1000) != 0) {
++		return false;
++	}
++	struct adm_open_v5 ao;
++	bzero(&ao, sizeof(ao));
++	ao.mode = ADM_MODE_TX_LIVE;
++	ao.endpoint1 = APR_PORT_SLIM0_TX;
++	ao.endpoint2 = 0xFFFF;
++	ao.topology = ADM_NULL_COPP_TOPOLOGY;
++	ao.channels = 1;
++	ao.bit_width = 16;
++	ao.rate = 48000;
++	ao.map[0] = PCM_CHANNEL_FC;
++	(void)apr_call("ADM DEVICE_OPEN_V5 0x4001 (TX)", APR_SVC_ADM, APR_PORT_SLIM0_TX, ADM_CMD_DEVICE_OPEN_V5, &ao, sizeof(ao),
++	    1000);
++	if (apr_wait_opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || apr_wait_len < 8 || apr_wait_payload[0] != 0) {
++		MLOG("%u: ADM TX open failed (opcode %#x, status %#x)", st, apr_wait_opcode, apr_wait_len >= 4 ? apr_wait_payload[0] : 0);
++		return false;
++	}
++	mic_copp_open = true;
++	mic_copp = (uint16_t)apr_wait_payload[1];
++	struct adm_routing_v5 rt = { ADM_MATRIX_AUDIO_TX, 1, 2, 1, mic_copp, 0 };
++	if (apr_call("ADM MATRIX_MAP (TX, session 2)", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &rt, sizeof(rt), 1000) != 0 ||
++	    !mic_afe_start(st, verbose) || !taimen_wcd_port_up(st, verbose)) {
++		return false;
++	}
++	uint32_t run[3] = { 0, 0, 0 };
++	if (apr_call("ASM RUN_V2 (session 2)", APR_SVC_ASM, MIC_ASM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 1000) != 0) {
++		return false;
++	}
++	mic_running = true;
++	mic_ready = 0;
++	mic_dones = mic_errors = mic_overflows = mic_good = 0;
++	mic_next = 0;
++	mic_unmuted = mic_settled = false;
++	for (unsigned i = 0; i < MIC_PERIODS; i++) {
++		if (!mic_read(i)) {
++			MLOG("%u: READ_V2 %u not sent", st, i);
++			return false;
++		}
++	}
++	mic_t0 = now_ms();
++	if (verbose) {
++		MLOG("t=%u.%03u %u: map %u KB @%#llx (DSP %#llx) handle %#x; ADM 0x4001 TX copp %u; OPEN_READ, ENC_CFG, MATRIX, "
++		    "RUN 0; %u reads of 20 ms queued", T, st, MIC_PERIODS * 4, mic_buf_pa, a, mic_handle, mic_copp, MIC_PERIODS);
++	}
++	return true;
++}
++
++/* down in the plan's order: mute, ASM CLOSE, ADM CLOSE, the channel, AFE STOP, the codec and MCLK, unmap */
++static void
++mic_session_down(unsigned st, bool verbose)
++{
++	taimen_wcd_mute(true);
++	if (mic_stream_open) {
++		apr_call("ASM CLOSE (session 2)", APR_SVC_ASM, MIC_ASM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 1000);
++		mic_stream_open = false;
++	}
++	if (mic_copp_open) {
++		apr_next_dst = mic_copp;
++		apr_call("ADM DEVICE_CLOSE_V5 (TX)", APR_SVC_ADM, APR_PORT_SLIM0_TX, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 1000);
++		mic_copp_open = false;
++	}
++	taimen_wcd_port_down(st, verbose);
++	mic_afe_stop();
++	taimen_wcd_down(st, verbose);
++	if (mic_mapped) {
++		uint32_t um = mic_handle;
++		apr_call("ASM unmap mic periods", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &um, sizeof(um), 1000);
++		mic_mapped = false;
++	}
++	mic_running = false;
++}
++
++/*
++ * The periods the DSP gave back, in order: each to the sink (n = 0 for an empty one) and read
++ * again; the unmute at 40 ms and the HPF corner at 300 ms. The pool is write-combined: a barrier
++ * after READ_DONE, no cache maintenance. Periods taken.
++ */
++static unsigned
++mic_service(mic_sink_t sink)
++{
++	int16_t s[MIC_PERIOD_FRAMES];
++	unsigned taken = 0;
++	if (!mic_running) {
++		return 0;
++	}
++	uint64_t el = now_ms() - mic_t0;
++	if (!mic_unmuted && el >= MIC_UNMUTE_MS) {
++		taimen_wcd_mute(false);
++		mic_unmuted = true;
++	}
++	if (!mic_settled && el >= MIC_SETTLE_MS) {
++		taimen_wcd_settle();
++		mic_settled = true;
++	}
++	while ((mic_ready & (1u << mic_next)) != 0 && taken < MIC_PERIODS) {
++		uint32_t sz = MIN(mic_size[mic_next], (uint32_t)MIC_PERIOD_BYTES), off = mic_offset[mic_next];
++		mic_ready &= ~(1u << mic_next);
++		mb();
++		if (sz != 0 && off <= 0x1000 - sz) {
++			memcpy(s, mic_buf + (uint64_t)mic_next * 0x1000 + off, sz & ~1u);
++		} else {
++			sz = 0;
++		}
++		mic_good += sz == MIC_PERIOD_BYTES;
++		sink(s, sz / 2);
++		(void)mic_read(mic_next);
++		mic_next = (mic_next + 1) % MIC_PERIODS;
++		taken++;
++	}
++	return taken;
++}
++
++/* levels: rms, peak, mean, extremes, and the power in the 1 kHz bin (48 samples a cycle) of each period */
++struct mic_meter {
++	uint64_t frames, sq, bin;
++	int64_t sum;
++	uint32_t periods, empty, bins, peak;
++	int32_t lo, hi;
++};
++
++/* round(32767 sin(2 pi k / 48)); the cosine is 12 on */
++static const int16_t sin48[48] = {
++	0, 4277, 8481, 12539, 16383, 19947, 23170, 25996, 28377, 30273, 31650, 32487,
++	32767, 32487, 31650, 30273, 28377, 25996, 23170, 19947, 16383, 12539, 8481, 4277,
++	0, -4277, -8481, -12539, -16383, -19947, -23170, -25996, -28377, -30273, -31650, -32487,
++	-32767, -32487, -31650, -30273, -28377, -25996, -23170, -19947, -16384, -12539, -8481, -4277,
++};
++
++static void
++meter_reset(struct mic_meter *m)
++{
++	bzero(m, sizeof(*m));
++	m->lo = 32767;
++	m->hi = -32768;
++}
++
++static void
++meter_add(struct mic_meter *m, const int16_t *s, uint32_t n)
++{
++	int64_t re = 0, im = 0;
++	m->periods++;
++	if (n == 0) {
++		m->empty++;
++		return;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		int32_t v = s[i];
++		uint32_t a = (uint32_t)(v < 0 ? -v : v);
++		m->sum += v;
++		m->sq += (uint64_t)((int64_t)v * v);
++		m->peak = MAX(m->peak, a);
++		m->lo = MIN(m->lo, v);
++		m->hi = MAX(m->hi, v);
++		re += (int64_t)v * sin48[(i + 12) % 48];
++		im += (int64_t)v * sin48[i % 48];
++	}
++	re /= 32768;
++	im /= 32768;
++	m->bin += (uint64_t)(re * re + im * im);
++	m->bins++;
++	m->frames += n;
++}
++
++/* log2(v) in 1/256 */
++static int32_t
++log2_q8(uint64_t v)
++{
++	int32_t ip = 63 - __builtin_clzll(v), fr = 0;
++	uint64_t x = ip >= 31 ? v >> (ip - 31) : v << (31 - ip);        /* [2^31, 2^32) */
++	for (int b = 7; b >= 0; b--) {
++		x = (x * x) >> 31;
++		if (x >= (1ull << 32)) {
++			x >>= 1;
++			fr |= 1 << b;
++		}
++	}
++	return ip * 256 + fr;
++}
++
++/* 10 log10(power / 2^(ref / 256)) in tenths of a dB; -9999 for nothing */
++static int32_t
++db_tenths(uint64_t power, int32_t ref_q8)
++{
++	return power == 0 ? -9999 : (int32_t)((int64_t)(log2_q8(power) - ref_q8) * 30103 / 256000);
++}
++
++static const char *
++db_text(char *b, size_t n, int32_t t)
++{
++	if (t <= -9999) {
++		snprintf(b, n, "-inf");
++	} else {
++		snprintf(b, n, "%s%d.%d", t < 0 ? "-" : "", (t < 0 ? -t : t) / 10, (t < 0 ? -t : t) % 10);
++	}
++	return b;
++}
++
++#define REF_FULL_SCALE_Q8       (30 * 256)      /* mean square 2^30: a full-scale square, 0 dBFS */
++#define REF_SINE_BIN_Q8         12240           /* (480 x 32768)^2: a full-scale sine's bin over 960 samples */
++
++static int32_t
++meter_rms_db(const struct mic_meter *m)
++{
++	return m->frames == 0 ? -9999 : db_tenths(m->sq / m->frames, REF_FULL_SCALE_Q8);
++}
++
++static int32_t
++meter_1k_db(const struct mic_meter *m)
++{
++	return m->bins == 0 ? -9999 : db_tenths(m->bin / m->bins, REF_SINE_BIN_Q8);
++}
++
++/* "N periods (E empty), F frames, level L dBFS, peak P, mean M, 1 kHz B dBFS" */
++static void
++meter_log(const char *what, const struct mic_meter *m, const char *extra)
++{
++	char a[16], b[16];
++	MLOG("%s: %u periods (%u empty), %llu frames, level %s dBFS, peak %u, mean %lld, 1 kHz %s dBFS%s", what, m->periods,
++	    m->empty, m->frames, db_text(a, sizeof(a), meter_rms_db(m)), m->peak, m->frames != 0 ? m->sum / (int64_t)m->frames : 0,
++	    db_text(b, sizeof(b), meter_1k_db(m)), extra);
++}
++
++static struct mic_meter m6_meter[5];    /* quiet DMIC0; with the tone DMIC0, 1, 2, 4 */
++static int m6_window = -1;
++
++static void
++m6_sink(const int16_t *s, uint32_t n)
++{
++	if (m6_window >= 0 && m6_window < 5) {
++		meter_add(&m6_meter[m6_window], s, n);
++	}
++}
++
++/*
++ * M6 (plan section 6): the census. The speakers' session opens first, playing silence (so its APR
++ * calls do not stall the reads), then the recording with every DMIC's bias and clock on. From RUN:
++ * 0.5-1.5 s quiet on DMIC0; at 1.5 s stage 8's tone (1 kHz, -20 dBFS) and DMIC0, at 2.5 s DMIC1,
++ * 3.5 s DMIC2, 4.5 s DMIC4, each measured after 200 ms; the tone ends at 5.5 s.
++ */
++static bool
++mic_m6(bool dsp_mem, bool tone_ok)
++{
++	static const int step_dmic[4] = { 0, 1, 2, 4 };
++	char t1[16], t2[16], t3[16], t4[16], ex[40];
++	bool tone = tone_ok, playing = false, ok;
++	unsigned next = 0;
++	uint32_t seen = 0;
++	int32_t rise[5] = { 0, 0, 0, 0, 0 }, lo = 32767, hi = -32768;
++	uint64_t frames = 0;
++
++	if (!dsp_mem) {
++		MLOG("6: no LPASS SMMU stream 1 bank (taimenaudiosmmu=2 or taimenaudioaddr=1): the DSP cannot write our memory");
++		return false;
++	}
++	for (unsigned i = 0; i < 5; i++) {
++		meter_reset(&m6_meter[i]);
++	}
++	m6_window = -1;
++	if (tone) {
++		playing = afe_start() && stream_open();
++		if (playing) {
++			if (amps) {
++				(void)taimen_tas2557_power(true);
++			}
++			seen = writes_done;
++			for (unsigned i = 0; i < PERIODS; i++) {
++				period_fill(i, false);
++				period_send(i);
++			}
++		} else {
++			MLOG("6: the speakers' session did NOT open: no tone");
++			afe_stop();                     /* as the feeder does */
++			tone = false;
++		}
++	} else {
++		MLOG("6: no speaker tone (it needs taimenaudio>=7: the MI2S port and the amps): the reads only");
++	}
++	ok = mic_session_up(6, 0, true, true);
++	int w = 0;
++	while (ok) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++		uint64_t el = now_ms() - mic_t0;
++		while (playing && writes_done != seen) {
++			seen++;
++			period_fill(next, el >= 1500 && el < 5500);
++			period_send(next);
++			next = (next + 1) % PERIODS;
++		}
++		int want = el < 500 ? -1 : el < 1500 ? 0 : el < 5500 ? (int)((el - 1500) / 1000) + 1 : -1;
++		if (want >= 1 && want != w) {
++			(void)taimen_wcd_select(step_dmic[want - 1]);
++			w = want;
++		}
++		m6_window = want >= 1 && (el - 1500) % 1000 < 200 ? -1 : want;
++		(void)mic_service(m6_sink);
++		if (el >= 5600) {
++			break;
++		}
++		if (el >= 1500 && mic_dones == 0) {
++			MLOG("6: NO READ_DONE in 1.5 s (the stream or the AFE port)");
++			ok = false;
++		}
++	}
++	m6_window = -1;
++	uint32_t reads = mic_dones, good = mic_good, errors = mic_errors, overflows = mic_overflows;
++	mic_session_down(6, true);
++	if (playing) {
++		uint64_t td = now_ms();
++		while (periods_out > 0 && now_ms() - td < 500) {
++			if (!glink_poll()) {
++				IOSleep(1);
++			}
++		}
++		if (amps) {
++			(void)taimen_tas2557_power(false);
++		}
++		stream_close();
++		afe_stop();
++	}
++	for (unsigned i = 0; i < 5; i++) {
++		const struct mic_meter *m = &m6_meter[i];
++		int32_t q = meter_1k_db(&m6_meter[0]), d = meter_1k_db(m);
++		rise[i] = q > -9999 && d > -9999 ? d - q : -9999;     /* nothing to compare: -inf */
++		frames += m->frames;
++		if (m->frames != 0) {
++			lo = MIN(lo, m->lo);
++			hi = MAX(hi, m->hi);
++		}
++		ex[0] = 0;
++		if (i != 0) {
++			snprintf(ex, sizeof(ex), " (%s dB over quiet)", db_text(t1, sizeof(t1), rise[i]));
++		}
++		char what[32];
++		snprintf(what, sizeof(what), "6: %s DMIC%d", i == 0 ? "quiet" : "tone", i == 0 ? 0 : step_dmic[i - 1]);
++		meter_log(what, m, ex);
++	}
++	bool heard = tone && MAX(rise[1], rise[2]) >= 200;
++	bool pass = ok && good >= 250 && hi > lo && heard;
++	MLOG("6: %s: DMIC0 1 kHz %s dB over quiet; DMIC1 %s; DMIC2 %s; DMIC4 %s; %u reads (%u full), %u errors, %u overflows",
++	    pass ? "M6 the microphone hears the speaker" : "M6 NOT reached", db_text(t1, sizeof(t1), rise[1]),
++	    db_text(t2, sizeof(t2), rise[2]), db_text(t3, sizeof(t3), rise[3]), db_text(t4, sizeof(t4), rise[4]), reads, good,
++	    errors, overflows);
++	if (!pass) {
++		MLOG("6: %s", !ok || reads == 0 ? "no READ_DONE: the stream or the AFE port" :
++		    good < 250 ? "too few full periods (READ_DONE with a status or a short size)" :
++		    frames == 0 || (lo == 0 && hi == 0) ? "all zeros: channel 135 carries nothing (M5) or the mux" :
++		    hi == lo ? "constant samples: a DMIC edge with no mic (try taimenmicdmic=1)" :
++		    !tone ? "no tone to hear" : "noise without the tone: the wrong mic or gain, or the speakers silent");
++	}
++	return pass;
++}
++
+ /* The microphone stages 1..taimenmic, once; a failure ends them and nothing else. */
+ static void
+-mic_stages(void)
++mic_stages(bool dsp_mem, bool tone_ok)
+ {
+ 	MLOG("t=%u.%03u taimenmic=%d: stage 1", T, mic_level);
+ 	(void)PE_parse_boot_argn("taimenmicdmic", &mic_dmic, sizeof(mic_dmic));
+@@ -2971,7 +3494,16 @@ mic_stages(void)
+ 		MLOG("5: M5 NOT reached; the microphone stages end here");
+ 		return;
+ 	}
+-	MLOG("t=%u.%03u M5 done%s", T, mic_level > 5 ? "; stages 6 and up are not built yet" : "");
++	MLOG("t=%u.%03u M5 done", T);
++	if (mic_level < 6) {
++		return;
++	}
++	MLOG("t=%u.%03u stage 6", T);
++	if (!mic_m6(dsp_mem, tone_ok)) {
++		MLOG("6: M6 NOT reached; the microphone stages end here");
++		return;
++	}
++	MLOG("t=%u.%03u M6 done%s", T, mic_level > 6 ? "; stage 7 is not built yet" : "");
+ }
+ 
+ /* ---------------------------------------------------------------- the thread */
+@@ -3082,7 +3614,7 @@ audio_thread(void *arg, wait_result_t)
+ 				pins_mi2s(false);
+ 			}
+ 			if (mic_level > 0) {
+-				mic_stages();           /* after the speaker's setup: its failures stay its own */
++				mic_stages(m5 || addr == 1, m6 && amps);       /* after the speaker's setup */
+ 			}
+ 		}
+ 		if (slave != NULL && (*slave & SLAVE_ERR_FATAL) != 0) {
