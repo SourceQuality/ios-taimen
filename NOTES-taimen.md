@@ -1412,3 +1412,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   tap where the search card belongs changes nothing visible. Every swap is backboardd's one composited surface (no odd
   swaps), so the chrome is lost in backboardd's CoreAnimation composition (sweetgl), not at the framebuffer: the Metal
   layer's drawable seems to cover the app's other layers. Next: how backboardd composites a CAMetalLayer's drawable.
+- 2026-10-30 boot 203 (r170, SweetMetal-da5dcafc): Maps 1, 3, 6 and 12 s after launch: at 3 s its whole UI (status
+  bar, map buttons, the search card with Favorites) over the placeholder grid; from 6 s, once the real map drew
+  through its CAMetalLayer, only the map, status bar included. backboardd keeps issuing ~23 draws a frame.
+- 2026-10-30 boots 204-205 (sweetgl b1defb6: SWEETGL_TRACE=full traces the panel-size composite with depth and
+  stencil state; the first sweetgl built with Xcode 16.4 on macos-15, fine): depth and stencil tests are off in
+  every draw (not an occlusion bug); CA does scissored partial updates and offscreen passes for its materials.
+  Two boot-script bugs on the way: XNU applies only the first sweetenv entry of a process, so boot-xnu.sh now
+  merges a backboardd entry of SWEETENV_EXTRA into the sweetgl one (f242519, 185c642: grep -v under pipefail);
+  and editing WSL scripts through the Windows path had dropped their executable bit (e47ddec). The trace
+  (out/maps-chrome/) is being read for the draw that covers the chrome.
