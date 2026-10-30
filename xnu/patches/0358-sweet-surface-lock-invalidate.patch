@@ -1,0 +1,105 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 77f6257..535dd50 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -663,6 +663,10 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 		if (b == NULL) {
+ 			return kIOReturnBadArgument;
+ 		}
++		if (b->surface != NULL) {
++			/* 0358: the next CPU lock of the surface cleans and invalidates it (SweetSurface trapLock) */
++			OSIncrementAtomic((volatile SInt32 *)&b->surface->gpuUse);
++		}
+ 		/*
+ 		 * CPU-cached: its CPU writes to memory, no stale lines over GPU
+ 		 * writes. Only pages written since the last submit: flushing every
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1cb1d83..aaf4865 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -46,6 +46,7 @@ extern "C" void sweet_user_backtrace(const char *tag);   /* osfmk/kern/exception
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <kern/clock.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -965,6 +966,52 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ 	return s;
+ }
+ 
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++extern "C" boolean_t pmap_valid_page(ppnum_t pn);
++
++/*
++ * 0358: a CPU lock of a surface the GPU used since the last lock cleans and invalidates the CPU cache
++ * over its RAM pages, so the CPU reads what the GPU wrote. The GPU (not cache-coherent here) writes
++ * DRAM behind the CPU's cacheable mappings: lines the CPU still holds (the kernel's bzero at creation,
++ * earlier reads, speculative fills) would hide its pixels. Mesa's own readbacks prepare their bos
++ * (SweetGPU bo cpu prep); another process locking the IOSurface had nothing. Boots 178-200: the poster
++ * gallery drew once and then showed black cards: PosterBoard encodes its snapshot ("Creating
++ * snapshot from IOSurface") from the surface AegirPoster's Metal rendering wrote.
++ */
++static void
++sweet_surface_invalidate(SweetSurface *s)
++{
++	static unsigned logged;
++	uint64_t t0 = mach_absolute_time();
++	IOByteCount off = 0, len = s->memory->getLength();
++	uint32_t pages = 0;
++	while (off < len) {
++		IOByteCount seg = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || seg == 0) {
++			break;
++		}
++		if (seg > len - off) {
++			seg = len - off;
++		}
++		for (addr64_t p = trunc_page_64(pa); p < pa + seg; p += PAGE_SIZE) {
++			/* not kernel RAM (the panel's buffers): no physmap alias, nothing cached */
++			if (pmap_valid_page((ppnum_t)atop_64(p))) {
++				flush_dcache64(p, PAGE_SIZE, TRUE);
++				pages++;
++			}
++		}
++		off += seg;
++	}
++	if (logged < 8) {
++		logged++;
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		IOLog("SWEET SURF: lock of surface %u (%ux%u) after GPU use: %u pages cleaned and invalidated in %llu us\n",
++		    s->id, s->width, s->height, pages, ns / 1000);
++	}
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+     void *, void *, void *)
+@@ -973,6 +1020,11 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	uint32_t use = s->gpuUse;
++	if (use != s->gpuUseSeen) {
++		s->gpuUseSeen = use;
++		sweet_surface_invalidate(s);
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 311014a..11ea01d 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -41,6 +41,8 @@ public:
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	bool                      clientMemory; /* the creator's pages (IOSurfaceAddress), prepared */
+ 	bool                      readOnly;     /* ...from a read-only mapping: mapped read-only */
++	volatile uint32_t         gpuUse;       /* 0358: GPU submits that listed it (SweetGPU) */
++	uint32_t                  gpuUseSeen;   /* ...as of the last CPU lock's cache maintenance */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
