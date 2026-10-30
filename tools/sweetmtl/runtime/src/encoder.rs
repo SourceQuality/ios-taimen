@@ -9,7 +9,7 @@
 //! another queue's).
 
 use crate::bind::{push_block, resolve, Attachments, Slot, StageRef, Table};
-use crate::command::{Cmd, CommandBuffer, DispatchRegion, DrawCmd, PassCmd};
+use crate::command::{Cmd, CommandBuffer, DispatchRegion, DrawCmd, PassCmd, ResolveCmd};
 use crate::device::{Device, Size};
 use crate::error::{invalid, not_yet, Error};
 use crate::ffi;
@@ -74,6 +74,49 @@ impl StoreAction {
             _ => return Err(invalid(format!("MTLStoreAction {raw}"))),
         })
     }
+
+    /// Whether the action resolves the attachment into its resolve texture.
+    pub fn resolves(self) -> bool {
+        matches!(self, StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve)
+    }
+}
+
+/// `MTLMultisampleDepthResolveFilter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MultisampleDepthResolveFilter {
+    #[default]
+    Sample0,
+    Min,
+    Max,
+}
+
+impl MultisampleDepthResolveFilter {
+    pub fn from_raw(raw: u64) -> Result<MultisampleDepthResolveFilter, Error> {
+        match raw {
+            0 => Ok(MultisampleDepthResolveFilter::Sample0),
+            1 => Ok(MultisampleDepthResolveFilter::Min),
+            2 => Ok(MultisampleDepthResolveFilter::Max),
+            _ => Err(invalid(format!("MTLMultisampleDepthResolveFilter {raw}"))),
+        }
+    }
+}
+
+/// `MTLMultisampleStencilResolveFilter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MultisampleStencilResolveFilter {
+    #[default]
+    Sample0,
+    DepthResolvedSample,
+}
+
+impl MultisampleStencilResolveFilter {
+    pub fn from_raw(raw: u64) -> Result<MultisampleStencilResolveFilter, Error> {
+        match raw {
+            0 => Ok(MultisampleStencilResolveFilter::Sample0),
+            1 => Ok(MultisampleStencilResolveFilter::DepthResolvedSample),
+            _ => Err(invalid(format!("MTLMultisampleStencilResolveFilter {raw}"))),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -99,7 +142,12 @@ pub struct RenderPassColorAttachment {
     pub load_action: LoadAction,
     pub store_action: StoreAction,
     pub clear_color: ClearColor,
+    /// Where a resolve store action resolves the attachment: a single-sampled texture's level and
+    /// slice (a 3D texture's depth plane).
     pub resolve_texture: Option<Texture>,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
 }
 
 #[derive(Clone, Default)]
@@ -111,6 +159,11 @@ pub struct RenderPassDepthAttachment {
     pub load_action: LoadAction,
     pub store_action: StoreAction,
     pub clear_depth: f64,
+    pub resolve_texture: Option<Texture>,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
+    pub resolve_filter: MultisampleDepthResolveFilter,
 }
 
 #[derive(Clone, Default)]
@@ -122,6 +175,11 @@ pub struct RenderPassStencilAttachment {
     pub load_action: LoadAction,
     pub store_action: StoreAction,
     pub clear_stencil: u32,
+    pub resolve_texture: Option<Texture>,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
+    pub resolve_filter: MultisampleStencilResolveFilter,
 }
 
 /// `MTLRenderPassDescriptor`, a plain value.
@@ -423,6 +481,8 @@ pub struct RenderCommandEncoder {
     attachments: Attachments,
     has_depth: bool,
     has_stencil: bool,
+    /// The store actions' resolves, recorded after the pass ends.
+    resolves: Vec<ResolveCmd>,
     pipeline: Option<RenderPipelineState>,
     depth_stencil: Option<DepthStencilState>,
     vertex: Table,
@@ -465,8 +525,75 @@ fn attachment(texture: &Texture, level: u64, slice: u64, depth_plane: u64, load:
     ))
 }
 
+/// Where a resolve store action sends an attachment.
+struct ResolveTarget<'a> {
+    store: StoreAction,
+    texture: Option<&'a Texture>,
+    level: u64,
+    slice: u64,
+    depth_plane: u64,
+}
+
+/// An attachment's resolve, checked: its texture's level and layer `(l, s)`, `w` x `h`, into the
+/// resolve texture's level and slice (a 3D texture's depth plane), on the GPU after the pass
+/// (sg_ctx_resolve). None where the store action does not resolve (Metal ignores the resolve
+/// texture then).
+#[allow(clippy::too_many_arguments)]
+fn resolve_of(what: impl Fn() -> String, texture: &Texture, l: u32, s: u32, w: u32, h: u32, target: ResolveTarget,
+              aspects: u32, used: &mut Vec<u64>, no_copy: &mut Vec<Buffer>) -> Result<Option<ResolveCmd>, Error> {
+    if target.store == StoreAction::Unknown && target.texture.is_some() {
+        return Err(not_yet(format!(
+            "{}: MTLStoreActionUnknown with a resolve texture (store actions set on the encoder)",
+            what()
+        )));
+    }
+    if !target.store.resolves() {
+        return Ok(None);
+    }
+    let r = target
+        .texture
+        .ok_or_else(|| invalid(format!("{}: store action {:?} without a resolve texture", what(), target.store)))?;
+    if r.sample_count() > 1 {
+        return Err(invalid(format!("{}: a multisampled resolve texture", what())));
+    }
+    if Arc::ptr_eq(&r.0.image, &texture.0.image) {
+        return Err(invalid(format!("{}: the resolve texture is the attachment's own", what())));
+    }
+    let three_d = r.texture_type() == TextureType::Type3D;
+    let (rl, rs) = r.image_level_slice(target.level, if three_d { 0 } else { target.slice })?;
+    let rs = if three_d {
+        if target.depth_plane >= (r.0.desc.depth >> rl).max(1) {
+            return Err(invalid(format!("{}: resolve depth plane {} past the level", what(), target.depth_plane)));
+        }
+        u32_of(target.depth_plane, "resolve depth plane")?
+    } else {
+        rs
+    };
+    let rw = (r.0.desc.width >> rl).max(1) as u32;
+    let rh = (r.0.desc.height >> rl).max(1) as u32;
+    used.extend(r.ids());
+    no_copy_texture(r, no_copy);
+    Ok(Some(ResolveCmd {
+        src: texture.0.image.clone(),
+        src_format: vk_format(texture.pixel_format())?,
+        src_level: l,
+        src_layer: s,
+        dst: r.0.image.clone(),
+        dst_format: vk_format(r.pixel_format())?,
+        dst_level: rl,
+        dst_layer: rs,
+        width: w.min(rw),
+        height: h.min(rh),
+        aspects,
+    }))
+}
+
 impl CommandBuffer {
-    /// `renderCommandEncoderWithDescriptor:`: begins the pass (its load actions).
+    /// `renderCommandEncoderWithDescriptor:`: begins the pass (its load actions). The resolve
+    /// store actions (MultisampleResolve, StoreAndMultisampleResolve) run after the pass ends
+    /// (sg_ctx_resolve: the GPU's resolve, averaging color; depth and stencil resolve with Metal's
+    /// Sample0 filters, other filters are not yet). The multisampled texture keeps its samples
+    /// either way (MultisampleResolve leaves them undefined).
     pub fn render_command_encoder(&self, pass: &RenderPassDescriptor) -> Result<RenderCommandEncoder, Error> {
         let mut keep = Vec::new();
         let mut sg = ffi::sg_pass::default();
@@ -474,17 +601,22 @@ impl CommandBuffer {
         let mut attachments: Attachments = Default::default();
         let mut used = Vec::new();
         let mut no_copy = Vec::new();
+        let mut resolves = Vec::new();
         let mut samples = pass.default_raster_sample_count.max(1) as u32;
         for (i, a) in pass.color_attachments.iter().enumerate() {
             let Some(t) = &a.texture else { continue };
-            if a.resolve_texture.is_some()
-                || matches!(a.store_action, StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve)
-            {
-                return Err(not_yet("multisample resolve"));
-            }
             let c = a.clear_color;
             let (att, w, h, l, s) =
                 attachment(t, a.level, a.slice, a.depth_plane, a.load_action, [c.red, c.green, c.blue, c.alpha], &mut keep)?;
+            let target = ResolveTarget {
+                store: a.store_action,
+                texture: a.resolve_texture.as_ref(),
+                level: a.resolve_level,
+                slice: a.resolve_slice,
+                depth_plane: a.resolve_depth_plane,
+            };
+            resolves.extend(resolve_of(|| format!("color attachment {i}"), t, l, s, w, h, target, ffi::SG_ASPECT_COLOR,
+                                       &mut used, &mut no_copy)?);
             sg.color[i] = att;
             size.get_or_insert((w, h));
             attachments[i] = Some((t.clone(), l, s));
@@ -494,21 +626,51 @@ impl CommandBuffer {
         }
         let mut has_depth = false;
         let mut has_stencil = false;
+        let depth_filter = pass.depth_attachment.resolve_filter;
         if let Some(t) = &pass.depth_attachment.texture {
             let a = &pass.depth_attachment;
-            let (att, w, h, _, _) =
+            let (att, w, h, l, s) =
                 attachment(t, a.level, a.slice, a.depth_plane, a.load_action, [a.clear_depth, 0.0, 0.0, 0.0], &mut keep)?;
+            if a.store_action.resolves() && depth_filter != MultisampleDepthResolveFilter::Sample0 {
+                return Err(not_yet(format!("depth resolve filter {depth_filter:?} (the GPU's resolve takes sample 0)")));
+            }
+            let target = ResolveTarget {
+                store: a.store_action,
+                texture: a.resolve_texture.as_ref(),
+                level: a.resolve_level,
+                slice: a.resolve_slice,
+                depth_plane: a.resolve_depth_plane,
+            };
+            resolves.extend(resolve_of(|| "depth attachment".into(), t, l, s, w, h, target, ffi::SG_ASPECT_DEPTH, &mut used,
+                                       &mut no_copy)?);
             sg.depth = att;
             size.get_or_insert((w, h));
+            samples = samples.max(t.sample_count() as u32);
             has_depth = true;
             used.extend(t.ids());
         }
         if let Some(t) = &pass.stencil_attachment.texture {
             let a = &pass.stencil_attachment;
-            let (att, w, h, _, _) = attachment(t, a.level, a.slice, a.depth_plane, a.load_action,
+            let (att, w, h, l, s) = attachment(t, a.level, a.slice, a.depth_plane, a.load_action,
                                                [a.clear_stencil as f64, 0.0, 0.0, 0.0], &mut keep)?;
+            // DepthResolvedSample is the sample the depth filter picks: sample 0 under Sample0
+            if a.store_action.resolves() && a.resolve_filter == MultisampleStencilResolveFilter::DepthResolvedSample
+                && depth_filter != MultisampleDepthResolveFilter::Sample0
+            {
+                return Err(not_yet(format!("stencil resolve of the depth filter's sample ({depth_filter:?})")));
+            }
+            let target = ResolveTarget {
+                store: a.store_action,
+                texture: a.resolve_texture.as_ref(),
+                level: a.resolve_level,
+                slice: a.resolve_slice,
+                depth_plane: a.resolve_depth_plane,
+            };
+            resolves.extend(resolve_of(|| "stencil attachment".into(), t, l, s, w, h, target, ffi::SG_ASPECT_STENCIL,
+                                       &mut used, &mut no_copy)?);
             sg.stencil = att;
             size.get_or_insert((w, h));
+            samples = samples.max(t.sample_count() as u32);
             has_stencil = true;
             used.extend(t.ids());
         }
@@ -539,6 +701,7 @@ impl CommandBuffer {
             attachments,
             has_depth,
             has_stencil,
+            resolves,
             pipeline: None,
             depth_stencil: None,
             vertex: Table::default(),
@@ -895,6 +1058,9 @@ impl RenderCommandEncoder {
 
     pub fn end_encoding(mut self) -> Result<(), Error> {
         self.core.cmds.push(Cmd::EndPass);
+        for r in std::mem::take(&mut self.resolves) {
+            self.core.cmds.push(Cmd::Resolve(Box::new(r)));
+        }
         self.core.end();
         Ok(())
     }

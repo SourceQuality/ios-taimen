@@ -64,7 +64,7 @@ struct sg_stats {
    uint64_t dispatches;     /* launch_grid calls */
    uint64_t draws;          /* draw_vbo calls */
    uint64_t clears;         /* clears (load action Clear) */
-   uint64_t blits;          /* copies, fills and mipmaps recorded on the GPU */
+   uint64_t blits;          /* copies, fills, mipmaps and resolves recorded on the GPU */
    uint64_t cpu_copies;     /* copies and fills done on the CPU after a wait */
    uint64_t shaders;        /* CSOs created */
    uint64_t shader_instrs;  /* ir3 instructions of their default variants */
@@ -124,7 +124,7 @@ struct sg_texture_desc {
    uint32_t vk_format;
    uint32_t width, height, depth, array_size;
    uint32_t levels;      /* mipmap levels, >= 1 */
-   uint32_t samples;     /* 0 or 1 for single-sampled */
+   uint32_t samples;     /* 0 or 1 for single-sampled; a540: 2 or 4 (softpipe fakes them: 1) */
    uint32_t usage;       /* SG_USAGE_* */
    uint32_t linear;      /* force a linear layout */
 };
@@ -312,6 +312,28 @@ struct sg_pass {
 /* Sets the framebuffer and performs the load actions. */
 bool sg_ctx_begin_pass(struct sg_device *dev, const struct sg_pass *pass);
 void sg_ctx_end_pass(struct sg_device *dev);
+
+/* The store action MTLStoreAction(StoreAnd)MultisampleResolve of one attachment, after its pass
+ * ended (sg_ctx_end_pass): `src` (the multisampled attachment, one level and layer) resolved into
+ * the single-sampled `dst` over the rectangle (0, 0, width, height), clipped to both levels. It
+ * runs on the GPU as Gallium's resolve, pipe->blit from the multisampled resource with the nearest
+ * filter: color averages the samples, depth and stencil take sample 0 (Metal's
+ * MTLMultisampleDepthResolveFilterSample0 and MTLMultisampleStencilResolveFilterSample0; freedreno
+ * a5xx does it with u_blitter's resolve shaders, stencil through its stencil fallback). Where the
+ * driver fakes multisampling (softpipe: sg_texture_new made `src` single-sampled) it is a copy.
+ * The source keeps its samples (Metal's MultisampleResolve leaves them undefined: kept is one
+ * answer). */
+#define SG_ASPECT_COLOR 1u
+#define SG_ASPECT_DEPTH 2u
+#define SG_ASPECT_STENCIL 4u
+struct sg_resolve {
+   struct sg_texture *src, *dst;
+   uint32_t src_format, src_level, src_layer; /* format: VkFormat of the view, 0: the texture's */
+   uint32_t dst_format, dst_level, dst_layer; /* layer: the array slice, or a 3D level's depth plane */
+   uint32_t width, height;
+   uint32_t aspects;                          /* SG_ASPECT_* */
+};
+bool sg_ctx_resolve(struct sg_device *dev, const struct sg_resolve *resolve);
 
 struct sg_draw {
    struct sg_shader *vs, *fs;

@@ -280,6 +280,25 @@ pub struct sg_pass {
     pub samples: u32,
 }
 
+pub const SG_ASPECT_COLOR: u32 = 1;
+pub const SG_ASPECT_DEPTH: u32 = 2;
+pub const SG_ASPECT_STENCIL: u32 = 4;
+
+#[repr(C)]
+pub struct sg_resolve {
+    pub src: *mut sg_texture,
+    pub dst: *mut sg_texture,
+    pub src_format: u32,
+    pub src_level: u32,
+    pub src_layer: u32,
+    pub dst_format: u32,
+    pub dst_level: u32,
+    pub dst_layer: u32,
+    pub width: u32,
+    pub height: u32,
+    pub aspects: u32,
+}
+
 #[repr(C)]
 pub struct sg_draw {
     pub vs: *mut sg_shader,
@@ -369,6 +388,7 @@ unsafe extern "C" {
     pub fn sg_ctx_dispatch(dev: *mut sg_device, cs: *mut sg_shader, grid: *const u32, shared_bytes: u32) -> bool;
     pub fn sg_ctx_begin_pass(dev: *mut sg_device, pass: *const sg_pass) -> bool;
     pub fn sg_ctx_end_pass(dev: *mut sg_device);
+    pub fn sg_ctx_resolve(dev: *mut sg_device, resolve: *const sg_resolve) -> bool;
     pub fn sg_ctx_draw(dev: *mut sg_device, draw: *const sg_draw) -> bool;
     pub fn sg_ctx_copy_buffer(dev: *mut sg_device, dst: *mut sg_buffer, dst_offset: u64, src: *mut sg_buffer,
                               src_offset: u64, size: u64) -> bool;

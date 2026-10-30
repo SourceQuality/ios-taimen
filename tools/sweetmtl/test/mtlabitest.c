@@ -1,8 +1,8 @@
 /*
  * mtlabitest: the bridge's object ABI (NativeMetalObjects.h, what the Objective-C frontend calls) on sweetmtl-runtime,
  * beyond the self-test: device answers, textures (CPU access, sampling, storage), samplers, blits, indexed draws with
- * depth, viewport, scissor and culling, function constants, threadgroup memory, vertex attributes, events, shared
- * events and listeners, fences, handlers and resource tracking.
+ * depth, viewport, scissor and culling, multisample resolves (color, depth and stencil), function constants,
+ * threadgroup memory, vertex attributes, events, shared events and listeners, fences, handlers and resource tracking.
  *
  *   mtlabitest [--daemon] [AIR_DIR]
  *
@@ -35,7 +35,7 @@ void sys_dcache_flush(void *start, size_t len)
 	(void)len;
 }
 
-static int fails, shim;
+static int fails, shim, softpipe;
 static const char *air_dir;
 
 static void line(const char *verdict, const char *what, const char *detail)
@@ -64,10 +64,11 @@ static void gpu_result(const char *what, int bad, const char *detail)
 
 /* Metal's raw values used below */
 enum {
-	PF_RGBA8 = 70, PF_RGBA32U = 123, PF_D32F = 252,
-	TT_2D = 2, TU_READ = 1, TU_WRITE = 2, TU_RT = 4,
+	PF_RGBA8 = 70, PF_RGBA32U = 123, PF_D32F = 252, PF_D32F_S8 = 260,
+	TT_2D = 2, TT_2D_MS = 4, TU_READ = 1, TU_WRITE = 2, TU_RT = 4,
 	SM_SHARED = 0, SM_PRIVATE = 2 << 4,
-	LOAD_CLEAR = 2, STORE_STORE = 1,
+	LOAD_LOAD = 1, LOAD_CLEAR = 2, STORE_STORE = 1, STORE_RESOLVE = 2, STORE_STORE_RESOLVE = 3,
+	STENCIL_RESOLVE_DEPTH_SAMPLE = 1,
 	PRIM_TRIANGLE = 3,
 	IDX_U16 = 0,
 	CMP_LESS = 1, CMP_ALWAYS = 7,
@@ -204,7 +205,7 @@ static void texture_cpu(void)
 	nmb_texture_release(t);
 }
 
-static NmbRenderPipeline *colored_pipeline(NmbLibrary *lib, const char *fragment, uint64_t depth)
+static NmbRenderPipeline *colored_pipeline(NmbLibrary *lib, const char *fragment, uint64_t depth, uint64_t samples)
 {
 	NmbFunction *v = nmb_function_new(lib, "colored_vertex"), *f = nmb_function_new(lib, fragment);
 	struct NmbRenderPipelineDescriptor d;
@@ -214,6 +215,7 @@ static NmbRenderPipeline *colored_pipeline(NmbLibrary *lib, const char *fragment
 	d.colors[0].format = PF_RGBA8;
 	d.colors[0].write_mask = 0xf;
 	d.depth_format = depth;
+	d.samples = samples;
 	d.topology = 3; /* MTLPrimitiveTopologyClassTriangle */
 	d.rasterization = 1;
 	NmbRenderPipeline *p = v && f ? nmb_render_pipeline_new(dev, &d) : NULL;
@@ -226,7 +228,7 @@ static NmbRenderPipeline *colored_pipeline(NmbLibrary *lib, const char *fragment
 
 static void sampled_render(NmbLibrary *lib)
 {
-	NmbRenderPipeline *p = colored_pipeline(lib, "sampled_fragment", 0);
+	NmbRenderPipeline *p = colored_pipeline(lib, "sampled_fragment", 0, 1);
 	if (!p) {
 		refused("render with a sampled texture: pipeline");
 		return;
@@ -383,7 +385,7 @@ static void blits(void)
  * green inside the scissor, the clear color outside. */
 static void indexed_and_depth(NmbLibrary *lib)
 {
-	NmbRenderPipeline *p = colored_pipeline(lib, "colored_fragment", PF_D32F);
+	NmbRenderPipeline *p = colored_pipeline(lib, "colored_fragment", PF_D32F, 1);
 	struct NmbDepthStencilDescriptor ds;
 	memset(&ds, 0, sizeof(ds));
 	ds.compare = CMP_LESS;
@@ -455,6 +457,170 @@ static void indexed_and_depth(NmbLibrary *lib)
 	nmb_buffer_release(ib);
 	nmb_render_pipeline_release(p);
 	nmb_depth_stencil_release(dss);
+}
+
+/* Multisample resolve of a color attachment: a 4x RGBA8 target (the a540 renders 2x and 4x; the device answers 1 and
+ * 4) cleared blue with a green triangle over its lower-left half (y > x in Metal's y-down window coordinates), stored
+ * and resolved into a single-sampled texture (MTLStoreActionStoreAndMultisampleResolve); a second pass loads the kept
+ * samples, draws nothing and resolves them into another (MTLStoreActionMultisampleResolve). Texels off the diagonal
+ * resolve to one color; the diagonal's, half covered, average their samples where the device multisamples (softpipe
+ * fakes 4x as 1x: one color each). */
+static void msaa_resolve(NmbLibrary *lib)
+{
+	const char *what = "multisample resolve (4x RGBA8: clear, draw, store and resolve; load, resolve)";
+	uint64_t four = 0;
+	if (!nmb_device_answer(dev, "supportsTextureSampleCount:", 4, &four) || !four) {
+		line("FAIL", what, "supportsTextureSampleCount:4 is false");
+		return;
+	}
+	NmbRenderPipeline *p = colored_pipeline(lib, "colored_fragment", 0, 4);
+	struct NmbTextureDescriptor md = {TT_2D_MS, PF_RGBA8, 16, 16, 1, 1, 4, 1, TU_RT, SM_PRIVATE};
+	NmbTexture *ms = p ? nmb_texture_new(dev, &md) : NULL;
+	NmbTexture *r1 = texture(PF_RGBA8, 16, 16, 1, TU_RT | TU_READ, SM_SHARED),
+	           *r2 = texture(PF_RGBA8, 16, 16, 1, TU_RT | TU_READ, SM_SHARED);
+	float pos[3][2] = {{-1, 1}, {1, -1}, {-1, -1}};
+	float col[3][4] = {{0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}};
+	NmbBuffer *pb = nmb_buffer_new(dev, sizeof(pos), SM_SHARED, pos), *cbuf = nmb_buffer_new(dev, sizeof(col), SM_SHARED, col);
+	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
+	static const uint8_t junk[4] = {0x5a, 0x5a, 0x5a, 0x5a}; /* a texel the resolve misses stays 0x5a */
+	if (!p || !ms || !r1 || !r2) {
+		refused(what);
+		goto done;
+	}
+	fill_rgba8(r1, 16, 16, 0, junk);
+	fill_rgba8(r2, 16, 16, 0, junk);
+	struct NmbRenderPassDescriptor rp;
+	memset(&rp, 0, sizeof(rp));
+	rp.colors[0].texture = ms;
+	rp.colors[0].load = LOAD_CLEAR;
+	rp.colors[0].store = STORE_STORE_RESOLVE;
+	rp.colors[0].clear[2] = 1.0; /* blue */
+	rp.colors[0].clear[3] = 1.0;
+	rp.colors[0].resolve_texture = r1;
+	NmbEncoder *e = nmb_render_encoder_new(cb, &rp);
+	if (!e || !nmb_render_set_pipeline(e, p) || !nmb_encoder_set_buffer(e, 1, pb, 0, 0) ||
+	    !nmb_encoder_set_buffer(e, 1, cbuf, 0, 1) || !nmb_render_draw(e, PRIM_TRIANGLE, 0, 3, 1, 0)) {
+		refused(what);
+		if (e)
+			nmb_encoder_discard(e);
+		goto done;
+	}
+	if (!nmb_encoder_end(e)) {
+		refused(what);
+		goto done;
+	}
+	rp.colors[0].load = LOAD_LOAD;
+	rp.colors[0].store = STORE_RESOLVE;
+	rp.colors[0].resolve_texture = r2;
+	e = nmb_render_encoder_new(cb, &rp);
+	if (!e || !nmb_encoder_end(e)) {
+		refused("multisample resolve: the second pass (load, resolve)");
+		goto done;
+	}
+	if (finish(cb, what)) {
+		uint8_t a[16 * 16 * 4], b[16 * 16 * 4];
+		int bad = read_rgba8(r1, 16, 16, 0, a) && read_rgba8(r2, 16, 16, 0, b) ? 0 : 256, blended = 0, differ = 0;
+		for (int y = 0; y < 16 && bad < 256; y++)
+			for (int x = 0; x < 16; x++) {
+				const uint8_t *t = a + 4 * (y * 16 + x), *u = b + 4 * (y * 16 + x);
+				if (x != y) {
+					const uint8_t want[4] = {0, (uint8_t)(y > x ? 255 : 0), (uint8_t)(y > x ? 0 : 255), 255};
+					int off = 0;
+					for (int c = 0; c < 4; c++)
+						off |= off_by(t[c], want[c]) > 1;
+					bad += off;
+				} else {
+					/* half green, half blue: green and blue add up to one */
+					bad += t[0] > 1 || t[3] < 254 || off_by(t[1] + t[2], 255) > 2;
+					blended += t[1] > 8 && t[2] > 8;
+				}
+				int d = 0;
+				for (int c = 0; c < 4; c++)
+					d |= off_by(t[c], u[c]) > 1;
+				differ += d;
+			}
+		char detail[160];
+		snprintf(detail, sizeof(detail), "%d of 256 texels off, %d of 16 diagonal texels blended%s, %d differ after load and resolve",
+		         bad, blended, softpipe ? " (softpipe fakes 4x: none expected)" : "", differ);
+		/* a device that multisamples blends the half-covered diagonal */
+		gpu_result(what, bad || differ || (!softpipe && !blended), detail);
+	}
+done:
+	nmb_command_buffer_release(cb);
+	nmb_buffer_release(pb);
+	nmb_buffer_release(cbuf);
+	if (ms)
+		nmb_texture_release(ms);
+	if (r1)
+		nmb_texture_release(r1);
+	if (r2)
+		nmb_texture_release(r2);
+	if (p)
+		nmb_render_pipeline_release(p);
+}
+
+/* Multisample resolve of depth and stencil: a 4x Depth32Float_Stencil8 attachment cleared to 0.25 and 0x5b, resolved
+ * (MTLStoreActionMultisampleResolve; depth filter Sample0, stencil filter DepthResolvedSample) into a single-sampled
+ * one, read back (Depth32Float_Stencil8: a float, then the stencil in the low byte of a word). */
+static void msaa_depth_stencil_resolve(void)
+{
+	const char *what = "multisample resolve of depth and stencil (4x Depth32Float_Stencil8: clear, resolve)";
+	struct NmbTextureDescriptor md = {TT_2D_MS, PF_D32F_S8, 16, 16, 1, 1, 4, 1, TU_RT, SM_PRIVATE};
+	NmbTexture *ms = nmb_texture_new(dev, &md), *r = texture(PF_D32F_S8, 16, 16, 1, TU_RT | TU_READ, SM_SHARED);
+	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
+	enum { N = 16 * 16 * 8 };
+	uint8_t *texels = malloc(N);
+	if (!ms || !r) {
+		refused(what);
+		goto done;
+	}
+	/* depth 0.75, stencil 0x11 where the resolve misses */
+	for (int i = 0; i < 16 * 16; i++) {
+		const float z = 0.75f;
+		const uint32_t s = 0x11;
+		memcpy(texels + 8 * i, &z, 4);
+		memcpy(texels + 8 * i + 4, &s, 4);
+	}
+	uint64_t region[6] = {0, 0, 0, 16, 16, 1};
+	nmb_texture_replace(r, region, 0, 0, texels, 16 * 8, 0, N);
+	struct NmbRenderPassDescriptor rp;
+	memset(&rp, 0, sizeof(rp));
+	rp.depth.texture = rp.stencil.texture = ms;
+	rp.depth.load = rp.stencil.load = LOAD_CLEAR;
+	rp.depth.store = rp.stencil.store = STORE_RESOLVE;
+	rp.depth.clear[0] = 0.25;
+	rp.stencil.clear[0] = 0x5b;
+	rp.depth.resolve_texture = rp.stencil.resolve_texture = r;
+	rp.stencil.resolve_filter = STENCIL_RESOLVE_DEPTH_SAMPLE;
+	NmbEncoder *e = nmb_render_encoder_new(cb, &rp);
+	if (!e || !nmb_encoder_end(e)) {
+		refused(what);
+		goto done;
+	}
+	if (finish(cb, what)) {
+		memset(texels, 0, N);
+		int depth_bad = 0, stencil_bad = 0;
+		if (!nmb_texture_get_bytes(r, texels, 16 * 8, 0, N, region, 0, 0)) {
+			depth_bad = stencil_bad = 256;
+		} else {
+			for (int i = 0; i < 16 * 16; i++) {
+				float z;
+				memcpy(&z, texels + 8 * i, 4);
+				depth_bad += z != 0.25f;
+				stencil_bad += texels[8 * i + 4] != 0x5b;
+			}
+		}
+		char detail[96];
+		snprintf(detail, sizeof(detail), "depth %d, stencil %d of 256 texels off", depth_bad, stencil_bad);
+		gpu_result(what, depth_bad || stencil_bad, detail);
+	}
+done:
+	nmb_command_buffer_release(cb);
+	free(texels);
+	if (ms)
+		nmb_texture_release(ms);
+	if (r)
+		nmb_texture_release(r);
 }
 
 static void function_constants(void)
@@ -770,6 +936,9 @@ int main(int argc, char **argv)
 		return oneshot_end("mtlabitest", 1);
 	}
 	queue = nmb_queue_new(dev);
+	char name[128] = "";
+	nmb_device_name(dev, name, sizeof(name));
+	softpipe = strstr(name, "softpipe") != NULL;
 	size_t n = 0;
 	const void *air = nmb_fixture_air(&n);
 	NmbLibrary *lib = nmb_library_new(dev, air, n, true);
@@ -783,6 +952,8 @@ int main(int argc, char **argv)
 	storage_compute(lib);
 	blits();
 	indexed_and_depth(lib);
+	msaa_resolve(lib);
+	msaa_depth_stencil_resolve();
 	function_constants();
 	threadgroup_memory();
 	sampler_kernel();

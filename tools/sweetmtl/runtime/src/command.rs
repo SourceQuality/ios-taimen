@@ -75,11 +75,28 @@ pub(crate) struct PassCmd {
 // SAFETY: the raw pointers in `pass` are kept valid by `textures`.
 unsafe impl Send for PassCmd {}
 
+/// A pass attachment's multisample resolve (its store action), replayed after the pass ends.
+pub(crate) struct ResolveCmd {
+    pub(crate) src: Arc<SgTexture>,
+    pub(crate) src_format: u32,
+    pub(crate) src_level: u32,
+    pub(crate) src_layer: u32,
+    pub(crate) dst: Arc<SgTexture>,
+    pub(crate) dst_format: u32,
+    pub(crate) dst_level: u32,
+    pub(crate) dst_layer: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// ffi::SG_ASPECT_*
+    pub(crate) aspects: u32,
+}
+
 pub(crate) enum Cmd {
     Dispatch { binds: Vec<Bind>, regions: Vec<DispatchRegion>, shared: u32 },
     BeginPass(Box<PassCmd>),
     Draw(Box<DrawCmd>),
     EndPass,
+    Resolve(Box<ResolveCmd>),
     CopyBuffer { src: Arc<BufferInner>, src_offset: u64, dst: Arc<BufferInner>, dst_offset: u64, size: u64 },
     FillBuffer { buffer: Arc<BufferInner>, offset: u64, size: u64, value: u8 },
     CopyTexture {
@@ -188,6 +205,24 @@ fn replay(lock: &GpuLock, cmd: &Cmd) -> Result<(), String> {
                 }
             }
             Cmd::EndPass => ffi::sg_ctx_end_pass(sg),
+            Cmd::Resolve(r) => {
+                let resolve = ffi::sg_resolve {
+                    src: r.src.sg,
+                    dst: r.dst.sg,
+                    src_format: r.src_format,
+                    src_level: r.src_level,
+                    src_layer: r.src_layer,
+                    dst_format: r.dst_format,
+                    dst_level: r.dst_level,
+                    dst_layer: r.dst_layer,
+                    width: r.width,
+                    height: r.height,
+                    aspects: r.aspects,
+                };
+                if !ffi::sg_ctx_resolve(sg, &resolve) {
+                    return Err(fail("multisample resolve"));
+                }
+            }
             Cmd::CopyBuffer { src, src_offset, dst, dst_offset, size } => {
                 if !ffi::sg_ctx_copy_buffer(sg, dst.sg.sg, *dst_offset, src.sg.sg, *src_offset, *size) {
                     return Err(fail("buffer copy"));

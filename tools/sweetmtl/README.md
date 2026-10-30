@@ -115,7 +115,7 @@ refusal for something the a540 cannot do.
 | Textures | `texture_new/new_linear/new_on_buffer/new_view/describe/replace/get_bytes/release/set_purgeable_state` | done: 1D/2D/3D/cube/arrays, mip levels, views with swizzle. A texture over a buffer needs freedreno. A linear texture of several images is not yet |
 | Libraries, functions | `library_new/function_count/function_name/release`, `function_new/new_specialized/type/release`, `fixture_air`, `function_constant_air` | done (function constants included) |
 | Compute | `compute_pipeline_new/new_with_descriptor/new_with_options/execution_width/max_threads/release`, `compute_encoder_new`, `compute_set_pipeline/set_threadgroup_memory`, `compute_dispatch` | done. Indirect dispatch is not yet |
-| Render | `render_pipeline_new/new_with_options/release`, `render_encoder_new`, `render_set_pipeline/viewport/scissor/raster/depth_stencil/stencil_reference/depth_bias/blend_color/line_width/visibility_mode`, `render_draw`, `render_draw_indexed` | done: vertex descriptors, blend per attachment, depth/stencil, culling and winding, scissor, primitive restart. Not yet: visibility results, line widths other than 1, multisample resolve, passes without attachments, pipelines without a fragment function, base instance (a5xx has no start instance), tessellation, mesh and tile functions (imageblocks), attachments read as storage images. Unsupported: sample-rate shading |
+| Render | `render_pipeline_new/new_with_options/release`, `render_encoder_new`, `render_set_pipeline/viewport/scissor/raster/depth_stencil/stencil_reference/depth_bias/blend_color/line_width/visibility_mode`, `render_draw`, `render_draw_indexed` | done: vertex descriptors, blend per attachment, depth/stencil, culling and winding, scissor, primitive restart, 4x multisampling with the resolve store actions (`resolve_texture` in `NmbPassAttachment`; after the pass, Gallium's resolve blit; depth and stencil with the Sample0 filters). Not yet: visibility results, line widths other than 1, depth resolve filters Min/Max, store actions set on the encoder (`MTLStoreActionUnknown` with a resolve texture), passes without attachments, pipelines without a fragment function, base instance (a5xx has no start instance), tessellation, mesh and tile functions (imageblocks), attachments read as storage images. Unsupported: sample-rate shading |
 | Encoder state | `encoder_set_buffer/set_buffer_offset/set_bytes/set_texture/set_sampler/end/discard/update_fence/wait_fence` | done. Argument buffers (descriptor bytes, handle tables) and push holes (device addresses a shader reads) are not yet |
 | Blits | `blit_encoder_new`, `blit_copy_buffer/fill_buffer/copy_texture/texture_to_buffer/buffer_to_texture/generate_mipmaps` | done. Copies run on the GPU with `resource_copy_region`, and mipmaps with `util_gen_mipmap`. a5xx has no `clear_buffer`, so fills, texture-to-buffer and buffer-to-texture run on the CPU after a wait |
 | Command buffers, queues | `queue_new/release`, `command_buffer_new/commit/status/error/gpu_time/on_completed/on_scheduled/wait/wait_scheduled/signal_event/wait_event/uses_buffer/uses_texture/release` | done |
@@ -202,9 +202,9 @@ softpipe:
 - **Self-test.** compute 0/1000 wrong, render 0/64 wrong. 0x6505 import stops with a clear error,
   by design: a texture over a buffer needs freedreno.
 - **mtlabitest.** All value checks right: sampled render through a constexpr sampler, read and
-  write images, the blits and mipmaps, culling, depth, viewport and scissor, function constants,
-  threadgroup memory, sampler arguments, events, and fences across queues. Heaps and archive
-  serialization report not yet.
+  write images, the blits and mipmaps, culling, depth, viewport and scissor, multisample resolves
+  (color, depth and stencil; 4x faked as 1x), function constants, threadgroup memory, sampler
+  arguments, events, and fences across queues. Heaps and archive serialization report not yet.
 
 iOS: see the iOS build section. The Rust half alone also builds in WSL
 (`cargo build --release --target aarch64-apple-ios` in `bridge/`, with conda-forge's
@@ -516,8 +516,11 @@ tells CPU cache trouble apart from a wrong bo.
 
 - **Not built yet:** heaps, argument buffers and handle tables, push holes, global memory (the
   ir3 `ldg`/`stg` patch), pipeline variants beyond specialization (`Plans` refuses a non-empty
-  variant), indirect dispatch and draws, visibility queries, resolve, base instance, the disk
-  cache.
+  variant), indirect dispatch and draws, visibility queries, base instance, the disk cache.
+- **Multisampling on the phone.** 4x passes and their resolves record on drm-shim (the resolve is
+  u_blitter's averaging shader, four `isamm` fetches) but have not executed on the a540; softpipe
+  fakes 4x as 1x (Gallium's `fake_sw_msaa`), so its check covers the resolve's plumbing, not the
+  averaging.
 - **Neutral images.** An image binding where nothing is bound is refused, not given a dummy
   texture.
 - **Framebuffer fetch.** The texture-barrier emulation is wired in the profile and in sysmem mode

@@ -190,6 +190,14 @@ sg_texture_new(struct sg_device *dev, const struct sg_texture_desc *desc)
    struct pipe_resource templ;
    if (!texture_template(desc, &templ))
       return NULL;
+   /* softpipe (the PC's validation driver) has no multisampled textures and asks for fake MSAA
+    * (Gallium's fake_sw_msaa, which Mesa's GL state tracker takes the same way): a multisampled
+    * texture is single-sampled there, its rendering aliased, its resolve (sg_ctx_resolve) a copy.
+    * freedreno a5xx multisamples (texture_multisample: 2x and 4x) and never takes this. */
+   if (templ.nr_samples > 1 && dev->screen->caps.fake_sw_msaa) {
+      templ.nr_samples = 0;
+      templ.nr_storage_samples = 0;
+   }
    if (!supported(dev, &templ)) {
       /* not every format renders or samples: keep exactly what the usage asks for */
       templ.bind = sg_bind_from_usage(desc->vk_format, desc->usage) |

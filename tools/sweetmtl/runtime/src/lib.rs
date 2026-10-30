@@ -31,8 +31,8 @@ pub use device::{
     ShaderCacheStatistics, Size, Tier,
 };
 pub use encoder::{
-    BlitCommandEncoder, BlitOption, ClearColor, ComputeCommandEncoder, LoadAction, RenderCommandEncoder,
-    RenderPassColorAttachment, RenderPassDepthAttachment, RenderPassDescriptor, RenderPassStencilAttachment,
+    BlitCommandEncoder, BlitOption, ClearColor, ComputeCommandEncoder, LoadAction, MultisampleDepthResolveFilter,
+    MultisampleStencilResolveFilter, RenderCommandEncoder, RenderPassColorAttachment, RenderPassDepthAttachment, RenderPassDescriptor, RenderPassStencilAttachment,
     ScissorRect, StoreAction, Viewport, VisibilityResultMode, MAX_COLOR_ATTACHMENTS,
 };
 pub use error::{Error, RuntimeGap};

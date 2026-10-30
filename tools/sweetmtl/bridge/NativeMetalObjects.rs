@@ -20,7 +20,7 @@ use metal2vulkan::pipeline::{
 use sweetmtl_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+    MetalLevel, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
@@ -1640,6 +1640,11 @@ pub struct NmbPassAttachment {
     pub load: u64,
     pub store: u64,
     pub clear: [f64; 4],
+    pub resolve_texture: *mut NmbTexture,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
+    pub resolve_filter: u64,
 }
 
 #[repr(C)]
@@ -1658,6 +1663,10 @@ fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
 }
 
+fn resolve_texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
+    if a.resolve_texture.is_null() { Ok(None) } else { Ok(Some(get(a.resolve_texture)?.0.clone())) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, descriptor: *const NmbRenderPassDescriptor)
                                          -> *mut NmbEncoder {
@@ -1672,6 +1681,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
             slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
             slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
             slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
+            slot.resolve_texture = resolve_texture_of(a)?;
+            slot.resolve_level = a.resolve_level;
+            slot.resolve_slice = a.resolve_slice;
+            slot.resolve_depth_plane = a.resolve_depth_plane;
         }
         let depth = &mut pass.depth_attachment;
         depth.texture = texture_of(&d.depth)?;
@@ -1681,6 +1694,11 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
         depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
         depth.clear_depth = d.depth.clear[0];
+        depth.resolve_texture = resolve_texture_of(&d.depth)?;
+        depth.resolve_level = d.depth.resolve_level;
+        depth.resolve_slice = d.depth.resolve_slice;
+        depth.resolve_depth_plane = d.depth.resolve_depth_plane;
+        depth.resolve_filter = MultisampleDepthResolveFilter::from_raw(d.depth.resolve_filter).map_err(e("depth resolve filter"))?;
         let stencil = &mut pass.stencil_attachment;
         stencil.texture = texture_of(&d.stencil)?;
         stencil.level = d.stencil.level;
@@ -1689,6 +1707,12 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
         stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
         stencil.clear_stencil = d.stencil.clear[0] as u32;
+        stencil.resolve_texture = resolve_texture_of(&d.stencil)?;
+        stencil.resolve_level = d.stencil.resolve_level;
+        stencil.resolve_slice = d.stencil.resolve_slice;
+        stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
+        stencil.resolve_filter =
+            MultisampleStencilResolveFilter::from_raw(d.stencil.resolve_filter).map_err(e("stencil resolve filter"))?;
         pass.render_target_width = d.width;
         pass.render_target_height = d.height;
         pass.render_target_array_length = d.array_length;

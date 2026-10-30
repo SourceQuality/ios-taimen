@@ -2,8 +2,8 @@
  * sweetmtl Gallium shim: command replay into the device's pipe_context.
  *
  * The runtime replays a committed command buffer under sg_lock(): bindings (sg_ctx_set_*),
- * then a dispatch, a pass with its draws, or a blit, command by command in Metal's order, then
- * sg_ctx_flush. State follows Vulkan's conventions as lavapipe maps them onto Gallium
+ * then a dispatch, a pass with its draws (and after it the resolves its store actions ask for),
+ * or a blit, command by command in Metal's order, then sg_ctx_flush. State follows Vulkan's conventions as lavapipe maps them onto Gallium
  * (frontends/lavapipe/lvp_execute.c): clip_halfz, half-pixel centers, the first vertex
  * provoking, scissoring always on. Metal's viewport (y down, origin top-left) becomes the Vulkan
  * viewport of negative height that metal2vulkan-runtime makes of it (render_state.rs).
@@ -250,6 +250,69 @@ void
 sg_ctx_end_pass(struct sg_device *dev)
 {
    dev->in_pass = false;
+}
+
+bool
+sg_ctx_resolve(struct sg_device *dev, const struct sg_resolve *r)
+{
+   if (dev->in_pass) {
+      sg_set_error("a multisample resolve inside a render pass");
+      return false;
+   }
+   if (!r->src || !r->dst || r->src->res == r->dst->res) {
+      sg_set_error("a multisample resolve needs two textures");
+      return false;
+   }
+   struct pipe_resource *src = r->src->res, *dst = r->dst->res;
+   if (dst->nr_samples > 1) {
+      sg_set_error("a multisample resolve into a multisampled texture");
+      return false;
+   }
+   enum pipe_format sf = r->src_format ? (enum pipe_format)sg_pipe_format(r->src_format) : src->format;
+   enum pipe_format df = r->dst_format ? (enum pipe_format)sg_pipe_format(r->dst_format) : dst->format;
+   if (sf == PIPE_FORMAT_NONE || df == PIPE_FORMAT_NONE) {
+      sg_set_error("multisample resolve of VkFormat %u into %u: no Gallium format", r->src_format,
+                   r->dst_format);
+      return false;
+   }
+   if (r->src_level > src->last_level || r->dst_level > dst->last_level) {
+      sg_set_error("multisample resolve of level %u into level %u: past a texture's levels",
+                   r->src_level, r->dst_level);
+      return false;
+   }
+   unsigned mask = 0;
+   if (r->aspects & SG_ASPECT_COLOR)
+      mask |= PIPE_MASK_RGBA;
+   if (r->aspects & SG_ASPECT_DEPTH)
+      mask |= PIPE_MASK_Z;
+   if (r->aspects & SG_ASPECT_STENCIL)
+      mask |= PIPE_MASK_S;
+   mask &= util_format_get_mask(sf) & util_format_get_mask(df);
+   if (!mask) {
+      sg_set_error("multisample resolve of %s into %s: no aspect in common (aspects 0x%x)",
+                   util_format_short_name(sf), util_format_short_name(df), r->aspects);
+      return false;
+   }
+   unsigned w = MIN3(r->width, u_minify(src->width0, r->src_level), u_minify(dst->width0, r->dst_level));
+   unsigned h = MIN3(r->height, u_minify(src->height0, r->src_level),
+                     u_minify(dst->height0, r->dst_level));
+   if (!w || !h)
+      return true;
+   struct pipe_blit_info b;
+   memset(&b, 0, sizeof(b));
+   b.src.resource = src;
+   b.src.format = sf;
+   b.src.level = r->src_level;
+   u_box_3d(0, 0, (int)r->src_layer, (int)w, (int)h, 1, &b.src.box);
+   b.dst.resource = dst;
+   b.dst.format = df;
+   b.dst.level = r->dst_level;
+   u_box_3d(0, 0, (int)r->dst_layer, (int)w, (int)h, 1, &b.dst.box);
+   b.mask = mask;
+   b.filter = PIPE_TEX_FILTER_NEAREST;
+   dev->pipe->blit(dev->pipe, &b);
+   dev->stats.blits++;
+   return true;
 }
 
 static bool
