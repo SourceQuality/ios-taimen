@@ -1312,3 +1312,19 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Weather, Safari's video and the poster gallery. The accelerometer held 50.7 Hz the whole time (30,914 samples, 3,040
   a minute), no panic, no GPU hang, no Metal refusal, one driverkitd crash; hottest sensor 70.5 C during the software
   video decoding, 56.6 C at the end. The gallery was black (54 KB) in all six rounds.
+- 2026-10-30 **boot 188 (r163 = +0344 M6, +0345 M7, taimensensors=8): every motion and environment sensor streams.**
+  The SMGR took all five new BUFFERING requests (result 0): gyro 50 Hz (|w| 0.020 rad/s at rest, uncalibrated
+  bias), magnetometer 50 Hz (|B| 67-70 uT; iOS z +52 uT face up, which the northern hemisphere says should be
+  negative: the hard-iron offset or the mag's z sign, unsettled without a rotation), pressure 10 Hz (100.42 kPa),
+  ambient light and proximity on change (84 lux, far). backboardd's event system opened all six SweetHID services;
+  SpringBoard started device motion on the gyro {0xff00, 9} (ReportInterval 5000) and the accelerometer {0xff00, 3}.
+  Compass (through Spotlight) draws its dial but no heading: locationd says "location disabled system-wide", opens
+  the raw magnetometer {0xff00, 10} at 40 Hz, and starts "Compass for AOP" (CLCompass7), which waits for the AOP's
+  device-motion services {0xff0c, 8} and {0xff0c, 1} ("not ready"). CLCompass6 (locationd's own AKM calibrator on
+  the raw magnetometer) also exists in locationd: what picks one is under study.
+- 2026-10-30 boot 189 (r163, SweetMetal-6ea6bcf8 = 35ff7d4): mtlabitest on the a540: **4x color resolve averages**
+  (16 of 16 diagonal texels blended); depth/stencil resolve fails (240 of 256 texels off). Maps took its Metal
+  device and passed the resolve, then died on -[NBRenderEncoder setDepthClipMode:] (8f3d06c answers it). Settings
+  has no Location Services row in Privacy & Security on this device; mkrootfix.py --locationd (root's
+  com.apple.locationd.plist) is the way to turn it on, and the recent ROOTFIX blobs had left it out. 19 driverkitd
+  crashes in a 20-minute boot.
