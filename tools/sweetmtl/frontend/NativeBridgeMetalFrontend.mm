@@ -435,6 +435,11 @@ static std::string quartzCoreCallers();
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
  handler(function,error);
 }
+// Maps (boot 176) asks with a pipeline library, which only caches compiled functions: the function is the same.
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values
+                       pipelineLibrary:(id)library error:(NSError **)error {
+ (void)library;return [self newFunctionWithName:name constantValues:values error:error];
+}
 - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
 // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
 // runtime does when the function is made.
