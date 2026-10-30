@@ -1229,3 +1229,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   APPS<->SLPI SMEM partition exists and is clean (@0x19f000 + 0x30000, cacheline 32, items 430/481/478-480 absent,
   no crash reason 424); TZ PAS_IS_SUPPORTED(12) -> 0/0, as for the ADSP, which boots fine, so not a refusal. The new
   reader pulled slpi_v2.mdt + .b00-.b14 (3.9 MB) and sns.reg (28174 B) into ../research/taimen/firmware/sensors.
+- 2026-10-30 boot 173 (r155, SweetMetal-20c40498 with pipeline-refusal logging, --sensors-fw): **sensors M1 done**:
+  slpi_v2.mdt 15 program headers, 12/12 segments (3,900,563 B), relocatable, image 0x93800000..0x94700000 (15 MB)
+  fits the carve-out 0x94b00000 + 15 MB; sns.reg 28,174 B. Settings opens and draws (no Metal asked). AegirPoster
+  never started: it runs for the lock screen's wallpaper gallery (a long press), as in boot 171.
+- 2026-10-30 **boot 174 (r156 = +0337): the lock screen's poster draws through Metal.** A long press on the lock
+  screen opened the wallpaper gallery: AegirPoster took the SweetMetal device (95 ms) and drew the current poster's
+  preview (the gradient with date and time; boot 167 showed black cards while it crash-looped); no refusals, 0
+  AegirPoster crashes. Rotation: backboardd opened SweetHIDOrientation (0x20/0x8a) and took the CMUsage orientation
+  events (0x67, 0x68, 0x65, one client), but Safari's full-screen video stayed portrait; locationd's own detector
+  wants a gyro ("No gyro; not detecting orientation!", strings). Next: is portrait lock on (boot 171's hand use)?
