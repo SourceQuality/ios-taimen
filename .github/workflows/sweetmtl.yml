@@ -36,8 +36,8 @@ permissions:
   contents: read
 
 env:
-  # sweetgl's toolchain (iPhoneOS 17.5 SDK); any Xcode with an SDK >= 16 works
-  XCODE_PREFER: "15.4"
+  # Xcode 16.4 (iPhoneOS 18.5 SDK) on macos-15, macos-14 being retired on 2026-11-02; any Xcode with an SDK >= 16 works
+  XCODE_PREFER: "16.4"
   # the PC's rustc (WSL m0 env), which built and ran the runtime
   RUST_TOOLCHAIN: "1.99.1"
   # Bump to throw away the caches below.
@@ -52,7 +52,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
