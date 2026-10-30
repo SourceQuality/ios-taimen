@@ -1361,3 +1361,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   and the kernel's reports flowed (heading 224-225 deg lying still, bias not yet: the phone never turned); after
   "Allow While Using App" the Compass draws its dial at north and no heading: Use True North (the default) wants
   a true heading, which needs a location fix.
+- 2026-10-30 **boot 195 (r167 = +0353, taimenmic=7, SweetMetal-ddf85ad0 = 8be925c): Maps draws its map, and iOS
+  records.** Maps rendered its vector map of North America through SweetMetal (its overlays not yet: 32 pipelines
+  still refused, because the translator's format table, profile/a540-gallium.json, had no COLOR_ATTACHMENT_BLEND_BIT
+  for any format: regenerated in 984171b; one draw wanted samplerAnisotropy: 650f0c9; two a pipeline variant).
+  **Voice Memos recorded 22 s from the microphone**: /dev/redwood-mic opened by mediaserverd's plug-in, the
+  recording up in 30 ms, first samples 0.06 s after the input started, 1,058,880 frames, 0 skipped, 0 overflows, a
+  quiet room at -61 to -67 dBFS. Compass: Use True North was already off, yet no heading on screen while
+  SweetHIDHeading streams: locationd's per-sample lines are debug-level (next: oslogd --debug on locationd).
