@@ -1,0 +1,90 @@
+diff --git a/bsd/dev/taimen_wcd934x.c b/bsd/dev/taimen_wcd934x.c
+index 74a41ac..daf253f 100644
+--- a/bsd/dev/taimen_wcd934x.c
++++ b/bsd/dev/taimen_wcd934x.c
+@@ -77,14 +77,32 @@ wr32(vm_offset_t a, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * 0359: GPIO13's PMIC accesses retry. Boots 197-198 had a census read fail ("SPMI READ FAILED") and a
++ * configuration write fail ("(GPIO13 NOT configured)"), with the registers already right from an earlier
++ * boot; after a cold start a lost write would leave MCLK off and the microphone silent.
++ */
++static unsigned pmic_retries;
++
++static bool
++pmic_rd(uint8_t addr, uint8_t *out)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		if (sweet_pmic_read(MCLK_PPID, addr, out)) {
++			return true;
++		}
++		pmic_retries++;
++		delay(200);
++	}
++	return false;
++}
++
+ static void
+ pmg_read(struct pmg *g)
+ {
+ 	bzero(g, sizeof(*g));
+-	g->ok = sweet_pmic_read(MCLK_PPID, 0x05, &g->sub) && sweet_pmic_read(MCLK_PPID, 0x40, &g->mode) &&
+-	    sweet_pmic_read(MCLK_PPID, 0x41, &g->vin) && sweet_pmic_read(MCLK_PPID, 0x42, &g->pull) &&
+-	    sweet_pmic_read(MCLK_PPID, 0x44, &g->src) && sweet_pmic_read(MCLK_PPID, 0x45, &g->out) &&
+-	    sweet_pmic_read(MCLK_PPID, 0x46, &g->en);
++	g->ok = pmic_rd(0x05, &g->sub) && pmic_rd(0x40, &g->mode) && pmic_rd(0x41, &g->vin) &&
++	    pmic_rd(0x42, &g->pull) && pmic_rd(0x44, &g->src) && pmic_rd(0x45, &g->out) && pmic_rd(0x46, &g->en);
+ }
+ 
+ /* M1: what the boot left on the codec's pins (read only). */
+@@ -593,18 +611,32 @@ gpio13_log(const char *when, const struct pmg *g)
+  * PM8998 GPIO13 as live.dts gpio@cc00: output, CMOS, no pull (5), VIN0, low strength (1), source 3
+  * = func2 (DIV_CLK1), enabled. LV/MV subtypes (0x10, 0x11) have the source in register 0x44.
+  */
++/* 0359: a write that is read back, up to four times */
++static bool
++pmic_wr(uint8_t addr, uint8_t val)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		uint8_t back = (uint8_t)~val;
++		if (sweet_pmic_write(MCLK_PPID, addr, val) && sweet_pmic_read(MCLK_PPID, addr, &back) && back == val) {
++			return true;
++		}
++		pmic_retries++;
++		delay(200);
++	}
++	return false;
++}
++
+ static bool
+ gpio13_mclk(const struct pmg *g)
+ {
+ 	bool lvmv = g->sub == 0x10 || g->sub == 0x11;
+-	bool ok = sweet_pmic_write(MCLK_PPID, 0x41, 0x00) && sweet_pmic_write(MCLK_PPID, 0x42, 0x05);
++	bool ok = pmic_wr(0x41, 0x00) && pmic_wr(0x42, 0x05);
+ 	if (lvmv) {
+-		ok = ok && sweet_pmic_write(MCLK_PPID, 0x44, 0x03) && sweet_pmic_write(MCLK_PPID, 0x45, 0x01) &&
+-		    sweet_pmic_write(MCLK_PPID, 0x40, 0x01);
++		ok = ok && pmic_wr(0x44, 0x03) && pmic_wr(0x45, 0x01) && pmic_wr(0x40, 0x01);
+ 	} else {
+-		ok = ok && sweet_pmic_write(MCLK_PPID, 0x45, 0x01) && sweet_pmic_write(MCLK_PPID, 0x40, 0x16);
++		ok = ok && pmic_wr(0x45, 0x01) && pmic_wr(0x40, 0x16);
+ 	}
+-	return ok && sweet_pmic_write(MCLK_PPID, 0x46, 0x80);
++	return ok && pmic_wr(0x46, 0x80);
+ }
+ 
+ bool
+@@ -644,8 +676,8 @@ taimen_wcd_m4(void)
+ 	pins = g0.ok && gpio13_mclk(&g0);
+ 	pmg_read(&g1);
+ 	gpio13_log("after", &g1);
+-	LOG("4: DIV_CLK1 (clka 0xb) on: %s; pm8998 gpio13 mode %#x src %#x en %#x%s", rpm ? "ok" : "NOT acked", g1.mode,
+-	    g1.src, g1.en, pins ? "" : " (GPIO13 NOT configured)");
++	LOG("4: DIV_CLK1 (clka 0xb) on: %s; pm8998 gpio13 mode %#x src %#x en %#x%s; %u PMIC retries", rpm ? "ok" : "NOT acked",
++	    g1.mode, g1.src, g1.en, pins ? "" : " (GPIO13 NOT configured)", pmic_retries);
+ 
+ 	n_expect = 0;
+ 	n_cdc_err = 0;
