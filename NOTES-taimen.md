@@ -1246,3 +1246,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   runner (GitHub's macOS queue), so the SLPI boot waits for boot 176. sweetlogp mirrors only Error-level os_log;
   boot-xnu.sh SWEETENV_EXTRA (edfd37d) adds e.g. locationd:OS_ACTIVITY_MODE=info through the ADT boot-args.
   0339: a still synthetic gyro (locationd's detector wants one).
+- 2026-10-30 **boot 176 (r157 = +0338, +0339): the SLPI (sensor DSP) runs.** taimensensors=3: RPM rwsc 0x180 and LVS2 votes
+  ok, PAS_INIT_IMAGE(12, metadata from the 0x8a800000 pool) 0/0, PAS_MEM_SETUP(0x94b00000 + 0xf00000) 0/0, 3.89 MB of
+  segments copied in 8 ms, PAS_AUTH_AND_RESET 0/0; its SMP2P item 481 after 29 ms (entries 'smp2p' 0,
+  'slave-kernel' 0x6) and **READY 38 ms after the reset** (262 ms from the first SCM call): sensors M2. Maps on Metal:
+  the device in 74 ms, then "MISSING NBLibrary -newFunctionWithName:constantValues:pipelineLibrary:error:" (dad220e
+  adds it) and a command buffer refused for NotYet("multisample resolve") (being built); it aborted as in 175.
+  Weather never asked for a device. Rotation: SweetHIDGyro (0339) opened by backboardd too, nothing rotated, and
+  locationd with OS_ACTIVITY_MODE=info still printed only objc warnings: sweetlogp mirrors no os_log (the
+  "<Error>" lines in mediaserverd were CFLog). oslogd (0dc3a71) streams the unified log of named processes instead.
