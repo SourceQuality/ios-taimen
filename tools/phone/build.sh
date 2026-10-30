@@ -7,6 +7,7 @@
 #   tcctest   what tccd answers an entitled platform process (launchd job com.sweet.tcctest)
 #   sweettcc.dylib  TCCAccessPreflight that agrees with tccd's audit token check (xnu 0312 inserts it)
 #   RedwoodAudio (+ RedwoodAudio.plist)  the HAL plug-in for mediaserverd's speaker (RedwoodAudio/)
+#   oslogd    os_log of named processes on stdout (launchd job com.sweet.oslogd, with sweetlogp=oslogd)
 set -euo pipefail
 cd "$(dirname "$0")"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -25,6 +26,7 @@ build() {	# NAME SOURCE [FLAGS...]
 build netsvcd netsvcd.c -framework CoreFoundation -framework SystemConfiguration
 build sweetexc.dylib sweetexc.m -dynamiclib -install_name /usr/local/lib/sweetexc.dylib -fobjc-arc -framework Foundation
 build tcctest tcctest.c -framework CoreFoundation
+build oslogd oslogd.c
 build sweettcc.dylib sweettcc.c -dynamiclib -install_name /usr/local/lib/sweettcc.dylib TCC.tbd -framework CoreFoundation
 # RedwoodAudio: the HAL plug-in in mediaserverd (RedwoodAudio/README.md; HackiOS, MIT): the bundle
 # executable and its Info.plist, which mkrootfix.py --hal-plugin installs
