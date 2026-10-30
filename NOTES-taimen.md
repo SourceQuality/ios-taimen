@@ -1426,3 +1426,16 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   soak with Weather's location prompt answered first: six rounds of Settings, Weather, Safari's video, Voice Memos,
   Compass and Maps. Seven recordings through /dev/redwood-mic (up in 29-32 ms each, 0 errors, 0 overflows; up to
   71 s), thirteen speaker sessions (0 underflows, 0 dropped), no panic, one driverkitd crash, hottest 56.9 C.
+- 2026-10-30 **Maps' chrome: CoreAnimation detaches the map.** backboardd's CA moves a full-screen CAMetalLayer onto its
+  own swap layer (layer 0, the app's drawable as is) and puts everything else it composites, status bar and UIKit
+  chrome included, on swap layer 1. The taimen present with the hardware scaler (taimen_present_scaled,
+  taimenhwscale=3) shows only layer 0, so once the map drew, the chrome was gone. sweetgl now sets
+  CA_DISABLE_DETACHED=1 for backboardd (b1c81af): CA composites the drawable with the rest into the one surface.
+- 2026-10-30 boot 207 (r171 = +0359: the MCLK pin's PMIC reads and writes retry and are read back; sweetgl b1c81af):
+  M4 "DIV_CLK1 on: ok; ... 0 PMIC retries", GPIO13 configured again (pull 0x4 -> 0x5), a recording up in 32 ms.
+  The scripted round stalled with Voice Memos in front, so Maps was not reached.
+- 2026-10-30 **boot 208 (r171, sweetgl b1c81af, SweetMetal-da5dcafc): Maps keeps its chrome.** 25 s after launch the
+  status bar, the map buttons and the search card with Favorites sit over the rendered map, and a pan redraws the map
+  under them. Tapping the search field aborted Maps (as in boot 203): CoreImage, from MapKit, asked the device for
+  Metal's private -sharedMemorySize. The frontend now answers it (physical memory) and dedicatedMemorySize (0)
+  (8330efe). M4 again 0 PMIC retries; one driverkitd crash; hottest 55.0 C.
