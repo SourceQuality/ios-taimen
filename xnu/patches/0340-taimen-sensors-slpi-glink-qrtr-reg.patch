@@ -1,0 +1,1316 @@
+diff --git a/iokit/Kernel/arm/TaimenSensors.cpp b/iokit/Kernel/arm/TaimenSensors.cpp
+index ab16131..caf19cf 100644
+--- a/iokit/Kernel/arm/TaimenSensors.cpp
++++ b/iokit/Kernel/arm/TaimenSensors.cpp
+@@ -23,6 +23,16 @@
+  * low RAM (0x8a800000, after TaimenAudio's at 0x8a000000), PAS_INIT_IMAGE, PAS_MEM_SETUP over the
+  * carve-out, the segments copied to paddr - lo, PAS_AUTH_AND_RESET; then 5 s for the SLPI's SMP2P
+  * item 481 and its "slave-kernel" READY bit, else its crash reason (item 424).
++ *
++ * 0340, plan M3 (taimensensors>=4), in the same thread right after a READY SLPI: GLINK on the "dsps"
++ * edge (descriptor 478, our TX FIFO 479, the SLPI's FIFO 480 in the APPS<->SLPI partition; doorbell
++ * APCS IPC bit 27), QRTR on IPCRTR (we are node 1) with a pd-mapper that answers no domains, and the
++ * sensor registry server SNS_REG (QMI svc 0x10f, v2, inst 0) answering group reads (0x04) from
++ * sns.reg by the static group table of the Linux qcom_sns_reg driver (plan 2.2, re-typed: it is
++ * data). SNS_SMGR (0x100) is only logged when it appears: talking to it is M4. A copy of
++ * TaimenAudio.cpp's lpass GLINK/QRTR code with this edge's partition and doorbell; the audio code is
++ * untouched. Polled: 2 ms for the first 20 s (then the "M3:" summary), 20 ms after that, serving the
++ * registry for as long as the SLPI runs. Stage numbers: 7 GLINK, 8 QRTR, 9 registry.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -33,6 +43,7 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/errno.h>
++#include <sys/param.h>
+ 
+ extern "C" int taimen_fw_load(const char *path, uint32_t max, void **data, uint32_t *len);   /* taimen_fwfile.c */
+ extern "C" void taimen_fw_free(void *data, uint32_t len);
+@@ -623,16 +634,19 @@ pas_boot(void)
+ 	return r == 0 && r1 == 0;
+ }
+ 
+-static void
++static uint64_t t_reset;                /* now_ms() when AUTH_AND_RESET returned: the M3 log's t= base */
++
++/* true when the SLPI said READY (0340: M3 runs only then) */
++static bool
+ slpi_boot(void)
+ {
+ 	if (!open_rw()) {
+-		return;
++		return false;
+ 	}
+ 	uint32_t n = 0;
+ 	if (smem_part_get(slpi_part, slpi_cacheline, ITEM_SMP2P_IN, &n) != NULL) {
+ 		LOG("6: item %u exists: the SLPI ran since the reset; not booting it over stale state", ITEM_SMP2P_IN);
+-		return;
++		return false;
+ 	}
+ 	bool cx = sweet_rpm_rail_level(RPM_RWSC, 0x180);
+ 	bool px = sweet_rpm_kv_both("lvs2 (SLPI px)", RPM_VSA, 2, RPM_SWEN, 1);
+@@ -640,14 +654,15 @@ slpi_boot(void)
+ 	struct smp2p_hdr *out = smp2p_create_out();
+ 	if (out == NULL || !smp2p_add(out, "master-kernel", 0)) {
+ 		LOG("6: SMP2P out (item %u) failed", ITEM_SMP2P_OUT);
+-		return;
++		return false;
+ 	}
+ 	uint64_t tstart = now_ms();
+ 	if (!pas_boot()) {
+ 		crash_reason();
+-		return;
++		return false;
+ 	}
+ 	uint64_t t1 = now_ms(), seen = 0;
++	t_reset = t1;
+ 	struct smp2p_hdr *in = NULL;
+ 	volatile uint32_t *slave = NULL;
+ 	while (now_ms() - t1 < 5000) {
+@@ -665,7 +680,7 @@ slpi_boot(void)
+ 	if (in == NULL) {
+ 		LOG("6: no SMP2P from the SLPI (item %u) within 5 s of the reset", ITEM_SMP2P_IN);
+ 		crash_reason();
+-		return;
++		return false;
+ 	}
+ 	LOG("6: SLPI SMP2P item %u after %llu ms: v%u features %#x pids %u->%u, %u/%u entries", ITEM_SMP2P_IN, seen,
+ 	    in->version, in->features[0], in->local_pid, in->remote_pid, in->valid, in->total);
+@@ -678,10 +693,1219 @@ slpi_boot(void)
+ 	if (slave == NULL || (*slave & SLAVE_ERR_FATAL) != 0 || (*slave & SLAVE_READY) == 0) {
+ 		LOG("6: SLPI not ready: slave-kernel %s %#x", slave != NULL ? "=" : "absent", slave != NULL ? *slave : 0);
+ 		crash_reason();
+-		return;
++		return false;
+ 	}
+ 	LOG("6: M2 SLPI READY %llu ms after AUTH_AND_RESET (%llu ms from the first SCM call)", now_ms() - t1,
+ 	    now_ms() - tstart);
++	return true;
++}
++
++/* ---------------------------------------------------------------- M3: GLINK on the dsps edge (0340) */
++
++/*
++ * TaimenAudio.cpp's multi-channel GLINK (channels by name, a table of the remote's RX intents, a TX
++ * queue), copied with the SLPI's partition and doorbell. The SLPI opens its channels; we open-ack
++ * all of them and answer IPCRTR, the only one with a client here.
++ */
++
++#define SLPI_GLINK_BIT          27              /* APCS IPC, "dsps" irq-mask 0x8000000 */
++#define ITEM_GLINK_DESC         478
++#define ITEM_GLINK_FIFO_TX      479             /* apps -> slpi */
++#define ITEM_GLINK_FIFO_RX      480             /* slpi -> apps */
++#define GLINK_TX_SIZE           0x4000
++#define GLINK_FEATURES          1               /* INTENT_REUSE */
++
++enum {
++	CMD_VERSION = 0, CMD_VERSION_ACK = 1, CMD_OPEN = 2, CMD_CLOSE = 3, CMD_OPEN_ACK = 4, CMD_INTENT = 5,
++	CMD_RX_DONE = 6, CMD_RX_INTENT_REQ = 7, CMD_RX_INTENT_REQ_ACK = 8, CMD_TX_DATA = 9, CMD_CLOSE_ACK = 11,
++	CMD_TX_DATA_CONT = 12, CMD_READ_NOTIF = 13, CMD_RX_DONE_W_REUSE = 14, CMD_SIGNALS = 15,
++};
++
++#define MAX_CHANS               12
++#define OUR_INTENTS             8
++#define OUR_INTENT_SIZE         0x4400
++#define MAX_RINTENTS            256
++#define TXQ_LEN                 32
++
++struct glink_msg { uint16_t cmd, p1; uint32_t p2; } __attribute__((packed));
++struct glink_data_hdr { struct glink_msg m; uint32_t chunk, left; } __attribute__((packed));
++
++typedef void (*glink_rx_t)(const uint8_t *data, uint32_t len);
++
++struct rintent { uint32_t id, size; bool used; };
++struct chan {
++	char       name[32];
++	glink_rx_t rx;                          /* NULL: not ours, only open-acked */
++	uint16_t   lcid;
++	uint32_t   rcid;
++	bool       remote_open, open_sent, open_acked, intents_sent, intent_req_sent, ri_logged;
++	struct rintent ri[MAX_RINTENTS];
++	uint32_t   ri_count;
++	uint8_t   *asm_buf;                     /* reassembly, OUR_INTENT_SIZE */
++	uint32_t   asm_len;
++	void      *txq[TXQ_LEN];
++	uint32_t   txq_len[TXQ_LEN];
++	uint32_t   txq_head, txq_tail, txq_drops;
++	uint32_t   rx_pkts, tx_pkts, ri_lost, intent_reqs;
++};
++
++static volatile uint32_t *g_desc;               /* [0] tx tail [1] tx head [2] rx tail [3] rx head */
++static uint8_t *g_tx, *g_rx;
++static uint32_t g_rx_len, g_features = GLINK_FEATURES, g_next_intent = 1, g_chans;
++static struct chan *g_ch;                       /* MAX_CHANS */
++static uint32_t g_rx_msgs, g_tx_msgs;
++static uint32_t g_rver, g_rfeat;                /* the SLPI's VERSION (or VERSION_ACK) */
++static bool g_rver_seen, g_dead;
++
++static unsigned
++ms(void)
++{
++	return (unsigned)(now_ms() - t_reset);
++}
++#define T   ms() / 1000, ms() % 1000
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t h = g_desc[3], t = g_desc[2];
++	return h >= t ? h - t : g_rx_len - t + h;
++}
++
++static void
++rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t t = g_desc[2] + off;
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	uint32_t n1 = MIN(n, g_rx_len - t);
++	memcpy(dst, g_rx + t, n1);
++	if (n > n1) {
++		memcpy((uint8_t *)dst + n1, g_rx, n - n1);
++	}
++}
++
++static void
++rx_advance(uint32_t n)
++{
++	uint32_t t = g_desc[2] + n;
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	mb();
++	g_desc[2] = t;
++}
++
++static uint32_t
++tx_put(uint32_t head, const void *src, uint32_t n)
++{
++	uint32_t n1 = MIN(n, GLINK_TX_SIZE - head);
++	memcpy(g_tx + head, src, n1);
++	if (n > n1) {
++		memcpy(g_tx, (const uint8_t *)src + n1, n - n1);
++	}
++	head += n;
++	return head >= GLINK_TX_SIZE ? head - GLINK_TX_SIZE : head;
++}
++
++static bool
++tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t head = 0, tail, avail, n;
++
++	for (n = 0; n < 1000; n++) {
++		head = g_desc[1];
++		tail = g_desc[0];
++		avail = tail <= head ? GLINK_TX_SIZE - head + tail : tail - head;
++		avail = avail < 8 ? 0 : avail - 8;
++		if (avail >= ((hlen + dlen + 7) & ~7u)) {
++			break;
++		}
++		IODelay(100);
++	}
++	if (n == 1000) {
++		LOG("7: t=%u.%03u glink TX FIFO full (head %#x tail %#x)", T, g_desc[1], g_desc[0]);
++		return false;
++	}
++	head = tx_put(head, hdr, hlen);
++	if (dlen != 0) {
++		head = tx_put(head, data, dlen);
++	}
++	head = (head + 7) & ~7u;
++	if (head >= GLINK_TX_SIZE) {
++		head -= GLINK_TX_SIZE;
++	}
++	mb();
++	g_desc[1] = head;
++	mb();
++	apcs_kick(SLPI_GLINK_BIT);
++	g_tx_msgs++;
++	return true;
++}
++
++static void
++send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct glink_msg m = { cmd, p1, p2 };
++	tx_write(&m, sizeof(m), NULL, 0);
++}
++
++static struct chan *
++by_name(const char *name)
++{
++	for (uint32_t i = 0; i < g_chans; i++) {
++		if (strcmp(g_ch[i].name, name) == 0) {
++			return &g_ch[i];
++		}
++	}
++	return NULL;
++}
++
++static struct chan *
++by_rcid(uint32_t rcid)
++{
++	for (uint32_t i = 0; i < g_chans; i++) {
++		if (g_ch[i].remote_open && g_ch[i].rcid == rcid) {
++			return &g_ch[i];
++		}
++	}
++	return NULL;
++}
++
++static struct chan *
++add_chan(const char *name)
++{
++	if (g_chans == MAX_CHANS) {
++		return NULL;
++	}
++	struct chan *c = &g_ch[g_chans];
++	bzero(c, sizeof(*c));
++	strlcpy(c->name, name, sizeof(c->name));
++	c->lcid = (uint16_t)(g_chans + 1);
++	g_chans++;
++	return c;
++}
++
++static void
++glink_register(const char *name, glink_rx_t rx)
++{
++	struct chan *c = by_name(name);
++	if (c == NULL) {
++		c = add_chan(name);
++	}
++	if (c != NULL) {
++		c->rx = rx;
++		c->asm_buf = (uint8_t *)IOMallocZero(OUR_INTENT_SIZE);
++	}
++}
++
++static void
++send_open(struct chan *c)
++{
++	struct { struct glink_msg m; char name[32]; } req;
++	uint32_t len = (uint32_t)strlen(c->name) + 1;
++
++	bzero(&req, sizeof(req));
++	req.m.cmd = CMD_OPEN;
++	req.m.p1 = c->lcid;
++	req.m.p2 = len;
++	memcpy(req.name, c->name, len);
++	tx_write(&req, (8 + len + 7) & ~7u, NULL, 0);
++	c->open_sent = true;
++	LOG("7: t=%u.%03u glink OPEN \"%s\" lcid %u", T, c->name, c->lcid);
++}
++
++static void
++advertise_intents(struct chan *c, uint32_t count, uint32_t size)
++{
++	struct { struct glink_msg m; uint32_t pair[2 * OUR_INTENTS]; } m;
++
++	count = MIN(count, (uint32_t)OUR_INTENTS);
++	m.m.cmd = CMD_INTENT;
++	m.m.p1 = c->lcid;
++	m.m.p2 = count;
++	for (uint32_t i = 0; i < count; i++) {
++		m.pair[2 * i] = size;
++		m.pair[2 * i + 1] = g_next_intent++;
++	}
++	tx_write(&m, sizeof(struct glink_msg) + 8 * count, NULL, 0);
++}
++
++static bool
++chan_up(const struct chan *c)
++{
++	return c->remote_open && c->open_acked;
++}
++
++static bool
++glink_chan_up(const char *name)
++{
++	struct chan *c = by_name(name);
++	return c != NULL && chan_up(c);
++}
++
++static bool
++try_send(struct chan *c, const void *data, uint32_t len)
++{
++	uint32_t i;
++
++	for (i = 0; i < c->ri_count; i++) {
++		if (!c->ri[i].used && c->ri[i].size >= len) {
++			break;
++		}
++	}
++	if (i == c->ri_count) {
++		if (!c->intent_req_sent) {
++			if (c->intent_reqs < 4) {
++				LOG("7: t=%u.%03u glink \"%s\": no SLPI intent for %u bytes (%u known), asking", T, c->name, len,
++				    c->ri_count);
++			}
++			send_cmd(CMD_RX_INTENT_REQ, c->lcid, len);
++			c->intent_req_sent = true;
++			c->intent_reqs++;
++		}
++		return false;
++	}
++	struct glink_data_hdr h = { { CMD_TX_DATA, c->lcid, c->ri[i].id }, len, 0 };
++	c->ri[i].used = true;
++	c->tx_pkts++;
++	return tx_write(&h, sizeof(h), data, len);
++}
++
++static void
++pump(struct chan *c)
++{
++	while (chan_up(c) && c->txq_head != c->txq_tail &&
++	    try_send(c, c->txq[c->txq_head % TXQ_LEN], c->txq_len[c->txq_head % TXQ_LEN])) {
++		IOFree(c->txq[c->txq_head % TXQ_LEN], c->txq_len[c->txq_head % TXQ_LEN]);
++		c->txq_head++;
++	}
++}
++
++/* queue a packet: it goes out when the channel is up and the SLPI has an intent for it */
++static bool
++glink_send(const char *name, const void *data, uint32_t len)
++{
++	struct chan *c = by_name(name);
++	void *copy;
++
++	if (c == NULL || c->txq_tail - c->txq_head >= TXQ_LEN || len == 0 || (copy = IOMalloc(len)) == NULL) {
++		if (c != NULL) {
++			c->txq_drops++;
++		}
++		return false;
++	}
++	memcpy(copy, data, len);
++	c->txq[c->txq_tail % TXQ_LEN] = copy;
++	c->txq_len[c->txq_tail % TXQ_LEN] = len;
++	c->txq_tail++;
++	pump(c);
++	return true;
++}
++
++static bool
++rx_one(void)
++{
++	struct glink_msg m;
++	uint32_t avail = rx_avail(), n;
++	struct chan *c;
++
++	if (avail < sizeof(m)) {
++		return false;
++	}
++	rx_peek(0, &m, sizeof(m));
++	g_rx_msgs++;
++
++	switch (m.cmd) {
++	case CMD_VERSION:
++		LOG("7: t=%u.%03u glink SLPI VERSION %u features %#x (ours %#x)", T, m.p1, m.p2, g_features);
++		rx_advance(8);
++		g_rver = m.p1;
++		g_rfeat = m.p2;
++		g_rver_seen = true;
++		if (m.p1 != 0) {
++			g_features &= m.p2;
++			send_cmd(CMD_VERSION_ACK, 1, g_features);
++		}
++		break;
++	case CMD_VERSION_ACK:
++		LOG("7: t=%u.%03u glink SLPI VERSION_ACK %u features %#x", T, m.p1, m.p2);
++		rx_advance(8);
++		if (!g_rver_seen) {
++			g_rver = m.p1;
++			g_rfeat = m.p2;
++			g_rver_seen = true;
++		}
++		if (m.p1 != 0 && m.p2 != g_features) {
++			g_features &= m.p2;
++			send_cmd(CMD_VERSION, 1, g_features);
++		}
++		break;
++	case CMD_OPEN: {
++		char name[33];
++		n = (8 + m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		bzero(name, sizeof(name));
++		rx_peek(8, name, MIN(m.p2, 32u));
++		rx_advance(n);
++		c = by_name(name);
++		if (c == NULL) {
++			c = add_chan(name);
++		}
++		LOG("7: t=%u.%03u glink SLPI OPEN \"%s\" rcid %u%s", T, name, m.p1,
++		    c == NULL ? " (no slot: not acked)" : c->rx != NULL ? " (ours)" : " (no client: open-ack only)");
++		if (c != NULL) {
++			c->rcid = m.p1;
++			c->remote_open = true;
++			send_cmd(CMD_OPEN_ACK, (uint16_t)c->rcid, 0);
++			if (c->rx != NULL && !c->open_sent) {
++				send_open(c);
++			}
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
++		rx_advance(8);
++		for (uint32_t i = 0; i < g_chans; i++) {
++			if (g_ch[i].lcid == m.p1) {
++				g_ch[i].open_acked = true;
++				LOG("7: t=%u.%03u glink OPEN_ACK \"%s\" (lcid %u, %#x)", T, g_ch[i].name, m.p1, m.p2);
++			}
++		}
++		break;
++	case CMD_CLOSE:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		LOG("7: t=%u.%03u glink SLPI CLOSE rcid %u \"%s\"", T, m.p1, c != NULL ? c->name : "?");
++		send_cmd(CMD_CLOSE_ACK, (uint16_t)m.p1, 0);
++		if (c != NULL) {
++			c->remote_open = false;
++			c->ri_count = 0;
++		}
++		break;
++	case CMD_INTENT:
++		n = (8 + 8 * m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		c = by_rcid(m.p1);
++		for (uint32_t i = 0; c != NULL && i < m.p2; i++) {
++			uint32_t pair[2];
++			rx_peek(8 + 8 * i, pair, 8);
++			if (c->ri_count < MAX_RINTENTS) {
++				c->ri[c->ri_count].size = pair[0];
++				c->ri[c->ri_count].id = pair[1];
++				c->ri[c->ri_count].used = false;
++				c->ri_count++;
++			} else {
++				c->ri_lost++;
++			}
++		}
++		rx_advance(n);
++		if (c != NULL) {
++			if (!c->ri_logged && c->ri_count != 0) {
++				c->ri_logged = true;
++				LOG("7: t=%u.%03u glink \"%s\": the SLPI gives %u intents, the first %u bytes", T, c->name, m.p2,
++				    c->ri[0].size);
++			}
++			c->intent_req_sent = false;
++			pump(c);
++		}
++		break;
++	case CMD_RX_DONE:
++	case CMD_RX_DONE_W_REUSE:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		for (uint32_t i = 0; c != NULL && i < c->ri_count; i++) {
++			if (c->ri[i].id == m.p2) {
++				if (m.cmd == CMD_RX_DONE_W_REUSE) {
++					c->ri[i].used = false;
++				} else {
++					c->ri[i] = c->ri[--c->ri_count];
++				}
++				break;
++			}
++		}
++		if (c != NULL) {
++			pump(c);
++		}
++		break;
++	case CMD_RX_INTENT_REQ:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		LOG("7: t=%u.%03u glink \"%s\" wants an intent of %u bytes", T, c != NULL ? c->name : "?", m.p2);
++		if (c != NULL) {
++			advertise_intents(c, 1, MAX(m.p2, (uint32_t)OUR_INTENT_SIZE));
++			send_cmd(CMD_RX_INTENT_REQ_ACK, c->lcid, 1);
++		}
++		break;
++	case CMD_RX_INTENT_REQ_ACK:
++		rx_advance(8);
++		c = by_rcid(m.p1);
++		if (c != NULL && m.p2 == 0) {
++			c->intent_req_sent = false;
++		}
++		break;
++	case CMD_CLOSE_ACK:
++	case CMD_SIGNALS:
++		rx_advance(8);
++		break;
++	case CMD_READ_NOTIF:
++		rx_advance(8);
++		apcs_kick(SLPI_GLINK_BIT);
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		uint32_t hdr[2];
++		if (avail < 16) {
++			return false;
++		}
++		rx_peek(8, hdr, 8);                     /* chunk_size, left_size */
++		n = (16 + hdr[0] + 7) & ~7u;
++		if (avail < n) {
++			return false;
++		}
++		c = by_rcid(m.p1);
++		if (c != NULL && c->asm_buf != NULL) {
++			if (m.cmd == CMD_TX_DATA) {
++				c->asm_len = 0;
++			}
++			if (c->asm_len + hdr[0] <= OUR_INTENT_SIZE) {
++				rx_peek(16, c->asm_buf + c->asm_len, hdr[0]);
++				c->asm_len += hdr[0];
++			}
++		}
++		rx_advance(n);
++		if (hdr[1] == 0 && c != NULL) {
++			c->rx_pkts++;
++			if (c->rx != NULL) {
++				c->rx(c->asm_buf, c->asm_len);
++			}
++			if (g_features & 1) {
++				send_cmd(CMD_RX_DONE_W_REUSE, c->lcid, m.p2);
++			} else {
++				send_cmd(CMD_RX_DONE, c->lcid, m.p2);
++				advertise_intents(c, 1, OUR_INTENT_SIZE);
++			}
++		}
++		break;
++	}
++	default:
++		LOG("7: t=%u.%03u glink unknown cmd %u (%#x %#x), RX stopped", T, m.cmd, m.p1, m.p2);
++		g_dead = true;
++		return false;
++	}
++	return true;
++}
++
++static bool
++glink_init(void)
++{
++	uint32_t n = 0;
++	bool existed = smem_part_get(slpi_part, slpi_cacheline, ITEM_GLINK_DESC, &n) != NULL;
++
++	g_ch = (struct chan *)IOMallocZero(MAX_CHANS * sizeof(struct chan));
++	g_desc = (volatile uint32_t *)smem_alloc(ITEM_GLINK_DESC, 32);
++	g_tx = (uint8_t *)smem_alloc(ITEM_GLINK_FIFO_TX, GLINK_TX_SIZE);
++	if (g_ch == NULL || g_desc == NULL || g_tx == NULL) {
++		LOG("7: glink: no memory (chans %p, desc %p, tx %p)", g_ch, g_desc, g_tx);
++		g_dead = true;
++		return false;
++	}
++	g_desc[2] = 0;                              /* rx tail */
++	g_desc[1] = 0;                              /* tx head */
++	mb();
++	send_cmd(CMD_VERSION, 1, g_features);
++	LOG("7: t=%u.%03u glink descriptor %u %s, TX FIFO %u (%u bytes); sent VERSION 1 features %#x, doorbell bit %u",
++	    T, ITEM_GLINK_DESC, existed ? "existed" : "ours", ITEM_GLINK_FIFO_TX, GLINK_TX_SIZE, g_features, SLPI_GLINK_BIT);
++	return true;
++}
++
++static bool
++glink_poll(void)
++{
++	uint32_t rx0 = g_rx_msgs, tx0 = g_tx_msgs, sz = 0, i;
++
++	if (g_dead || g_desc == NULL) {
++		return false;
++	}
++	if (g_rx == NULL) {
++		g_rx = (uint8_t *)smem_part_get(slpi_part, slpi_cacheline, ITEM_GLINK_FIFO_RX, &sz);
++		if (g_rx == NULL) {
++			return false;
++		}
++		g_rx_len = sz;
++		LOG("7: t=%u.%03u SLPI RX FIFO (item %u), %u bytes", T, ITEM_GLINK_FIFO_RX, sz);
++		if (sz < 64) {
++			LOG("7: the SLPI's FIFO is too small; GLINK off");
++			g_dead = true;
++			return false;
++		}
++	}
++	for (i = 0; i < 64 && !g_dead && rx_one(); i++) {
++	}
++	for (i = 0; i < g_chans; i++) {
++		struct chan *c = &g_ch[i];
++		if (c->rx == NULL) {
++			continue;
++		}
++		/* the SLPI opens its channels first; if it has not after 8 s, open from our side */
++		if (!c->open_sent && ms() >= 8000) {
++			send_open(c);
++		}
++		if (chan_up(c) && !c->intents_sent) {
++			advertise_intents(c, OUR_INTENTS, OUR_INTENT_SIZE);
++			c->intents_sent = true;
++			LOG("7: t=%u.%03u glink \"%s\" open both ways (lcid %u, rcid %u); gave %u intents of %u bytes", T, c->name,
++			    c->lcid, c->rcid, OUR_INTENTS, OUR_INTENT_SIZE);
++		}
++		pump(c);
++	}
++	return g_rx_msgs != rx0 || g_tx_msgs != tx0;
++}
++
++static void
++glink_summary(void)
++{
++	LOG("7: glink: rx %u msgs, tx %u%s", g_rx_msgs, g_tx_msgs, g_dead ? " (DEAD)" : "");
++	for (uint32_t i = 0; i < g_chans; i++) {
++		struct chan *c = &g_ch[i];
++		LOG("7:  chan \"%s\" lcid %u rcid %u %s%s rx %u tx %u, SLPI intents %u (lost %u, asked %u), txq %u drops %u",
++		    c->name, c->lcid, c->rcid, chan_up(c) ? "UP" : c->remote_open ? "remote-open" : "down",
++		    c->rx == NULL ? " (no client)" : "", c->rx_pkts, c->tx_pkts, c->ri_count, c->ri_lost, c->intent_reqs,
++		    c->txq_tail - c->txq_head, c->txq_drops);
++	}
++}
++
++/* ---------------------------------------------------------------- M3: QRTR, pd-mapper (0340) */
++
++#define QCHAN                   "IPCRTR"
++#define QRTR_NODE_APPS          1
++#define QRTR_PORT_CTRL          0xFFFFFFFEu
++enum {
++	QRTR_TYPE_DATA = 1, QRTR_TYPE_HELLO = 2, QRTR_TYPE_BYE = 3, QRTR_TYPE_NEW_SERVER = 4, QRTR_TYPE_DEL_SERVER = 5,
++	QRTR_TYPE_DEL_CLIENT = 6, QRTR_TYPE_RESUME_TX = 7, QRTR_TYPE_EXIT = 8, QRTR_TYPE_PING = 9,
++	QRTR_TYPE_NEW_LOOKUP = 10, QRTR_TYPE_DEL_LOOKUP = 11,
++};
++/* a server's QRTR instance word: QMI version in bits 7:0, QMI instance in bits 15:8 */
++#define QRTR_INSTANCE(v, i)     ((uint32_t)(v) | ((uint32_t)(i) << 8))
++#define SVC_PDM                 0x40
++#define PDM_WORD                QRTR_INSTANCE(1, 1)     /* 0x101, as TaimenAudio's */
++#define PORT_PDM                0x4001
++#define SVC_SNS_REG             0x010F
++#define SNS_REG_WORD            QRTR_INSTANCE(2, 0)     /* 0x0002: REG/ qmi_add_server(0x10f, 2, 0) */
++#define PORT_SNS_REG            0x4002
++#define SVC_SNS_SMGR            0x0100
++#define QMI_REQ                 0
++#define QMI_RESP                2
++
++struct qrtr_v1 { uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port; } __attribute__((packed));
++struct qrtr_v2 { uint8_t version, type, flags, optlen; uint32_t size; uint16_t src_node, src_port, dst_node, dst_port; } __attribute__((packed));
++struct qrtr_ctrl { uint32_t cmd, a, b, c, d; } __attribute__((packed));
++
++/* the unaligned little-endian fields of QRTR and QMI packets */
++static inline uint16_t ld16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
++static inline uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static inline void st16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
++
++static uint32_t q_ver = 1, q_node = 0xFFFFFFFFu;
++static bool q_hello_rx, q_hello_sent, q_announced;
++static uint32_t q_hellos, q_lookups, q_pdreqs, q_other, q_resumes, q_byes;
++
++/* the SLPI's servers, from NEW_SERVER / DEL_SERVER */
++#define MAX_SERVERS             48
++static struct { uint32_t svc, word, node, port; } q_srv[MAX_SERVERS];
++static uint32_t q_nsrv;
++
++/* SNS_SMGR, the Sensor Manager: M4 talks to it from here (taimensensors>=5) */
++static uint32_t smgr_node = 0xFFFFFFFFu, smgr_port, smgr_word;
++
++static void
++qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
++{
++	uint8_t buf[sizeof(struct qrtr_v1) + 512];
++	uint32_t n;
++
++	if (len > 512) {
++		return;
++	}
++	bzero(buf, sizeof(buf));
++	if (q_ver == 2) {
++		struct qrtr_v2 *h = (struct qrtr_v2 *)buf;
++		h->version = 2;
++		h->type = (uint8_t)type;
++		h->flags = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = (uint16_t)src_port;
++		h->dst_node = (uint16_t)dst_node;
++		h->dst_port = (uint16_t)dst_port;
++		n = sizeof(*h);
++	} else {
++		struct qrtr_v1 *h = (struct qrtr_v1 *)buf;
++		h->version = 1;
++		h->type = type;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = src_port;
++		h->confirm_rx = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->dst_node = dst_node;
++		h->dst_port = dst_port;
++		n = sizeof(*h);
++	}
++	memcpy(buf + n, payload, len);
++	glink_send(QCHAN, buf, (n + len + 3) & ~3u);
++}
++
++static void
++send_ctrl(uint32_t type, uint32_t dst_node, uint32_t dst_port, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{
++	struct qrtr_ctrl m = { type, a, b, c, d };
++	qrtr_send(type, QRTR_PORT_CTRL, dst_node, dst_port, &m, sizeof(m));
++}
++
++static const uint8_t *
++qm_find(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
++{
++	uint32_t o = 7;
++
++	while (o + 3 <= len) {
++		uint16_t l = ld16(d + o + 1);
++		if (o + 3 + l > len) {
++			break;
++		}
++		if (d[o] == type) {
++			*tlen = l;
++			return d + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++static uint32_t
++qm_tlv(uint8_t *m, uint32_t n, uint8_t type, const void *v, uint16_t len)
++{
++	m[n] = type;
++	st16(m + n + 1, len);
++	memcpy(m + n + 3, v, len);
++	return n + 3 + len;
++}
++
++/* The servreg locator (pd-mapper): no protection domains here (plan 2.1, as on the ADSP), so 0 domains. */
++static void
++pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	uint8_t m[64];
++	char name[80];
++	uint16_t r[2] = { 0, 0 }, v, l = 0;
++	uint32_t n = 7;
++
++	m[0] = QMI_RESP;
++	st16(m + 1, txn);
++	st16(m + 3, msg);
++	name[0] = 0;
++	const uint8_t *s = qm_find(d, len, 1, &l);
++	if (s != NULL) {
++		l = (uint16_t)MIN((size_t)l, sizeof(name) - 1);
++		memcpy(name, s, l);
++		name[l] = 0;
++	}
++	n = qm_tlv(m, n, 2, r, 4);
++	if (msg == 0x21) {                          /* GET_DOMAIN_LIST */
++		v = 0;
++		n = qm_tlv(m, n, 0x10, &v, 2);          /* total_domains */
++		v = 1;
++		n = qm_tlv(m, n, 0x11, &v, 2);          /* db_rev_count */
++	}
++	st16(m + 5, (uint16_t)(n - 7));
++	qrtr_send(QRTR_TYPE_DATA, PORT_PDM, node, port, m, n);
++	q_pdreqs++;
++	LOG("8: t=%u.%03u pd-mapper: msg %#x \"%s\" from %u:%#x -> 0 domains", T, msg, name, node, port);
++}
++
++static void reg_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len);
++
++static void
++srv_add(uint32_t svc, uint32_t word, uint32_t node, uint32_t port)
++{
++	for (uint32_t i = 0; i < q_nsrv; i++) {
++		if (q_srv[i].node == node && q_srv[i].port == port) {
++			q_srv[i].svc = svc;
++			q_srv[i].word = word;
++			return;
++		}
++	}
++	if (q_nsrv < MAX_SERVERS) {
++		q_srv[q_nsrv].svc = svc;
++		q_srv[q_nsrv].word = word;
++		q_srv[q_nsrv].node = node;
++		q_srv[q_nsrv].port = port;
++		q_nsrv++;
++	}
++}
++
++static void
++srv_del(uint32_t node, uint32_t port)
++{
++	for (uint32_t i = 0; i < q_nsrv; i++) {
++		if (q_srv[i].node == node && (q_srv[i].port == port || port == QRTR_PORT_CTRL)) {
++			q_srv[i] = q_srv[--q_nsrv];
++			i--;
++		}
++	}
++}
++
++/*
++ * M4's hook: the Sensor Manager is up. The instance is per SoC (plan 2.2: 50 on MSM8996/SDM660,
++ * MSM8998 not in the open table); M4 (taimensensors>=5) sends ALL_SENSOR_INFO (0x05) to
++ * smgr_node:smgr_port from here. M3 only logs it.
++ */
++static void
++smgr_appeared(uint32_t word, uint32_t node, uint32_t port)
++{
++	smgr_node = node;
++	smgr_port = port;
++	smgr_word = word;
++	LOG("8: t=%u.%03u SNS_SMGR (svc 0x100) up: v%u inst %u (QRTR instance %#x), node %u port %#x; not used before M4",
++	    T, word & 0xFF, word >> 8, word, node, port);
++}
++
++static void
++qrtr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t type, src_node, src_port, dst_port, size, hlen, confirm;
++
++	if (len >= sizeof(struct qrtr_v1) && ld32(p) == 1) {
++		const struct qrtr_v1 *h = (const struct qrtr_v1 *)p;
++		type = h->type; src_node = h->src_node; src_port = h->src_port; dst_port = h->dst_port;
++		size = h->size; hlen = sizeof(*h); confirm = h->confirm_rx;
++		q_ver = 1;
++	} else if (len >= sizeof(struct qrtr_v2) && p[0] == 2) {
++		const struct qrtr_v2 *h = (const struct qrtr_v2 *)p;
++		type = h->type; src_node = h->src_node; src_port = h->src_port; dst_port = h->dst_port;
++		size = h->size; hlen = sizeof(*h) + h->optlen * 4; confirm = h->flags & 1;
++		src_port = src_port == 0xFFFE ? QRTR_PORT_CTRL : src_port;
++		dst_port = dst_port == 0xFFFE ? QRTR_PORT_CTRL : dst_port;
++		q_ver = 2;
++	} else {
++		LOG("8: t=%u.%03u qrtr: bad packet, %u bytes (%02x %02x %02x %02x)", T, len, len > 0 ? p[0] : 0,
++		    len > 1 ? p[1] : 0, len > 2 ? p[2] : 0, len > 3 ? p[3] : 0);
++		return;
++	}
++	if (hlen + size > len) {
++		LOG("8: t=%u.%03u qrtr: truncated (%u + %u > %u)", T, hlen, size, len);
++		return;
++	}
++	struct qrtr_ctrl c;
++	bzero(&c, sizeof(c));
++	memcpy(&c, p + hlen, MIN((uint32_t)sizeof(c), size));
++
++	switch (type) {
++	case QRTR_TYPE_HELLO:
++		q_node = src_node;
++		q_hello_rx = true;
++		q_hellos++;
++		q_hello_sent = false;                   /* (re)answer with our HELLO, then our servers */
++		q_announced = false;
++		LOG("8: t=%u.%03u qrtr v%u HELLO from node %u", T, q_ver, src_node);
++		break;
++	case QRTR_TYPE_BYE:
++		q_byes++;
++		srv_del(src_node, QRTR_PORT_CTRL);
++		LOG("8: t=%u.%03u qrtr BYE from node %u", T, src_node);
++		if (src_node == q_node) {
++			q_hello_rx = false;
++		}
++		break;
++	case QRTR_TYPE_NEW_SERVER:
++		if (c.a == 0 && c.b == 0) {
++			break;                          /* the end of a lookup's answer */
++		}
++		srv_add(c.a, c.b, c.c, c.d);
++		LOG("8: t=%u.%03u NEW_SERVER svc %#x v%u inst %u (%#x) node %u port %#x", T, c.a, c.b & 0xFF, c.b >> 8, c.b,
++		    c.c, c.d);
++		if (c.a == SVC_SNS_SMGR) {
++			smgr_appeared(c.b, c.c, c.d);
++		}
++		break;
++	case QRTR_TYPE_DEL_SERVER:
++		srv_del(c.c, c.d);
++		LOG("8: t=%u.%03u DEL_SERVER svc %#x v%u inst %u node %u port %#x", T, c.a, c.b & 0xFF, c.b >> 8, c.c, c.d);
++		if (c.a == SVC_SNS_SMGR) {
++			smgr_node = 0xFFFFFFFFu;
++		}
++		break;
++	case QRTR_TYPE_DEL_CLIENT:
++		if (q_other++ < 32) {
++			LOG("8: t=%u.%03u DEL_CLIENT node %u port %#x", T, c.a, c.b);
++		}
++		break;
++	case QRTR_TYPE_NEW_LOOKUP: {
++		bool pdm = c.a == 0 || c.a == SVC_PDM, reg = c.a == 0 || c.a == SVC_SNS_REG;
++		q_lookups++;
++		if (pdm) {
++			send_ctrl(QRTR_TYPE_NEW_SERVER, src_node, src_port, SVC_PDM, PDM_WORD, QRTR_NODE_APPS, PORT_PDM);
++		}
++		if (reg) {
++			send_ctrl(QRTR_TYPE_NEW_SERVER, src_node, src_port, SVC_SNS_REG, SNS_REG_WORD, QRTR_NODE_APPS, PORT_SNS_REG);
++		}
++		send_ctrl(QRTR_TYPE_NEW_SERVER, src_node, src_port, 0, 0, 0, 0);
++		LOG("8: t=%u.%03u lookup svc %#x (v%u inst %u) from %u:%#x -> %s", T, c.a, c.b & 0xFF, c.b >> 8, src_node, src_port,
++		    pdm && reg ? "pd-mapper + SNS_REG" : pdm ? "pd-mapper" : reg ? "SNS_REG" : "none here");
++		break;
++	}
++	case QRTR_TYPE_DEL_LOOKUP:
++		LOG("8: t=%u.%03u DEL_LOOKUP svc %#x from %u:%#x", T, c.a, src_node, src_port);
++		break;
++	case QRTR_TYPE_DATA:
++		if (confirm) {
++			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
++			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
++		}
++		if (dst_port == PORT_PDM && size >= 7 && p[hlen] == QMI_REQ) {
++			pdm_rx(src_node, src_port, ld16(p + hlen + 1), ld16(p + hlen + 3), p + hlen, size);
++		} else if (dst_port == PORT_SNS_REG && size >= 7) {
++			reg_rx(src_node, src_port, p + hlen, size);
++		} else if (q_other++ < 32) {
++			LOG("8: t=%u.%03u DATA %u:%#x -> port %#x, %u bytes (QMI type %u msg %#x)", T, src_node, src_port, dst_port,
++			    size, size >= 7 ? p[hlen] : 0xFFu, size >= 7 ? ld16(p + hlen + 3) : 0xFFFFu);
++		}
++		break;
++	case QRTR_TYPE_RESUME_TX:
++		q_resumes++;
++		break;
++	default:
++		if (q_other++ < 32) {
++			LOG("8: t=%u.%03u qrtr type %u from %u:%#x, %u bytes", T, type, src_node, src_port, size);
++		}
++		break;
++	}
++}
++
++static void
++qrtr_poll(void)
++{
++	if (!glink_chan_up(QCHAN)) {
++		return;
++	}
++	if (!q_hello_sent) {
++		send_ctrl(QRTR_TYPE_HELLO, q_node, QRTR_PORT_CTRL, 0, 0, 0, 0);
++		q_hello_sent = true;
++		LOG("8: t=%u.%03u sent qrtr v%u HELLO (node %u) to node %#x", T, q_ver, QRTR_NODE_APPS, q_node);
++	}
++	if (q_hello_rx && !q_announced) {
++		send_ctrl(QRTR_TYPE_NEW_SERVER, q_node, QRTR_PORT_CTRL, SVC_PDM, PDM_WORD, QRTR_NODE_APPS, PORT_PDM);
++		send_ctrl(QRTR_TYPE_NEW_SERVER, q_node, QRTR_PORT_CTRL, SVC_SNS_REG, SNS_REG_WORD, QRTR_NODE_APPS, PORT_SNS_REG);
++		q_announced = true;
++		LOG("8: t=%u.%03u announced to node %u: pd-mapper 0x40 (instance %#x) port %#x, SNS_REG 0x10f (v2 inst 0, "
++		    "instance %#x) port %#x", T, q_node, PDM_WORD, PORT_PDM, SNS_REG_WORD, PORT_SNS_REG);
++	}
++}
++
++/* ---------------------------------------------------------------- M3: the SNS_REG server (0340) */
++
++/*
++ * The SLPI reads its configuration from the AP's registry: QMI SNS_REG (0x10f), one message, group
++ * read 0x04. Request TLV 0x01 = u16 group id. Response: 0x02 = u16 result (0 ok, 1 failure), 0x03 =
++ * u16 group id, 0x04 = u16 length + that many bytes (at most 256). A group is `size` bytes at
++ * `offset` of sns.reg (each group starts a 256-byte block). The table is the static map of the
++ * Linux qcom_sns_reg driver (plan 2.2), re-typed as data; groups 20 and 2980 carry its FIXME
++ * ("0x7e on some SoCs"): taimensnsregfix=N serves those two with N bytes instead.
++ */
++
++#define SNS_REG_MSG_GROUP       0x04
++#define SNS_REG_DATA_MAX        0x100
++#define REG_SEEN_MAX            192
++
++struct reg_group { uint16_t id, off, size; };
++static const struct reg_group reg_groups[] = {
++	{ 0, 0x0000, 0x018 }, { 10, 0x0800, 0x018 }, { 20, 0x3000, 0x03a }, { 50, 0x0900, 0x005 },
++	{ 1000, 0x0a00, 0x003 }, { 1001, 0x0b00, 0x003 }, { 1010, 0x0c00, 0x003 }, { 1020, 0x0d00, 0x003 },
++	{ 1030, 0x4100, 0x018 }, { 1040, 0x0100, 0x080 }, { 1050, 0x3200, 0x100 }, { 1080, 0x3600, 0x080 },
++	{ 1081, 0x3700, 0x080 }, { 1090, 0x3300, 0x100 }, { 1091, 0x3400, 0x100 }, { 1110, 0x3800, 0x003 },
++	{ 1120, 0x3d00, 0x018 }, { 1130, 0x3e00, 0x018 }, { 1140, 0x4000, 0x018 },
++	{ 2000, 0x0200, 0x010 }, { 2001, 0x0300, 0x00c }, { 2002, 0x0400, 0x018 }, { 2050, 0x1100, 0x00c },
++	{ 2500, 0x0500, 0x015 }, { 2600, 0x0600, 0x0ea }, { 2610, 0x0700, 0x018 }, { 2620, 0x0e00, 0x024 },
++	{ 2630, 0x0f00, 0x018 }, { 2640, 0x1000, 0x00a }, { 2650, 0x1200, 0x0ac }, { 2660, 0x1400, 0x005 },
++	{ 2670, 0x1500, 0x010 }, { 2680, 0x1600, 0x00d }, { 2690, 0x1700, 0x100 }, { 2691, 0x2600, 0x100 },
++	{ 2692, 0x1800, 0x100 }, { 2693, 0x1900, 0x100 }, { 2694, 0x1a00, 0x100 }, { 2695, 0x1b00, 0x100 },
++	{ 2696, 0x1c00, 0x100 }, { 2697, 0x2f00, 0x100 }, { 2698, 0x2700, 0x100 }, { 2699, 0x2d00, 0x100 },
++	{ 2700, 0x1d00, 0x0e0 }, { 2701, 0x1e00, 0x0e0 }, { 2800, 0x1f00, 0x022 },
++	{ 2900, 0x2000, 0x004 }, { 2910, 0x2100, 0x004 }, { 2920, 0x2200, 0x004 }, { 2930, 0x2300, 0x004 },
++	{ 2940, 0x2400, 0x024 }, { 2950, 0x2500, 0x008 }, { 2960, 0x2800, 0x004 }, { 2970, 0x2900, 0x08f },
++	{ 2971, 0x2b00, 0x016 }, { 2980, 0x2a00, 0x03a }, { 2990, 0x2c00, 0x020 },
++	{ 3000, 0x2e00, 0x100 }, { 3010, 0x3100, 0x100 }, { 3020, 0x3500, 0x100 }, { 3040, 0x3a00, 0x014 },
++	{ 3050, 0x3900, 0x100 }, { 3060, 0x3b00, 0x100 }, { 3070, 0x3c00, 0x00c }, { 3080, 0x3f00, 0x05a },
++	{ 3090, 0x6000, 0x014 },
++	{ 3300, 0x4200, 0x00e }, { 3301, 0x4300, 0x00e }, { 3302, 0x4400, 0x00e }, { 3303, 0x4500, 0x00e },
++	{ 3304, 0x4600, 0x00e }, { 3305, 0x4700, 0x00e }, { 3306, 0x4800, 0x00e }, { 3307, 0x4900, 0x00e },
++	{ 3308, 0x4a00, 0x00e }, { 3309, 0x4b00, 0x00e }, { 3310, 0x4c00, 0x00e }, { 3311, 0x4d00, 0x00e },
++	{ 3312, 0x4e00, 0x00e }, { 3313, 0x4f00, 0x00e }, { 3314, 0x5000, 0x00e }, { 3315, 0x5100, 0x00e },
++	{ 3316, 0x5200, 0x00e }, { 3317, 0x5300, 0x00e }, { 3318, 0x5400, 0x00e }, { 3319, 0x5500, 0x00e },
++	{ 3320, 0x5600, 0x00e }, { 3321, 0x5700, 0x00e }, { 3322, 0x5800, 0x00e }, { 3323, 0x5900, 0x00e },
++	{ 3324, 0x5a00, 0x00e }, { 3325, 0x5b00, 0x00e }, { 3326, 0x5c00, 0x00e }, { 3327, 0x5d00, 0x00e },
++	{ 3328, 0x5e00, 0x00e }, { 3329, 0x5f00, 0x00e },
++	{ 3400, 0x6100, 0x01c },
++};
++#define REG_NGROUPS             (sizeof(reg_groups) / sizeof(reg_groups[0]))
++
++static uint8_t *reg_data;
++static uint32_t reg_len;
++static uint32_t reg_fix;                        /* taimensnsregfix */
++static uint32_t reg_reqs, reg_req_ok, reg_req_fail, reg_other;
++static uint16_t reg_seen[REG_SEEN_MAX];
++static bool reg_seen_ok[REG_SEEN_MAX];
++static uint32_t reg_nseen, reg_served, reg_unknown;
++
++static uint32_t
++reg_size(const struct reg_group *g)
++{
++	return reg_fix != 0 && (g->id == 20 || g->id == 2980) ? reg_fix : g->size;
++}
++
++static const struct reg_group *
++reg_find(uint16_t id)
++{
++	for (unsigned i = 0; i < REG_NGROUPS; i++) {
++		if (reg_groups[i].id == id) {
++			return &reg_groups[i];
++		}
++	}
++	return NULL;
++}
++
++/* distinct groups, for the summary */
++static void
++reg_count(uint16_t id, bool ok)
++{
++	for (uint32_t i = 0; i < reg_nseen; i++) {
++		if (reg_seen[i] == id) {
++			if (ok && !reg_seen_ok[i]) {
++				reg_seen_ok[i] = true;
++				reg_served++;
++				reg_unknown--;
++			}
++			return;
++		}
++	}
++	if (reg_nseen < REG_SEEN_MAX) {
++		reg_seen[reg_nseen] = id;
++		reg_seen_ok[reg_nseen] = ok;
++		reg_nseen++;
++	}
++	if (ok) {
++		reg_served++;
++	} else {
++		reg_unknown++;
++	}
++}
++
++/* sns.reg from the root, kept for the SLPI's reads; how the table fits it, logged once */
++static void
++reg_load(void)
++{
++	int fix = 0;
++	void *d = NULL;
++	uint32_t n = 0;
++
++	if (PE_parse_boot_argn("taimensnsregfix", &fix, sizeof(fix)) && fix > 0 && fix <= SNS_REG_DATA_MAX) {
++		reg_fix = (uint32_t)fix;
++		LOG("9: taimensnsregfix=%#x: groups 20 and 2980 are served with %#x bytes (the table says 0x3a)", fix, fix);
++	}
++	if (taimen_fw_load(FW_DIR "sns.reg", 1u << 20, &d, &n) != 0 || d == NULL || n == 0) {
++		LOG("9: no %ssns.reg: every group read will get a failure", FW_DIR);
++		return;
++	}
++	reg_data = (uint8_t *)d;
++	reg_len = n;
++	unsigned beyond = 0, past_end = 0;
++	for (unsigned i = 0; i < REG_NGROUPS; i++) {
++		const struct reg_group *g = &reg_groups[i];
++		uint32_t size = reg_size(g), last = 0;
++		if (g->off + size > reg_len) {
++			past_end++;
++			LOG("9: sns.reg group %u (%#x + %#x) runs past the file's end (%#x)", g->id, g->off, size, reg_len);
++			continue;
++		}
++		for (uint32_t k = 0; k < SNS_REG_DATA_MAX && g->off + k < reg_len; k++) {
++			if (reg_data[g->off + k] != 0) {
++				last = k + 1;
++			}
++		}
++		if (last > size) {
++			beyond++;
++			LOG("9: sns.reg group %u @%#x: data up to +%#x, the table serves %#x bytes%s", g->id, g->off, last, size,
++			    g->id == 20 || g->id == 2980 ? " (REG/ FIXME: 0x7e on some SoCs; taimensnsregfix=0x7e)" : "");
++		}
++	}
++	/* 256-byte blocks with data that no table group starts: groups this table does not know */
++	char extra[128];
++	unsigned nextra = 0;
++	size_t el = 0;
++	extra[0] = 0;
++	for (uint32_t b = 0; b < reg_len; b += 0x100) {
++		bool known = false, data = false;
++		for (unsigned i = 0; i < REG_NGROUPS && !known; i++) {
++			known = reg_groups[i].off == b;
++		}
++		for (uint32_t k = b; k < b + 0x100 && k < reg_len && !data; k++) {
++			data = reg_data[k] != 0;
++		}
++		if (!known && data) {
++			nextra++;
++			if (el + 8 < sizeof(extra)) {
++				el += (size_t)snprintf(extra + el, sizeof(extra) - el, " %#x", b);
++			}
++		}
++	}
++	LOG("9: sns.reg %u bytes for the registry server: %u table groups, %u with data past their size, %u past the "
++	    "end; %u blocks with data outside the table:%s", reg_len, (unsigned)REG_NGROUPS, beyond, past_end, nextra,
++	    nextra != 0 ? extra : " none");
++}
++
++static void
++reg_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	uint8_t type = d[0];
++	uint16_t txn = ld16(d + 1), msg = ld16(d + 3);
++
++	if (type != QMI_REQ || msg != SNS_REG_MSG_GROUP) {
++		/* REG/ answers nothing else either */
++		if (reg_other++ < 16) {
++			LOG("9: t=%u.%03u sns_reg: QMI type %u msg %#x txn %u from %u:%#x, %u bytes: not a group read, no answer",
++			    T, type, msg, txn, node, port, len);
++		}
++		return;
++	}
++	uint16_t tl = 0, id = 0;
++	const uint8_t *v = qm_find(d, len, 0x01, &tl);
++	bool have_id = v != NULL && tl >= 2;
++	if (have_id) {
++		memcpy(&id, v, 2);
++	}
++	const struct reg_group *g = have_id ? reg_find(id) : NULL;
++	uint32_t size = g != NULL ? reg_size(g) : 0;
++	bool ok = g != NULL && reg_data != NULL && g->off + size <= reg_len && size <= SNS_REG_DATA_MAX;
++
++	uint8_t m[7 + 5 + 5 + 3 + 2 + SNS_REG_DATA_MAX], data[2 + SNS_REG_DATA_MAX];
++	uint16_t result = ok ? 0 : 1, dl = (uint16_t)(ok ? size : 0);
++	uint32_t n = 7;
++	m[0] = QMI_RESP;
++	st16(m + 1, txn);
++	st16(m + 3, SNS_REG_MSG_GROUP);
++	n = qm_tlv(m, n, 0x02, &result, 2);
++	n = qm_tlv(m, n, 0x03, &id, 2);
++	memcpy(data, &dl, 2);
++	if (ok) {
++		memcpy(data + 2, reg_data + g->off, dl);
++	}
++	n = qm_tlv(m, n, 0x04, data, (uint16_t)(2 + dl));
++	st16(m + 5, (uint16_t)(n - 7));
++	qrtr_send(QRTR_TYPE_DATA, PORT_SNS_REG, node, port, m, n);
++
++	reg_reqs++;
++	if (ok) {
++		reg_req_ok++;
++	} else {
++		reg_req_fail++;
++	}
++	reg_count(id, ok);
++	if (ok) {
++		LOG("9: t=%u.%03u sns_reg group %u served: %#x + %#x (txn %u, %u:%#x)", T, id, g->off, size, txn, node, port);
++	} else {
++		LOG("9: t=%u.%03u sns_reg group %u %s: failure, 0 bytes (txn %u, %u:%#x)", T, id,
++		    !have_id ? "(no group TLV 0x01)" : g == NULL ? "UNKNOWN" : reg_data == NULL ? "no sns.reg" : "past the file",
++		    txn, node, port);
++	}
++}
++
++/* ---------------------------------------------------------------- M3: the loop (0340) */
++
++#define M3_WINDOW_MS            20000
++
++static void
++m3_summary(const char *when)
++{
++	char chans[160], smgr[64];
++	size_t cl = 0;
++	chans[0] = 0;
++	for (uint32_t i = 0; i < g_chans && cl + 40 < sizeof(chans); i++) {
++		struct chan *c = &g_ch[i];
++		cl += (size_t)snprintf(chans + cl, sizeof(chans) - cl, "%s%s(%s)", i != 0 ? " " : "", c->name,
++		    chan_up(c) ? "up" : c->remote_open ? "acked" : "down");
++	}
++	if (smgr_node != 0xFFFFFFFFu) {
++		snprintf(smgr, sizeof(smgr), "SMGR v%u inst %u at %u:%#x", smgr_word & 0xFF, smgr_word >> 8, smgr_node, smgr_port);
++	} else {
++		snprintf(smgr, sizeof(smgr), "no SMGR");
++	}
++	LOG("9: M3%s: dsps glink v%u features %#x (SLPI %#x)%s, chans %s, qrtr node %d v%u, servers %u (%s), "
++	    "sns_reg %u groups served, %u unknown (%u requests: %u ok, %u failed)", when, g_rver, g_features, g_rfeat,
++	    g_rver_seen ? "" : " (no VERSION seen)", g_chans != 0 ? chans : "none", q_hello_rx ? (int)q_node : -1, q_ver,
++	    q_nsrv, smgr, reg_served, reg_unknown, reg_reqs, reg_req_ok, reg_req_fail);
++	glink_summary();
++	for (uint32_t i = 0; i < q_nsrv; i++) {
++		LOG("8:  server svc %#x v%u inst %u node %u port %#x", q_srv[i].svc, q_srv[i].word & 0xFF, q_srv[i].word >> 8,
++		    q_srv[i].node, q_srv[i].port);
++	}
++	LOG("8:  qrtr: %u HELLO, %u BYE, %u lookups, %u pd-mapper requests, %u RESUME_TX, %u other", q_hellos, q_byes,
++	    q_lookups, q_pdreqs, q_resumes, q_other);
++}
++
++static void
++m3_run(int level)
++{
++	LOG("7: M3 (taimensensors=%d): GLINK on the dsps edge (APCS bit %u), QRTR, SNS_REG; t= is from AUTH_AND_RESET",
++	    level, SLPI_GLINK_BIT);
++	reg_load();
++	if (!glink_init()) {
++		return;
++	}
++	glink_register(QCHAN, qrtr_rx);
++	uint32_t n = 0;
++	struct smp2p_hdr *in = (struct smp2p_hdr *)smem_part_get(slpi_part, slpi_cacheline, ITEM_SMP2P_IN, &n);
++	volatile uint32_t *slave = in != NULL ? smp2p_find(in, "slave-kernel") : NULL;
++	uint64_t start = now_ms(), last_status = start;
++	uint32_t last_sig = 0;
++	bool summary = false;
++	for (;;) {
++		bool busy = glink_poll();
++		qrtr_poll();
++		if (!summary && now_ms() - start >= M3_WINDOW_MS) {
++			summary = true;
++			m3_summary("");
++			LOG("9: t=%u.%03u the registry stays served, polled every 20 ms", T);
++		}
++		if (slave != NULL && (*slave & SLAVE_ERR_FATAL) != 0) {
++			LOG("9: t=%u.%03u *** SLPI FATAL (slave-kernel %#x) ***", T, *slave);
++			crash_reason();
++			m3_summary(" (at the SLPI's fatal error)");
++			break;
++		}
++		if (g_dead && summary) {
++			LOG("9: t=%u.%03u GLINK is dead; the sensors thread ends", T);
++			break;
++		}
++		/* after the window: a status line each minute in which something happened */
++		if (summary && now_ms() - last_status >= 60000) {
++			last_status = now_ms();
++			uint32_t sig = g_rx_msgs + q_nsrv + reg_reqs + q_lookups + q_pdreqs;
++			if (sig != last_sig) {
++				last_sig = sig;
++				LOG("9: t=%u.%03u status: slave-kernel %#x, glink rx %u tx %u, servers %u%s, sns_reg %u served %u "
++				    "unknown (%u requests)", T, slave != NULL ? *slave : 0, g_rx_msgs, g_tx_msgs, q_nsrv,
++				    smgr_node != 0xFFFFFFFFu ? " (SMGR up)" : "", reg_served, reg_unknown, reg_reqs);
++			}
++		}
++		if (busy) {
++			IODelay(200);
++		} else {
++			IOSleep(summary ? 20 : 2);
++		}
++	}
+ }
+ 
+ static void
+@@ -696,7 +1920,14 @@ sensors_thread(void *arg, wait_result_t)
+ 	fw_census();
+ 	LOG("5: census done");
+ 	if (level >= 3) {
+-		slpi_boot();
++		bool ready = slpi_boot();
++		if (level >= 4) {
++			if (ready) {
++				m3_run(level);
++			} else {
++				LOG("7: M3 skipped: M2 did not bring the SLPI to READY");
++			}
++		}
+ 	}
+ }
+ 
