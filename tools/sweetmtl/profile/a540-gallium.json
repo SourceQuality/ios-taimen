@@ -13,7 +13,8 @@
           "imageCubeArray": true,
           "fragmentStoresAndAtomics": true,
           "vertexPipelineStoresAndAtomics": true,
-          "shaderStorageImageWriteWithoutFormat": true
+          "shaderStorageImageWriteWithoutFormat": true,
+          "samplerAnisotropy": true
         }
       },
       "properties": {
@@ -88,7 +89,7 @@
             "maxDrawIndexedIndexValue": 16777215,
             "maxDrawIndirectCount": 1,
             "maxSamplerLodBias": 2,
-            "maxSamplerAnisotropy": 1,
+            "maxSamplerAnisotropy": 16,
             "maxViewports": 1,
             "maxViewportDimensions": [
               4096,
