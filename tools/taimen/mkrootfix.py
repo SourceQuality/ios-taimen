@@ -338,8 +338,11 @@ def main():
         assert path.startswith('/'), path
         b.add(REMOVE, path)
     if a.locationd:
+        # iOS 16's locationd reads LocationServicesEnabledIn8.0 (its strings); with only the 7.0 key it still
+        # said "location disabled system-wide" (boot 190)
         b.plist(WRITE, '/private/var/root/Library/Preferences/com.apple.locationd.plist',
-                {'LocationServicesEnabledIn7.0': True, 'LocationServicesEnabled': True}, 0o600, 0, 0)
+                {'LocationServicesEnabledIn8.0': True, 'LocationServicesEnabledIn7.0': True,
+                 'LocationServicesEnabled': True}, 0o600, 0, 0)
     if hal is not None:
         b.mkdirs(hal[0])
         b.plist(WRITE, hal[0] + '/Info.plist', hal[1], 0o644, 0, 0, plistlib.FMT_XML)
