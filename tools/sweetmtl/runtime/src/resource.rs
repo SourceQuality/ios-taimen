@@ -768,6 +768,7 @@ impl Heap {
 pub(crate) struct Neutral {
     zero: Option<Buffer>,
     sink: Option<Buffer>,
+    color_write: Option<Buffer>,
 }
 
 impl Device {
@@ -778,6 +779,17 @@ impl Device {
             n.zero = Some(self.new_buffer(min.max(65536), ResourceOptions::shared())?);
         }
         Ok(n.zero.clone().unwrap())
+    }
+
+    /// The sRGB color table a fragment function writing floats to an sRGB attachment reads
+    /// (WriteSource::ColorWriteTable, metal2vulkan's color_write_table: 4096 bytes, the same for
+    /// every pipeline): one read-only buffer per device. Maps' VectorKit draws need it (boot 191).
+    pub(crate) fn color_write_table(&self) -> Result<Buffer, Error> {
+        let mut n = self.0.neutral.lock().unwrap_or_else(|p| p.into_inner());
+        if n.color_write.is_none() {
+            n.color_write = Some(self.new_buffer_with_bytes(metal2vulkan::bind::color_write_table(), ResourceOptions::shared())?);
+        }
+        Ok(n.color_write.clone().unwrap())
     }
 
     /// A buffer of at least `min` bytes that takes writes nobody reads.

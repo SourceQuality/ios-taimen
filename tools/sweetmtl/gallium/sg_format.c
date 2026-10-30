@@ -296,9 +296,12 @@ sg_format_block_height(uint32_t vk)
    return f == PIPE_FORMAT_NONE ? 0 : util_format_get_blockheight(f);
 }
 
+static bool sg_blend_unreported(struct sg_device *dev, enum pipe_format f);
+
 bool
 sg_format_supported(struct sg_device *dev, uint32_t vk, uint32_t usage, uint32_t samples)
 {
+   struct pipe_screen *ps = dev->screen;
    enum pipe_format f = (enum pipe_format)sg_pipe_format(vk);
    if (f == PIPE_FORMAT_NONE)
       return false;
@@ -307,9 +310,24 @@ sg_format_supported(struct sg_device *dev, uint32_t vk, uint32_t usage, uint32_t
    enum pipe_texture_target t = (usage & SG_USAGE_VERTEX) ? PIPE_BUFFER : PIPE_TEXTURE_2D;
    if ((usage & SG_USAGE_BLEND) && util_format_is_pure_integer(f))
       return false;
-   if (usage & SG_USAGE_BLEND)
-      bind |= PIPE_BIND_BLENDABLE;
-   return dev->screen->is_format_supported(dev->screen, f, t, s, s, bind);
+   if ((usage & SG_USAGE_BLEND) && !ps->is_format_supported(ps, f, t, s, s, bind | PIPE_BIND_BLENDABLE))
+      return sg_blend_unreported(dev, f) && ps->is_format_supported(ps, f, t, s, s, bind);
+   return ps->is_format_supported(ps, f, t, s, s, bind | ((usage & SG_USAGE_BLEND) ? PIPE_BIND_BLENDABLE : 0));
+}
+
+/*
+ * freedreno's a5xx is_format_supported never answers PIPE_BIND_BLENDABLE (fd5_screen.c adds the bits it
+ * knows to retval and wants retval == usage), so asking for a blendable render target failed for every
+ * format and Maps' BGRA8Unorm_sRGB pipelines were refused (boot 191). The RB blends every non-integer
+ * color format it renders, sRGB ones in linear space; 32-bit float channels only where the driver says so.
+ */
+static bool
+sg_blend_unreported(struct sg_device *dev, enum pipe_format f)
+{
+   const struct util_format_description *d = util_format_description(f);
+   bool f32 = d && d->channel[0].type == UTIL_FORMAT_TYPE_FLOAT && d->channel[0].size == 32;
+   (void)dev;
+   return !util_format_is_pure_integer(f) && !f32;
 }
 
 uint32_t
@@ -340,7 +358,8 @@ sg_format_features(struct sg_device *dev, uint32_t vk)
          out |= SG_FEAT_DEPTH_STENCIL;
    } else if (HAS(PIPE_TEXTURE_2D, PIPE_BIND_RENDER_TARGET)) {
       out |= SG_FEAT_COLOR;
-      if (!integer && HAS(PIPE_TEXTURE_2D, PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE))
+      if (!integer && (HAS(PIPE_TEXTURE_2D, PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE) ||
+                       sg_blend_unreported(dev, f)))
          out |= SG_FEAT_BLEND;
    }
    if (!zs && HAS(PIPE_TEXTURE_2D, PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR))

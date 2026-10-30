@@ -324,6 +324,11 @@ pub(crate) fn resolve(device: &Device, stages: &[StageRef], plan: &BindingPlan, 
                     BindRes::Buffer { buffer: b.0.clone(), offset: 0, size: size as u32, writable: true }
                 }
                 WriteSource::Neutral(NeutralResource::Sampler { .. }) => BindRes::Sampler(neutral_sampler(device)?),
+                WriteSource::ColorWriteTable => {
+                    let b = device.color_write_table()?;
+                    let size = b.length() as u32;
+                    BindRes::Buffer { buffer: b.0.clone(), offset: 0, size, writable: false }
+                }
                 WriteSource::Texture { slot: mslot, view } => {
                     let t = table(stages, mslot)?;
                     let tex = t.textures.get(&mslot.index).ok_or_else(|| {

@@ -184,7 +184,7 @@ def main():
     ap.add_argument('--write', action='append', default=[], metavar='/DEST=SRC[:UID]',
                     help='write a file at boot even if it exists (mode 0644, owner UID, default 0)')
     ap.add_argument('--locationd', action='store_true',
-                    help='Location Services on (root\'s com.apple.locationd.plist): no "Turn On Location Services" alerts')
+                    help='Location Services on (mobile\'s com.apple.locationd.plist): no "Turn On Location Services" alerts')
     ap.add_argument('--zfile', action='append', default=[], metavar='/DEST=SRC')
     ap.add_argument('--phone-tools', metavar='DIR',
                     help='install the phone-tools CI build in DIR (tools/windows/ci-phone-tools.sh): '
@@ -338,8 +338,12 @@ def main():
         assert path.startswith('/'), path
         b.add(REMOVE, path)
     if a.locationd:
-        # iOS 16's locationd reads LocationServicesEnabledIn8.0 (its strings); with only the 7.0 key it still
-        # said "location disabled system-wide" (boot 190)
+        # iOS 16's locationd reads the switch as CFPreferencesCopyValue("LocationServicesEnabledIn8.0",
+        # "com.apple.locationd", "mobile", kCFPreferencesAnyHost) (locationd 0x1001b32c8): mobile's plist. Root's
+        # (the 7.0 key, iOS 7's place) left it "location disabled system-wide" (boots 190-191).
+        b.mkdirs('/private/var/mobile/Library/Preferences', uid=MOBILE, gid=MOBILE)
+        b.plist(WRITE, '/private/var/mobile/Library/Preferences/com.apple.locationd.plist',
+                {'LocationServicesEnabledIn8.0': True}, 0o600, MOBILE, MOBILE)
         b.plist(WRITE, '/private/var/root/Library/Preferences/com.apple.locationd.plist',
                 {'LocationServicesEnabledIn8.0': True, 'LocationServicesEnabledIn7.0': True,
                  'LocationServicesEnabled': True}, 0o600, 0, 0)
