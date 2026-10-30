@@ -2,14 +2,16 @@
  * mtlabitest: the bridge's object ABI (NativeMetalObjects.h, what the Objective-C frontend calls) on sweetmtl-runtime,
  * beyond the self-test: device answers, textures (CPU access, sampling, storage), samplers, blits, indexed draws with
  * depth, viewport, scissor and culling, multisample resolves (color, depth and stencil), function constants,
- * threadgroup memory, vertex attributes, events, shared events and listeners, fences, handlers and resource tracking.
+ * threadgroup memory, vertex attributes, pipeline variants (an sRGB texture read in a fragment function), events,
+ * shared events and listeners, fences, handlers and resource tracking.
  *
  *   mtlabitest [--daemon] [AIR_DIR]
  *
  * AIR_DIR holds extra fixtures assembled from metal2vulkan's validation fixtures (host-check.sh makes them):
- * stage_io.air, sampling.air, threadgroup_word.air. A build with MTLABITEST_EMBEDDED_AIR (build-ios.sh) carries them
- * in the binary (embedded_air[], from a header it generates) and needs no AIR_DIR. --daemon: as a launchd job on the
- * phone, run once per boot and then idle (test/oneshot.h). Each check prints one line:
+ * stage_io.air, sampling.air, threadgroup_word.air, tob_renders.air. A build with MTLABITEST_EMBEDDED_AIR
+ * (build-ios.sh) carries them in the binary (embedded_air[], from a header it generates) and needs no AIR_DIR.
+ * --daemon: as a launchd job on the phone, run once per boot and then idle (test/oneshot.h). Each check prints one
+ * line:
  *   ok        it ran and what it computed is right
  *   ran       it ran (recorded, compiled, submitted); its GPU-written result is not checkable (SWEETMTL_DRM_SHIM=1:
  *             freedreno drm-shim executes nothing)
@@ -19,6 +21,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +67,7 @@ static void gpu_result(const char *what, int bad, const char *detail)
 
 /* Metal's raw values used below */
 enum {
-	PF_RGBA8 = 70, PF_RGBA32U = 123, PF_D32F = 252, PF_D32F_S8 = 260,
+	PF_RGBA8 = 70, PF_RGBA8_SRGB = 71, PF_RGBA32U = 123, PF_RGBA32F = 125, PF_D32F = 252, PF_D32F_S8 = 260,
 	TT_2D = 2, TT_2D_MS = 4, TU_READ = 1, TU_WRITE = 2, TU_RT = 4,
 	SM_SHARED = 0, SM_PRIVATE = 2 << 4,
 	LOAD_LOAD = 1, LOAD_CLEAR = 2, STORE_STORE = 1, STORE_RESOLVE = 2, STORE_STORE_RESOLVE = 3,
@@ -745,6 +748,161 @@ static void sampler_kernel(void)
 	nmb_library_release(lib);
 }
 
+/* Metal's value of an 8-bit sRGB color code: the step k of its twelve-bit table, k / 4095 rounded to float
+ * (metal2vulkan lower/arith/srgb.rs, SRGB_DECODE_STEPS: k = round(decode(c / 255) * 4095), every k at least 1.6e-4 of
+ * a step from a half step). The GPU's own sRGB decode is not this. */
+static float metal_srgb(int c)
+{
+	double x = c / 255.0;
+	double linear = x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+	return (float)lround(linear * 4095.0) / 4095.0f;
+}
+
+/* A fragment function that reads a texture bound in RGBA8Unorm_sRGB. The binder's plan asks for the pipeline's
+ * variant for that binding (VariantKey::srgb_textures), which the runtime compiles at the first draw and binds:
+ * - tob_read reads each texel through a UNORM view of the texture (its raw codes) and decodes them with Metal's table,
+ *   so every channel must be Metal's value exactly;
+ * - tob_sample samples the texture at texel centers through a runtime sampler (nearest), whose filter the function does
+ *   not know, so the translator keeps the GPU's own sRGB decode there (PrecisionNote::SrgbTexelDecode): every channel
+ *   within 1/4095 of Metal's value;
+ * - the fixture's invert_texels kernel reads it as tob_read does (a compute pipeline's variant): 1 - Metal's value.
+ * 4x4 texels of 64 codes over 0..255 (alpha c / 255), drawn or written into RGBA32Float. Any refusal is a FAIL. */
+static void srgb_variant(NmbLibrary *fixture)
+{
+	NmbLibrary *lib = library_file("tob_renders.air");
+	if (!lib) {
+		line("FAIL", "sRGB texture variant", "no tob_renders.air");
+		return;
+	}
+	uint8_t codes[4 * 4 * 4];
+	float want[4 * 4 * 4];
+	for (int i = 0; i < 16; i++)
+		for (int c = 0; c < 4; c++) {
+			int code = c < 3 ? (i * 3 + c) * 255 / 47 : i * 17;
+			codes[4 * i + c] = (uint8_t)code;
+			want[4 * i + c] = c < 3 ? metal_srgb(code) : (float)code / 255.0f;
+		}
+	static const char *const fragments[2] = {"tob_read", "tob_sample"};
+	static const char *const what[2] = {
+		"sRGB texture variant: RGBA8Unorm_sRGB read in a fragment function (raw codes, Metal's decode)",
+		"sRGB texture variant: RGBA8Unorm_sRGB sampled through a runtime sampler (the GPU's decode)",
+	};
+	static const float within[2] = {0.0f, 1.0f / 4095.0f};
+	struct NmbSamplerDescriptor sd;
+	memset(&sd, 0, sizeof(sd));
+	sd.normalized = 1;
+	sd.max_anisotropy = 1;
+	sd.lod_max = 1000;
+	NmbSampler *s = nmb_sampler_new(dev, &sd);
+	for (int k = 0; k < 2; k++) {
+		NmbFunction *v = nmb_function_new(lib, "tob_rect"), *f = nmb_function_new(lib, fragments[k]);
+		struct NmbRenderPipelineDescriptor d;
+		memset(&d, 0, sizeof(d));
+		d.vertex = v;
+		d.fragment = f;
+		d.colors[0].format = PF_RGBA32F;
+		d.colors[0].write_mask = 0xf;
+		d.samples = 1;
+		d.topology = 3;
+		d.rasterization = 1;
+		NmbRenderPipeline *p = v && f ? nmb_render_pipeline_new(dev, &d) : NULL;
+		if (v)
+			nmb_function_release(v);
+		if (f)
+			nmb_function_release(f);
+		if (!p || !s) {
+			line("FAIL", what[k], nmb_last_error());
+			if (p)
+				nmb_render_pipeline_release(p);
+			continue;
+		}
+		NmbTexture *src = texture(PF_RGBA8_SRGB, 4, 4, 1, TU_READ, SM_SHARED);
+		NmbTexture *dst = texture(PF_RGBA32F, 4, 4, 1, TU_RT | TU_READ, SM_SHARED);
+		uint64_t region[6] = {0, 0, 0, 4, 4, 1};
+		static const float rect[4] = {-1, -1, 1, 1};
+		NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
+		struct NmbRenderPassDescriptor rp;
+		memset(&rp, 0, sizeof(rp));
+		rp.colors[0].texture = dst;
+		rp.colors[0].load = LOAD_CLEAR;
+		rp.colors[0].store = STORE_STORE;
+		NmbEncoder *e = src && dst && nmb_texture_replace(src, region, 0, 0, codes, 16, 0, sizeof(codes))
+		                    ? nmb_render_encoder_new(cb, &rp)
+		                    : NULL;
+		if (!e || !nmb_render_set_pipeline(e, p) || !nmb_encoder_set_bytes(e, 1, rect, sizeof(rect), 0) ||
+		    !nmb_encoder_set_texture(e, 2, src, 0) || !nmb_encoder_set_sampler(e, 2, s, 0) ||
+		    !nmb_render_draw(e, PRIM_TRIANGLE, 0, 6, 1, 0)) {
+			line("FAIL", what[k], nmb_last_error());
+			if (e)
+				nmb_encoder_discard(e);
+		} else if (nmb_encoder_end(e) && finish(cb, what[k])) {
+			float out[4 * 4 * 4];
+			bool fetched = nmb_texture_get_bytes(dst, out, 64, 0, sizeof(out), region, 0, 0);
+			int bad = fetched ? 0 : 64;
+			for (int i = 0; i < 64 && fetched; i++) {
+				bool right = within[k] ? fabsf(out[i] - want[i]) <= within[k] : !memcmp(&out[i], &want[i], sizeof(float));
+				if (!right && bad++ < 4 && !shim)
+					printf("  texel %d channel %d (code %u): %.9g, want %.9g\n", i / 4, i % 4, codes[i], out[i],
+					       want[i]);
+			}
+			char detail[64];
+			snprintf(detail, sizeof(detail), within[k] ? "%d of 64 channels off by more than 1/4095"
+			                                           : "%d of 64 channels off", bad);
+			gpu_result(what[k], bad, detail);
+		}
+		nmb_command_buffer_release(cb);
+		if (src)
+			nmb_texture_release(src);
+		if (dst)
+			nmb_texture_release(dst);
+		nmb_render_pipeline_release(p);
+	}
+	if (s)
+		nmb_sampler_release(s);
+	nmb_library_release(lib);
+
+	/* the same in a kernel (a compute pipeline's variant): invert_texels reads each texel and writes its color
+	 * channels inverted, 1 - Metal's value, into RGBA32Float */
+	const char *kwhat = "sRGB texture variant: RGBA8Unorm_sRGB read in a kernel (raw codes, Metal's decode)";
+	NmbFunction *kf = nmb_function_new(fixture, "invert_texels");
+	NmbComputePipeline *kp = kf ? nmb_compute_pipeline_new(dev, kf) : NULL;
+	if (kf)
+		nmb_function_release(kf);
+	NmbTexture *src = texture(PF_RGBA8_SRGB, 4, 4, 1, TU_READ, SM_SHARED);
+	NmbTexture *dst = texture(PF_RGBA32F, 4, 4, 1, TU_WRITE | TU_READ, SM_SHARED);
+	uint64_t region[6] = {0, 0, 0, 4, 4, 1};
+	NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
+	NmbEncoder *e = kp && src && dst && nmb_texture_replace(src, region, 0, 0, codes, 16, 0, sizeof(codes))
+	                    ? nmb_compute_encoder_new(cb)
+	                    : NULL;
+	uint64_t grid[3] = {4, 4, 1}, group[3] = {4, 4, 1};
+	if (!e || !nmb_compute_set_pipeline(e, kp) || !nmb_encoder_set_texture(e, 0, src, 0) ||
+	    !nmb_encoder_set_texture(e, 0, dst, 1) || !nmb_compute_dispatch(e, grid, group, true)) {
+		line("FAIL", kwhat, nmb_last_error());
+		if (e)
+			nmb_encoder_discard(e);
+	} else if (nmb_encoder_end(e) && finish(cb, kwhat)) {
+		float out[4 * 4 * 4];
+		bool fetched = nmb_texture_get_bytes(dst, out, 64, 0, sizeof(out), region, 0, 0);
+		int bad = fetched ? 0 : 64;
+		for (int i = 0; i < 64 && fetched; i++) {
+			float w = i % 4 < 3 ? 1.0f - want[i] : want[i];
+			if (memcmp(&out[i], &w, sizeof(float)) && bad++ < 4 && !shim)
+				printf("  texel %d channel %d (code %u): %.9g, want %.9g\n", i / 4, i % 4, codes[i], out[i], w);
+		}
+		char detail[64];
+		snprintf(detail, sizeof(detail), "%d of 64 channels off", bad);
+		gpu_result(kwhat, bad, detail);
+	}
+	nmb_command_buffer_release(cb);
+	if (src)
+		nmb_texture_release(src);
+	if (dst)
+		nmb_texture_release(dst);
+	if (kp)
+		nmb_compute_pipeline_release(kp);
+}
+
 static void vertex_attributes(void)
 {
 	NmbLibrary *lib = library_file("stage_io.air");
@@ -957,6 +1115,7 @@ int main(int argc, char **argv)
 	function_constants();
 	threadgroup_memory();
 	sampler_kernel();
+	srgb_variant(lib);
 	vertex_attributes();
 	sync_objects(lib);
 	not_yet_paths();

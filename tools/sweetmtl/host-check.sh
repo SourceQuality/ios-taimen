@@ -109,6 +109,7 @@ if [ "$BUILD" = 1 ]; then
 	"$LLVM_AS" -o "$OUT/air/stage_io.air" "$F/engine/stage_io.ll"
 	"$LLVM_AS" -o "$OUT/air/sampling.air" "$F/engine/sampling.ll"
 	"$LLVM_AS" -o "$OUT/air/threadgroup_word.air" "$F/kernel_threadgroup_word.ll"
+	"$LLVM_AS" -o "$OUT/air/tob_renders.air" "$F/engine/tob_renders.ll"
 fi
 SHIM="LD_PRELOAD=$MESA_BUILD/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so FD_GPU_ID=540 SWEETMTL_DRM_SHIM=1
 	LD_LIBRARY_PATH=$LIBPATH"

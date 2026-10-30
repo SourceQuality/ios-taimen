@@ -700,6 +700,14 @@ fn run(device: &Device, cb: &Arc<CbInner>) {
             }
         }
     }
+    // Nothing stays bound while the lock is released: a binding's sampler or view may be freed once
+    // its command buffer completes, and a later clear (on a5xx u_blitter's draw) emits every bound
+    // sampler's border color (fd5 setup_border_colors read a freed sampler: mtlabitest on drm-shim,
+    // a sampler state released after its last draw, then a pass that clears).
+    let unbind = |lock: &GpuLock| {
+        // SAFETY: lock held.
+        unsafe { ffi::sg_ctx_reset_bindings(lock.sg()) }
+    };
     let flush = |lock: &GpuLock, actions: Vec<Action>| {
         // SAFETY: lock held.
         let fence = unsafe { ffi::sg_ctx_flush(lock.sg()) };
@@ -720,6 +728,7 @@ fn run(device: &Device, cb: &Arc<CbInner>) {
             Cmd::SignalEvent(event, value) => flush(lock.as_ref().unwrap(), vec![Action::Signal(event.clone(), *value)]),
             Cmd::WaitEvent(event, value) => {
                 if event.value() < *value {
+                    unbind(lock.as_ref().unwrap());
                     flush(lock.as_ref().unwrap(), Vec::new());
                     drop(lock.take());
                     event.wait(*value, None);
@@ -732,6 +741,7 @@ fn run(device: &Device, cb: &Arc<CbInner>) {
             }
             Cmd::WaitFence(fence, generation) => {
                 if *fence.flushed.lock().unwrap_or_else(|p| p.into_inner()) < *generation {
+                    unbind(lock.as_ref().unwrap());
                     drop(lock.take());
                     fence.wait(*generation);
                     lock = Some(gpu.lock());
@@ -745,6 +755,7 @@ fn run(device: &Device, cb: &Arc<CbInner>) {
             }
         }
     }
+    unbind(lock.as_ref().unwrap());
     // SAFETY: lock held.
     let fence = unsafe { ffi::sg_ctx_flush(lock.as_ref().unwrap().sg()) };
     drop(lock);

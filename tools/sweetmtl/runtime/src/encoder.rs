@@ -436,7 +436,8 @@ impl ComputeCommandEncoder {
         let device = self.core.device();
         let mut state = BindState::default();
         state.stages.insert(Stage::Kernel, self.table.facts());
-        let plan = p.plan(&state.shape())?;
+        // the pipeline's compile this binding runs: the base, or a variant compiled for it
+        let (v, plan) = p.settle(&state.shape(), &dispatch)?;
         let c = plan.instantiate_dispatch(&state, &dispatch)?;
         if !c.descriptor_bytes.is_empty() || c.root_table.is_some() {
             return Err(not_yet("argument buffers and handle tables (descriptor bytes)"));
@@ -445,7 +446,7 @@ impl ComputeCommandEncoder {
             return Err(not_yet(format!("push holes {:?} (device addresses the shader reads)", c.push_holes)));
         }
         let mut used = Vec::new();
-        let stages = [StageRef { program: &p.0.program, metal: Stage::Kernel, table: &self.table }];
+        let stages = [StageRef { program: &v.program, metal: Stage::Kernel, table: &self.table }];
         let binds = resolve(&device, &stages, &plan, &c.descriptor_ranges, None, &mut used)?;
         let base = spec_of(&plan.specialization);
         let mut regions = Vec::new();
@@ -453,7 +454,7 @@ impl ComputeCommandEncoder {
             if r.indirect.is_some() {
                 return Err(not_yet("indirect dispatches"));
             }
-            let shader = p.0.program.shader(&device, &spec_merge(&base, &spec_of(&r.specialization)))?;
+            let shader = v.program.shader(&device, &spec_merge(&base, &spec_of(&r.specialization)))?;
             regions.push(DispatchRegion { shader, push: push_block(&r.push_constants), groups: r.group_count });
         }
         self.table.used(&mut self.core.used);
@@ -880,7 +881,8 @@ impl RenderCommandEncoder {
             state.depth_stencil = ds.descriptor().clone();
         }
         state.primitive_type = Some(primitive);
-        let plan = p.plan(&state.shape())?;
+        // the pipeline's compile this binding runs: the base, or a variant compiled for it
+        let (v, plan) = p.settle(&state.shape())?;
         let c = plan.instantiate_draw(&state, &call)?;
         if !c.descriptor_bytes.is_empty() || !c.root_tables.is_empty() {
             return Err(not_yet("argument buffers and handle tables (descriptor bytes)"));
@@ -893,23 +895,23 @@ impl RenderCommandEncoder {
         {
             return Err(not_yet("this draw's binder form (amplification, mesh, index bounds, indirect arguments)"));
         }
-        let fs_program = p.0.fs.as_ref().ok_or_else(|| not_yet("render pipelines without a fragment function"))?;
+        let fs_program = v.fs.as_ref().ok_or_else(|| not_yet("render pipelines without a fragment function"))?;
         let mut spec = spec_of(&plan.specialization);
         if let Some(s) = &c.specialization {
             spec = spec_merge(&spec, &spec_of(s));
         }
-        let vs = p.0.vs.shader(&device, &spec)?;
+        let vs = v.vs.shader(&device, &spec)?;
         let fs = fs_program.shader(&device, &spec)?;
         let mut used = Vec::new();
         let stages = [
-            StageRef { program: &p.0.vs, metal: Stage::Vertex, table: &self.vertex },
+            StageRef { program: &v.vs, metal: Stage::Vertex, table: &self.vertex },
             StageRef { program: fs_program, metal: Stage::Fragment, table: &self.fragment },
         ];
         let binds = resolve(&device, &stages, &plan, &c.descriptor_ranges, Some(&self.attachments), &mut used)?;
         let push = push_block(&c.push_constants);
 
         // vertex input: elements in the vertex stage's input order
-        let vi = &p.0.pipeline.vertex_input;
+        let vi = &v.pipeline.vertex_input;
         let stride_of = |binding: u32| -> Result<u32, Error> {
             let b = vi.bindings.iter().find(|b| b.binding == binding).ok_or_else(|| invalid("an attribute of no binding"))?;
             Ok(match b.stride {
@@ -956,7 +958,7 @@ impl RenderCommandEncoder {
         }
 
         // blend from the pipeline's graphics state
-        let g = &p.0.pipeline.graphics;
+        let g = &v.pipeline.graphics;
         let blend: Vec<ffi::sg_blend_rt> = g
             .color_attachments
             .iter()

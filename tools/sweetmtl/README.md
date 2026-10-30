@@ -69,8 +69,18 @@ Metal.framework (client process)
 - **Specialization.** Each specialization the binder asks for gets its own CSO, compiled under the
   lock when first used: workgroup size, threadgroup memory lengths (`SpecKey::TgLength/TgOffset`)
   and function constants.
+- **Variants.** A plan of the pipeline for a bind shape can name a variant (`BindingPlan::variant`,
+  for a dispatch `dispatch_variant`): a texture bound in an 8-bit sRGB format whose raw codes the
+  function reads, for one. The state then compiles the pipeline again under that `VariantKey`
+  (render: `compile_render_variant`; compute: the kernel under the key's `lowering_inputs`, then the
+  pipeline around it), keeps it by key, and the draw or dispatch binds the variant's own plan and
+  programs (`pipeline.rs`, `settle`). Compiled: `srgb_textures` (the slot read through a UNORM
+  view, decoded with Metal's table), `address_maps`, `cross_class`, `storage_view_slots`,
+  `dropped_vertex_layer`, `emulated_simdgroups`. Any other field is refused as not yet, by name
+  (`a pipeline variant with pulled_vertex_buffers {0}`).
 - **Binding.** At each dispatch or draw, the encoder's Metal argument tables become the binder's
-  facts. Then `pipeline.plan(device, shape)` and `instantiate_dispatch/draw` run, and
+  facts. Then `pipeline.settle(shape)` (the plan, and the variant it runs) and
+  `instantiate_dispatch/draw` run, and
   `bind.rs::resolve` turns each `WriteSource` into an `sg_ctx_set_*` binding at the stage's slots
   (buffers, inline bytes, textures, samplers, combined image/samplers, immutable constexpr
   samplers, neutral zero/sink buffers). The bindings hold their resources until completion.
@@ -169,7 +179,7 @@ Environment variables:
 
 | Variable | Effect |
 | --- | --- |
-| `SWEETMTL_TRACE=1` | one line per compiled stage (ir3 instructions, registers, constlen, local size) and per completed command buffer (time, device counters) |
+| `SWEETMTL_TRACE=1` | one line per compiled stage (ir3 instructions, registers, constlen, local size), per compiled pipeline variant (`pipeline variant compiled (srgb_textures {...}) in N ms`) and per completed command buffer (time, device counters) |
 | `SWEETMTL_PROFILE=FILE` | a different device profile JSON for the translator |
 | `SG_DRIVER=softpipe` | the CPU validation driver (PC builds with softpipe) |
 | `SG_RENDER_NODE=PATH` | the DRM node on Linux (default `/dev/dri/renderD128`) |
@@ -204,7 +214,9 @@ softpipe:
 - **mtlabitest.** All value checks right: sampled render through a constexpr sampler, read and
   write images, the blits and mipmaps, culling, depth, viewport and scissor, multisample resolves
   (color, depth and stencil; 4x faked as 1x), function constants, threadgroup memory, sampler
-  arguments, events, and fences across queues. Heaps and archive serialization report not yet.
+  arguments, the sRGB texture variant (an RGBA8Unorm_sRGB texture read in a fragment function and
+  in a kernel: Metal's decode exactly; sampled through a runtime sampler: the GPU's decode, within
+  1/4095), events, and fences across queues. Heaps and archive serialization report not yet.
 
 iOS: see the iOS build section. The Rust half alone also builds in WSL
 (`cargo build --release --target aarch64-apple-ios` in `bridge/`, with conda-forge's
@@ -213,6 +225,15 @@ iOS: see the iOS build section. The Rust half alone also builds in WSL
 Fixed on the way (worth knowing for the phone): `nir_rewrite_image_intrinsic` leaves the deref
 form's SRC_TYPE in the new RANGE_BASE slot (160 for float32), so `sg_shader.c` resets it.
 nir_to_tgsi added it to the image index. ir3 does not read it.
+
+Also fixed with the variants (2026-10-30):
+
+- softpipe read every fragment's `[[position]]` as (0, 0): `sg_shader.c` now makes the frag coord
+  and front face inputs where the driver does not take them as system values, as Mesa's
+  ARB_gl_spirv path does. freedreno a5xx takes both, so the phone's shaders are unchanged.
+- A sampler state released after its last draw stayed bound in the context, and the next pass's
+  clear (u_blitter's draw on a5xx) emitted its border color from freed memory (an assertion on
+  drm-shim). The replay now unbinds everything whenever it releases the device lock (`command.rs`).
 
 ## Files
 
@@ -515,8 +536,9 @@ tells CPU cache trouble apart from a wrong bo.
 ## Known gaps and risks
 
 - **Not built yet:** heaps, argument buffers and handle tables, push holes, global memory (the
-  ir3 `ldg`/`stg` patch), pipeline variants beyond specialization (`Plans` refuses a non-empty
-  variant), indirect dispatch and draws, visibility queries, base instance, the disk cache.
+  ir3 `ldg`/`stg` patch), pipeline variant fields other than the six compiled ones (refused by
+  name; pulled vertex buffers and device-address slots among them), indirect dispatch and draws,
+  visibility queries, base instance, the disk cache.
 - **Multisampling on the phone.** 4x passes and their resolves record on drm-shim (the resolve is
   u_blitter's averaging shader, four `isamm` fetches) but have not executed on the a540; softpipe
   fakes 4x as 1x (Gallium's `fake_sw_msaa`), so its check covers the resolve's plumbing, not the

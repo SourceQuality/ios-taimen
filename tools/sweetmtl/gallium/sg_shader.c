@@ -499,7 +499,14 @@ translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shade
    NIR_PASS(_, nir, nir_opt_copy_prop_vars);
    NIR_PASS(_, nir, nir_opt_dce);
    if (stage == MESA_SHADER_FRAGMENT) {
-      const nir_lower_sysvals_to_varyings_options sv = {.primitive_id = true};
+      /* as Mesa's ARB_gl_spirv path (main/glspirv.c): a system value the driver does not take as
+       * one becomes an input. freedreno a5xx takes both; softpipe neither, and its SV POSITION
+       * read 0 (every fragment's [[position]] was (0, 0): mtlabitest's sRGB variant check). */
+      const nir_lower_sysvals_to_varyings_options sv = {
+         .frag_coord = !dev->screen->caps.fs_position_is_sysval,
+         .front_face = !dev->screen->caps.fs_face_is_integer_sysval,
+         .primitive_id = true,
+      };
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sv);
    }
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
