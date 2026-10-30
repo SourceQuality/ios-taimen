@@ -1397,3 +1397,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Voice Memos: a 6 s recording (335,040 frames, 0 overflows) and its playback through the speaker (session 4,
   1,142,528 frames, 0 dropped). "Configure failed" (CLDeviceMotionControl, the AppleSPU plug-in) stays: no client
   needs it.
+- 2026-10-30 boot 200 (r169, SweetMetal-7efba317): the poster gallery as ever, visit 1 drawn (174 KB), 2-3 black (54 KB),
+  no Metal refusal. AegirPoster's os_log: it renders once ("Finished setting up renderer"), then a snapshot
+  (didUpdate isSnapshot: true), "faking sceneDidDisconnect", invalidates its render extensions and frees its
+  CLKUIMetalQuadView; PosterBoard shows the stored snapshot after that, which it encodes on the CPU from the IOSurface
+  the GPU wrote. The GPU is not coherent with the CPU's cacheable mappings and IOSurface locks did no cache
+  maintenance (only Mesa's own bos are prepared): 0358 cleans and invalidates a surface at the first lock after GPU use.
