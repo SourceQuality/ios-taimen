@@ -1,0 +1,276 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 94aa812..bc37e9b 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -70,6 +70,12 @@
+  *   speakers while DMIC MUX7 steps through DMIC0, 1, 2, 4 (a second each); levels and the 1 kHz bin
+  *   per window. Pass: 250 full reads, samples not constant, the bottom mic (DMIC0 or 1) 20 dB over
+  *   quiet at 1 kHz.
++ * 7 (0353): /dev/redwood-mic for the RedwoodAudio plug-in's "Codec" input (plan section 5, HK's
++ *   /dev/hakios-mic ABI), made at the thread's start: read() never waits and gives s16le mono 48 kHz
++ *   from a 16384-frame ring, 40 ms behind the DSP (nothing until that much has come; over 100 ms
++ *   waiting, the oldest skipped). The first open starts a recording (taimenmicdmic's DMIC) from this
++ *   thread's loop, the last close ends it; three that broke off, and no more until reboot. At
++ *   taimenmic=7 stages 5 and 6 (and their tone) run only with taimenmictest=1.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -3450,6 +3456,186 @@ mic_m6(bool dsp_mem, bool tone_ok)
+ 	return pass;
+ }
+ 
++/* ---------------------------------------------------------------- microphones: /dev/redwood-mic (M7) */
++
++#define MRING_FRAMES            16384u  /* 341 ms of mono 16-bit; a power of two */
++#define MRING_KEEP              1920u   /* 40 ms: how far behind the DSP a reader is kept */
++#define MRING_MOST              4800u   /* 100 ms: more than this waiting, and the oldest is skipped */
++
++static int16_t *mring;
++static uint64_t mring_w;                /* frames put (this thread), atomic */
++static uint64_t mring_r;                /* frames taken (the one reader) */
++static uint32_t mring_reset;            /* this thread asks the reader to start at the writer, atomic */
++static bool mring_primed;
++static uint64_t mring_skipped, mring_dry;       /* the reader's, said at the end of a recording */
++static uint32_t mic_wanted, mic_opens;          /* the device is open; opens so far (atomic) */
++static uint32_t mic_failed_opens = 0xFFFFFFFFu; /* a recording broke off at this open: wait for the next */
++static bool mic_svc, mic_on, mic_gave_up;
++static uint32_t mic_recs, mic_fails;
++static uint64_t mic_rec_frames, mic_rec_secs;
++static struct mic_meter mic_sec_meter;
++
++static void
++mring_put(const int16_t *smp, uint32_t n)
++{
++	uint64_t at = __atomic_load_n(&mring_w, __ATOMIC_RELAXED);
++	for (uint32_t i = 0; i < n; i++) {
++		mring[(at + i) & (MRING_FRAMES - 1)] = smp[i];
++	}
++	__atomic_store_n(&mring_w, at + n, __ATOMIC_RELEASE);
++}
++
++/* never waits: what has come, 40 ms behind; nothing until 40 ms have come (after a start or a dry read) */
++static int
++rm_read(dev_t, struct uio *uio, int)
++{
++	if (mring == NULL || uio_resid(uio) < 2) {
++		return 0;
++	}
++	if (__atomic_exchange_n(&mring_reset, 0u, __ATOMIC_ACQ_REL) != 0) {
++		mring_r = __atomic_load_n(&mring_w, __ATOMIC_ACQUIRE);
++		mring_primed = false;
++		mring_skipped = mring_dry = 0;
++	}
++	uint64_t w = __atomic_load_n(&mring_w, __ATOMIC_ACQUIRE), avail = w - mring_r, want = (uint64_t)uio_resid(uio) / 2;
++	if (avail > MRING_MOST) {
++		mring_skipped += avail - MRING_KEEP;
++		mring_r = w - MRING_KEEP;
++		avail = MRING_KEEP;
++	}
++	if (!mring_primed) {
++		if (avail < MRING_KEEP) {
++			return 0;
++		}
++		mring_primed = true;
++	}
++	if (avail < want) {
++		mring_dry++;
++		mring_primed = false;
++	}
++	int err = 0;
++	while (want > 0 && avail > 0 && err == 0) {
++		uint64_t at = mring_r & (MRING_FRAMES - 1), n = MIN(MIN(want, avail), MRING_FRAMES - at);
++		err = uiomove((char *)&mring[at], (int)(n * 2), uio);
++		mring_r += n;
++		want -= n;
++		avail -= n;
++	}
++	return err;
++}
++
++static int
++rm_open(dev_t, int, int, struct proc *)
++{
++	(void)__atomic_fetch_add(&mic_opens, 1u, __ATOMIC_ACQ_REL);
++	__atomic_store_n(&mic_wanted, 1u, __ATOMIC_RELEASE);
++	return 0;
++}
++
++/* (the last close) */
++static int
++rm_close(dev_t, int, int, struct proc *)
++{
++	__atomic_store_n(&mic_wanted, 0u, __ATOMIC_RELEASE);
++	return 0;
++}
++
++static const struct cdevsw rm_cdevsw = {
++	.d_open = rm_open, .d_close = rm_close, .d_read = rm_read, .d_write = eno_rdwrt, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++static bool
++mic_dev_init(void)
++{
++	mring = (int16_t *)IOMallocZero(MRING_FRAMES * 2);
++	int major = mring != NULL ? cdevsw_add(-1, &rm_cdevsw) : -1;
++	if (major < 0) {
++		MLOG("7: /dev/redwood-mic: no memory or no major");
++		return false;
++	}
++	void *node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic");
++	MLOG("/dev/redwood-mic %s (major %d)", node != NULL ? "ready" : "NOT made (devfs)", major);
++	return node != NULL;
++}
++
++static void
++mic_rec_sink(const int16_t *smp, uint32_t n)
++{
++	if (n != 0) {
++		mring_put(smp, n);
++	}
++	mic_rec_frames += n;
++	meter_add(&mic_sec_meter, smp, n);
++}
++
++static void
++mic_rec_failed(const char *why, uint32_t opens)
++{
++	mic_failed_opens = opens;               /* not again until the device is opened again */
++	if (++mic_fails >= 3) {
++		mic_gave_up = true;
++		MLOG("7: three recordings broke off (the last: %s): the microphone stays off until reboot", why);
++	} else {
++		MLOG("7: recording %u broke off (%s): again at the next open", mic_recs, why);
++	}
++}
++
++/*
++ * The audio thread's microphone, each turn of its loop: a recording up when the device is open
++ * (the first in full in the log, the others quietly), its periods into the ring, a level line a
++ * second for the first 3 s and then every 30 s, down when the device is closed.
++ */
++static void
++mic_dev_poll(void)
++{
++	uint32_t wanted = __atomic_load_n(&mic_wanted, __ATOMIC_ACQUIRE), opens = __atomic_load_n(&mic_opens, __ATOMIC_ACQUIRE);
++	if (!mic_on) {
++		if (wanted == 0 || mic_gave_up || opens == mic_failed_opens) {
++			return;
++		}
++		mic_recs++;
++		uint64_t t = now_ms();
++		__atomic_store_n(&mring_reset, 1u, __ATOMIC_RELEASE);
++		MLOG("t=%u.%03u 7: iOS records (%u)", T, mic_recs);
++		if (!mic_session_up(7, mic_dmic, false, mic_recs == 1)) {
++			mic_session_down(7, true);
++			mic_rec_failed("the session did not come up", opens);
++			return;
++		}
++		mic_on = true;
++		mic_rec_frames = mic_rec_secs = 0;
++		meter_reset(&mic_sec_meter);
++		MLOG("t=%u.%03u 7: iOS records (%u): up in %llu ms", T, mic_recs, now_ms() - t);
++		return;
++	}
++	(void)mic_service(mic_rec_sink);
++	if (mic_sec_meter.periods >= 50) {
++		mic_rec_secs++;
++		if (mic_rec_secs <= 3 || mic_rec_secs % 30 == 0) {
++			char what[32], ex[48];
++			snprintf(what, sizeof(what), "7: s%llu DMIC%d", mic_rec_secs, mic_dmic);
++			snprintf(ex, sizeof(ex), "; %u reads, %u overflows", mic_dones, mic_overflows);
++			meter_log(what, &mic_sec_meter, ex);
++		}
++		meter_reset(&mic_sec_meter);
++	}
++	bool broke = now_ms() - mic_t0 > 1500 && mic_dones == 0;
++	if (wanted != 0 && !broke) {
++		return;
++	}
++	uint32_t reads = mic_dones, errors = mic_errors, overflows = mic_overflows;
++	mic_session_down(7, mic_recs == 1);
++	mic_on = false;
++	MLOG("t=%u.%03u 7: recording %u %s: %llu frames, %llu skipped, %llu dry; %u reads, %u errors, %u overflows", T, mic_recs,
++	    broke ? "BROKE OFF (no READ_DONE in 1.5 s)" : "ended", mic_rec_frames, mring_skipped, mring_dry, reads, errors,
++	    overflows);
++	if (broke) {
++		mic_rec_failed("no READ_DONE", opens);
++	}
++}
++
+ /* The microphone stages 1..taimenmic, once; a failure ends them and nothing else. */
+ static void
+ mic_stages(bool dsp_mem, bool tone_ok)
+@@ -3489,21 +3675,41 @@ mic_stages(bool dsp_mem, bool tone_ok)
+ 	if (mic_level < 5) {
+ 		return;
+ 	}
+-	MLOG("t=%u.%03u stage 5", T);
+-	if (!mic_m5()) {
+-		MLOG("5: M5 NOT reached; the microphone stages end here");
+-		return;
++	/* stages 5 and 6 are tests (6 beeps): at 7 only on request; there a failure ends nothing */
++	int test = mic_level <= 6 ? 1 : 0;
++	(void)PE_parse_boot_argn("taimenmictest", &test, sizeof(test));
++	if (test != 0) {
++		MLOG("t=%u.%03u stage 5", T);
++		bool ok = mic_m5();
++		if (!ok) {
++			MLOG("5: M5 NOT reached%s", mic_level < 7 ? "; the microphone stages end here" : "");
++			if (mic_level < 7) {
++				return;
++			}
++		} else {
++			MLOG("t=%u.%03u M5 done", T);
++		}
++		if (ok && mic_level >= 6) {
++			MLOG("t=%u.%03u stage 6", T);
++			if (!mic_m6(dsp_mem, tone_ok)) {
++				MLOG("6: M6 NOT reached%s", mic_level < 7 ? "; the microphone stages end here" : "");
++				if (mic_level < 7) {
++					return;
++				}
++			} else {
++				MLOG("t=%u.%03u M6 done", T);
++			}
++		}
+ 	}
+-	MLOG("t=%u.%03u M5 done", T);
+-	if (mic_level < 6) {
++	if (mic_level < 7) {
+ 		return;
+ 	}
+-	MLOG("t=%u.%03u stage 6", T);
+-	if (!mic_m6(dsp_mem, tone_ok)) {
+-		MLOG("6: M6 NOT reached; the microphone stages end here");
++	if (!dsp_mem || mring == NULL) {
++		MLOG("7: %s: /dev/redwood-mic stays silent", !dsp_mem ? "no LPASS SMMU stream 1 bank" : "no device");
+ 		return;
+ 	}
+-	MLOG("t=%u.%03u M6 done%s", T, mic_level > 6 ? "; stage 7 is not built yet" : "");
++	mic_svc = true;
++	MLOG("t=%u.%03u 7: M7 the microphone is iOS's: a recording (DMIC%d) runs while /dev/redwood-mic is open", T, mic_dmic);
+ }
+ 
+ /* ---------------------------------------------------------------- the thread */
+@@ -3518,6 +3724,9 @@ audio_thread(void *arg, wait_result_t)
+ 	if (mic_level > 0 && level < 4) {
+ 		MLOG("taimenmic=%d needs taimenaudio>=4 (GLINK, QRTR, APR): no microphone stage runs", mic_level);
+ 	}
++	if (mic_level >= 7 && level >= 4) {
++		(void)mic_dev_init();   /* before mediaserverd's HAL, like /dev/redwood-audio */
++	}
+ 	/* the device first: mediaserverd's plug-in opens it when the HAL starts, long before the ADSP */
+ 	if (level >= 9) {
+ 		(void)audio_dev_init();
+@@ -3549,6 +3758,9 @@ audio_thread(void *arg, wait_result_t)
+ 		if (feeder_ok) {
+ 			feeder_poll();
+ 		}
++		if (mic_svc) {
++			mic_dev_poll();
++		}
+ 		if (!m3 && glink_chan_up(ACHAN)) {
+ 			m3 = true;
+ 			LOG("t=%u.%03u 3: M3 APR channel up", T);
