@@ -1328,3 +1328,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   has no Location Services row in Privacy & Security on this device; mkrootfix.py --locationd (root's
   com.apple.locationd.plist) is the way to turn it on, and the recent ROOTFIX blobs had left it out. 19 driverkitd
   crashes in a 20-minute boot.
+- 2026-10-30 boot 190 (r163, taimensensors=8): a 12-minute soak with all six SLPI streams (accel, gyro, mag 50.6 Hz,
+  pressure 10 Hz, ALS and prox on change), six rounds of Settings, Weather, Compass and the gallery: steady
+  throughout (30,862 accel samples), no panic, hottest sensor 60.8 C, one driverkitd and one videosubscriptionsd
+  crash. Location stayed "disabled system-wide": locationd reads LocationServicesEnabledIn8.0 from **mobile's**
+  com.apple.locationd (CFPreferencesCopyValue(.., "mobile", AnyHost), locationd 0x1001b32c8), not root's; 8be925c.
+  Compass: CLCompass7 is chosen by CLPlatformInfo::motionCaps bits 4/5 alone (factory 0x1006e42c8), so locationd's
+  own AKM path (CLCompass6) is out of reach; it wants {0xff0c, 8} sending an 88-byte CMDeviceMotionReport type 2
+  with the heading computed (docs/taimen-compass-notes.md). xnu 0350 builds that report in the kernel.
+- 2026-10-30 boot 191 (r163, SweetMetal-ae4624e1 = 8f3d06c): Maps no longer crashes, but its screen stays black:
+  22 command buffers refused for metal2vulkan's sRGB ColorWriteTable binding, 32 render pipelines for
+  B8G8R8A8_SRGB not blendable (freedreno a5xx never answers PIPE_BIND_BLENDABLE). Both in 8be925c.
