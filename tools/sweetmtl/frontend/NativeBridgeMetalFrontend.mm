@@ -901,6 +901,13 @@ static void scheduled(void *context);
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+  // MSAA resolve (09660e9): the runtime refuses a resolving store action without its resolve texture
+  if(a.resolveTexture) {
+   if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
+   NBTexture *resolve=(NBTexture *)a.resolveTexture;if(resolve.surface)[_surfaces addObject:resolve];
+   [_resourceOwners addObject:resolve];
+   out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+  }
   return true;
  };
  for(unsigned i=0;i<8;i++) {
@@ -910,6 +917,7 @@ static void scheduled(void *context);
  }
  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
+ pass.depth.resolve_filter=d.depthAttachment.depthResolveFilter;pass.stencil.resolve_filter=d.stencilAttachment.stencilResolveFilter;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}

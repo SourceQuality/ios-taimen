@@ -1301,3 +1301,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (/product display-corner-radius)" is not ours to fix (the real D22AP tree has none either). oslogd crashed four
   times in printf: DarwinLog's subsystem/category offsets are wrong for iOS 16's entries (NULL every time, 0x10 in
   AegirPoster's); oslogd no longer prints them.
+- 2026-10-30 **boot 186 (r161 = +0343): the screen rotates.** With the sensor-time child as page 0xff15 usage 2,
+  `orient left` / `right` / `portrait` turn Safari's full-screen video to landscape left, landscape right and back
+  (2.6 MB shots against 1.0 MB in portrait); the home screen stays portrait, as on an iPhone X. backboardd: "Sending
+  orientation: landscapeLeft (3) event to SpringBoard", and GraphicsOrientation 3/4/1 to SweetHIDTouch, so touch
+  turns with it. No stale drops. The fixed oslogd ran without a crash and showed AegirPoster: in the gallery it takes
+  a snapshot (isPreview, isSnapshot), then "faking sceneDidDisconnect for pr_isInvalidated", invalidates its render
+  extensions and frees its CLKUIMetalQuadView. Both gallery visits were black (54 KB) this time.
+- 2026-10-30 boot 187 (r161, taimensensors=6, taimenaccelmap=-y-x+z): a 12-minute soak, six rounds of Settings,
+  Weather, Safari's video and the poster gallery. The accelerometer held 50.7 Hz the whole time (30,914 samples, 3,040
+  a minute), no panic, no GPU hang, no Metal refusal, one driverkitd crash; hottest sensor 70.5 C during the software
+  video decoding, 56.6 C at the end. The gallery was black (54 KB) in all six rounds.
