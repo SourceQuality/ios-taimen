@@ -1445,3 +1445,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   No crash. Still refused: one metallib of LibraryKind(1) (a dynamic library) and 26 render pipelines whose
   fragment functions read the framebuffer in a multisampled pass: metal2vulkan's per-sample storage form needs
   sampleRateShading, which the a540 profile does not have. Nothing visible missed them at continent scale.
+- 2026-10-30 boot 210 (r172 = +0360, SweetMetal-33832561): the first app survey since boot 141 (tools/taimen/appsurvey.sh).
+  Open and draw: Calendar (What's New), Photos (No Photos or Videos), Notes (Welcome), Phone (keypad), Safari (Big
+  Buck Bunny plays), Messages (compose), Music ("An Error Occurred": no account), Wallet. **Picture in Picture
+  works**: leaving Safari's video floats it over Messages, Music and Maps. FaceTime: still black. Reminders' and
+  Wallet's location prompts hold the home gesture, so Clock to Maps photographed Reminders' prompt (until a tap
+  answered it). The Mail shot was the lock screen: the PMIC keys reported key 0 and key 3 down together (hands on
+  the phone, or a glitch), backboardd locked with its click. 0360 logged swaps of mask 0x7 / 0x80000007 with
+  surfaces on layer 0 only: every swap enables layers 0-2, so 0361 tests the layers' surfaces instead.
