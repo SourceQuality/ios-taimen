@@ -1,0 +1,463 @@
+diff --git a/iokit/Kernel/arm/TaimenSensors.cpp b/iokit/Kernel/arm/TaimenSensors.cpp
+index 60b70a6..0f59566 100644
+--- a/iokit/Kernel/arm/TaimenSensors.cpp
++++ b/iokit/Kernel/arm/TaimenSensors.cpp
+@@ -61,6 +61,17 @@
+  * CompassX.. unscaled into CoreMotion's rotation rate (rad/s) and magnetic field (uT), so the gyro goes
+  * through as IOFixed and the field x100. They feed SweetHIDGyro (sweet_hid_gyro_sample, in place of its
+  * still samples) and SweetHIDCompass (sweet_hid_compass_sample).
++ *
++ * 0345, plan M7 (taimensensors>=8): proximity (PROX_LIGHT data type 0, 10 Hz), ambient light (PROX_LIGHT
++ * data type 1, 5 Hz, report id 0x29: the next id no sensor has) and pressure (PRESSURE data type 0,
++ * 10 Hz) stream the same way after M6's (taimenproxhz=, taimenalshz=, taimenpresshz=); stage 13. The
++ * SMGR has no on-change request in the open description: the Linux driver streams proximity like any
++ * sensor. Proximity: the integer part's low bit of the first value, 1 near (the Linux driver), into
++ * SweetHIDProx (sweet_hid_prox_sample). Light: the first value, lux (range 32767, resolution 1; not in
++ * the open description, so the first samples log all three values), into SweetHIDALS
++ * (sweet_hid_als_sample). Pressure: the first value in hPa (range 1100, resolution 0.0018 = the BMP280's
++ * 0.18 Pa), into SweetHIDPressure as kPa (sweet_hid_pressure_sample), the unit locationd's CLPressure
++ * works in.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -112,6 +123,9 @@ extern "C" bool sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id,
+ extern "C" int sweet_hid_accel_sample(int mx, int my, int mz);        /* hid/SweetHID.cpp, 0341 */
+ extern "C" int sweet_hid_gyro_sample(int x, int y, int z);            /* 0344: IOFixed rad/s */
+ extern "C" int sweet_hid_compass_sample(int x, int y, int z);         /* 0344: IOFixed microtesla */
++extern "C" int sweet_hid_prox_sample(int is_near);                    /* 0345: 1 near, 0 far */
++extern "C" int sweet_hid_als_sample(int lux);                         /* 0345 */
++extern "C" int sweet_hid_pressure_sample(int kpa);                    /* 0345: IOFixed kPa */
+ 
+ #define PT_LOAD                 1
+ #define MDT_TYPE_MASK           (7u << 24)
+@@ -2335,7 +2349,7 @@ m6_maps(void)
+  * They are asked for one after the other, each once the last one's answer came.
+  */
+ enum { XS_IDLE, XS_WAIT, XS_ON, XS_OFF };
+-enum { XK_GYRO, XK_MAG };
++enum { XK_GYRO, XK_MAG, XK_PROX, XK_ALS, XK_PRESS };
+ struct xs_cfg {
+ 	const char *name, *type;        /* our name; the ALL_SENSOR_INFO type to stream */
+ 	uint8_t kind, dt, stage, level; /* XK_*, its data type, the log stage, the taimensensors level that asks */
+@@ -2345,6 +2359,10 @@ struct xs_cfg {
+ static const struct xs_cfg xs_tab[] = {
+ 	{ "gyro", "GYRO", XK_GYRO, 0, 12, 7, 50, "taimengyrohz", "SweetHIDGyro" },
+ 	{ "mag", "MAG", XK_MAG, 0, 12, 7, 50, "taimenmaghz", "SweetHIDCompass" },
++	/* 0345, M7 */
++	{ "prox", "PROX_LIGHT", XK_PROX, 0, 13, 8, 10, "taimenproxhz", "SweetHIDProx" },
++	{ "als", "PROX_LIGHT", XK_ALS, 1, 13, 8, 5, "taimenalshz", "SweetHIDALS" },
++	{ "pressure", "PRESSURE", XK_PRESS, 0, 13, 8, 10, "taimenpresshz", "SweetHIDPressure" },
+ };
+ #define XS_N                    (sizeof(xs_tab) / sizeof(xs_tab[0]))
+ struct xstream {
+@@ -2353,6 +2371,7 @@ struct xstream {
+ 	uint64_t t0, win_ms, next_ms;
+ 	uint32_t samples, reports, win, win_reports, logged, last_ts, hid_missing;
+ 	int32_t raw[3], out[3];
++	uint32_t changes;               /* 0345: proximity changes logged */
+ };
+ static struct xstream xs[XS_N];
+ static uint32_t xs_cur;
+@@ -2436,6 +2455,15 @@ xs_out_fmt(uint32_t i, char *b, size_t n)
+ 	case XK_MAG:
+ 		snprintf(b, n, "%s %s %s uT (|B| %s)", v[0], v[1], v[2], m);
+ 		break;
++	case XK_PROX:
++		snprintf(b, n, "%s", x->out[0] != 0 ? "near" : "far");
++		break;
++	case XK_ALS:
++		snprintf(b, n, "%d lux", x->out[0]);
++		break;
++	case XK_PRESS:
++		snprintf(b, n, "%s kPa", v[0]);
++		break;
+ 	default:
+ 		snprintf(b, n, "?");
+ 		break;
+@@ -2533,7 +2561,7 @@ xs_next(void)
+ 		for (uint32_t i = 0; i < XS_N && n + 24 < sizeof(line); i++) {
+ 			n += (size_t)snprintf(line + n, sizeof(line) - n, ", %s %s", xs_tab[i].name, sn[xs[i].st & 3]);
+ 		}
+-		LOG("12: t=%u.%03u smgr streams: %s", T, line);
++		LOG("%u: t=%u.%03u smgr streams: %s", sens_level >= 8 ? 13u : 12u, T, line);
+ 	}
+ }
+ 
+@@ -2585,9 +2613,21 @@ xs_sample(uint32_t i, const int32_t r[3], uint32_t ts, const uint8_t *s)
+ 		}
+ 		break;
+ 	}
++	case XK_PROX:
++		o[0] = (r[0] >> 16) & 1;                        /* 1: an object near (the Linux driver) */
++		break;
++	case XK_ALS:
++		o[0] = r[0] < 0 ? 0 : (int32_t)(((int64_t)r[0] + 0x8000) >> 16);
++		break;
++	case XK_PRESS:
++		o[0] = r[0] / 10;                               /* hPa -> kPa, both Q16.16 */
++		break;
+ 	default:
+ 		break;
+ 	}
++	if (c->kind == XK_PROX && x->samples != 0 && o[0] != x->out[0] && x->changes++ < 32) {
++		LOG("%u: t=%u.%03u %s now %s (raw %d %d %d)", c->stage, T, c->name, o[0] != 0 ? "near" : "far", r[0], r[1], r[2]);
++	}
+ 	x->samples++;
+ 	x->win++;
+ 	memcpy(x->raw, r, sizeof(x->raw));
+@@ -2611,6 +2651,15 @@ xs_sample(uint32_t i, const int32_t r[3], uint32_t ts, const uint8_t *s)
+ 	case XK_MAG:
+ 		took = sweet_hid_compass_sample(o[0], o[1], o[2]);
+ 		break;
++	case XK_PROX:
++		took = sweet_hid_prox_sample(o[0]);
++		break;
++	case XK_ALS:
++		took = sweet_hid_als_sample(o[0]);
++		break;
++	case XK_PRESS:
++		took = sweet_hid_pressure_sample(o[0]);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -3031,6 +3080,9 @@ m3_run(int level)
+ 		if (level >= 7) {
+ 			m6_maps();
+ 		}
++		if (level >= 8) {
++			LOG("13: M7 (taimensensors>=8): proximity, ambient light and pressure streams after M6's");
++		}
+ 	}
+ 	if (!glink_init()) {
+ 		return;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index b292bac..a2b1ff9 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -19,6 +19,9 @@
+  *                    detector runs only with both ("No gyro; not detecting orientation!");
+  *                    0344: the SLPI's rates (rad/s) while they flow
+  *   SweetHIDCompass  the SLPI's magnetometer (0xff00/0xa, microtesla; 0344, taimensensors>=7)
++ *   SweetHIDPressure the SLPI's barometer (Sensor page 0x20 usage 0x31, kPa; 0345, taimensensors>=8)
++ *   SweetHIDProx     the SLPI's proximity (0xff00/8, Placement 1; 0345, taimensensors>=8)
++ *   SweetHIDALS      the SLPI's ambient light (0xff00/4, lux; 0345, taimensensors>=8)
+  *   SweetHIDOrientation  the device orientation as a coprocessor reports it (0337:
+  *                    Sensor page 0x20 usage 0x8A, orientation events of type
+  *                    CMUsage), derived from SweetHIDAccel's samples
+@@ -603,6 +606,7 @@ protected:
+ OSDefineMetaClassAndStructors(SweetHIDAccel, IOHIDEventService);
+ static SweetHIDAccel *gSweetAccel;
+ static SweetHIDAccel *gSweetGyro, *gSweetCompass;       /* 0344 */
++static SweetHIDAccel *gSweetPressure;                   /* 0345 */
+ 
+ bool
+ SweetHIDAccel::start(IOService *provider)
+@@ -627,6 +631,8 @@ SweetHIDAccel::start(IOService *provider)
+ 		gSweetGyro = this;
+ 	} else if (eventType() == kIOHIDEventTypeCompass) {
+ 		gSweetCompass = this;
++	} else if (eventType() == kIOHIDEventTypeAtmosphericPressure) {
++		gSweetPressure = this;
+ 	}
+ 	registerService();
+ 	IOLog("TAIMEN SENSORS: %s up (%#x/%u, %s)\n", getName(), (unsigned)getPrimaryUsagePage(), (unsigned)getPrimaryUsage(),
+@@ -782,6 +788,231 @@ protected:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDCompass, SweetHIDAccel);
+ 
++/*
++ * 0345: the barometer, as locationd's CLPressure opens it: usage pair {0x20, 0x31} (Sensor page,
++ * Environmental: Atmospheric Pressure; locationd 0x101431558), kIOHIDEventTypeAtmosphericPressure events
++ * whose level it takes unscaled (callback 0x1004aaa0c) in kPa, the unit it corrects with a Pa-scale bias
++ * divided by -1000 (0x1004aac7c) and CoreMotion's altimeter reports. It sets ReportInterval and
++ * BatchInterval as the others do. Real samples only (TaimenSensors.cpp M7), taimensensors>=8.
++ */
++class SweetHIDPressure : public SweetHIDAccel {
++	OSDeclareDefaultStructors(SweetHIDPressure);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Sensor; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 0x31; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 8; }
++	virtual IOHIDEvent *event() APPLE_KEXT_OVERRIDE
++	{
++		uint64_t ts = mach_absolute_time();
++		IOHIDEvent *e = IOHIDEvent::atmosphericPressureEvent(ts, fV[0]);
++		if (e) {
++			add_sensor_time(e, ts);
++		}
++		return e;
++	}
++	virtual IOHIDEventType eventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeAtmosphericPressure; }
++	virtual int minLevel() APPLE_KEXT_OVERRIDE { return 8; }
++	virtual bool synthesizes() APPLE_KEXT_OVERRIDE { return false; }
++	virtual const char *describe() APPLE_KEXT_OVERRIDE { return "the SLPI's barometer, kPa"; }
++};
++OSDefineMetaClassAndStructors(SweetHIDPressure, SweetHIDAccel);
++
++/* 0345: a setProperties dictionary's keys, for the log */
++static void
++prop_keys(OSDictionary *d, char *keys, size_t size)
++{
++	size_t n = 0;
++	keys[0] = 0;
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	if (it) {
++		for (OSString *k; (k = OSDynamicCast(OSString, it->getNextObject())) != NULL && n + 2 < size;) {
++			n += (size_t)snprintf(keys + n, size - n, "%s%s", n ? " " : "", k->getCStringNoCopy());
++		}
++		it->release();
++	}
++}
++
++/*
++ * 0345: proximity, as backboardd and locationd look for it. backboardd's BKHIDUISensorController matches
++ * {DeviceUsagePage 0xff00, DeviceUsage 8} (the dictionary built at backboardd 0x100046f2c) and then
++ * "ignoring discrete prox service %llX not top placement" unless the service's Placement is 1; without
++ * NeedsHostState it takes it as a discrete prox and sets ProxDetectionMode on it. Its proximity handler
++ * (0x10002cce4) and locationd's CLProximityNotifier ({0xff00, 8}, 0x101471268; callback 0x100766388) read
++ * the detection mask (kIOHIDEventFieldProximityDetectionMask): an object is near when it is not 0. So
++ * near sends kIOHIDProximityDetectionReceiver (0x40, the earpiece), far 0, on each change.
++ */
++class SweetHIDProx : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDProx);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = NULL, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++	void update(bool isNear);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 8; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 10; }
++private:
++	IOHIDEvent *event();
++	volatile bool fNear, fKnown;
++	UInt32 fSaid, fChanges;
++};
++OSDefineMetaClassAndStructors(SweetHIDProx, IOHIDEventService);
++static SweetHIDProx *gSweetProx;
++
++bool
++SweetHIDProx::start(IOService *provider)
++{
++	int level = 0;
++	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 8) {
++		return false;
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	setProperty("Placement", 1ULL, 32);     /* top: backboardd ignores a discrete prox anywhere else */
++	gSweetProx = this;
++	registerService();
++	IOLog("TAIMEN SENSORS: SweetHIDProx up (0xff00/8, Placement 1, the SLPI's proximity)\n");
++	return true;
++}
++
++IOHIDEvent *
++SweetHIDProx::event()
++{
++	IOHIDProximityDetectionMask mask = fNear ? (IOHIDProximityDetectionMask)kIOHIDProximityDetectionReceiver : 0;
++	return IOHIDEvent::proximityEvent(mach_absolute_time(), mask, fNear ? 1 : 0);
++}
++
++IOReturn
++SweetHIDProx::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	if (fSaid < 16) {
++		fSaid++;
++		char keys[160];
++		prop_keys(d, keys, sizeof(keys));
++		OSNumber *mode = OSDynamicCast(OSNumber, d->getObject("ProxDetectionMode"));
++		IOLog("SWEET HID: SweetHIDProx properties [%s]: ProxDetectionMode %lld\n", keys,
++		    mode ? (long long)mode->unsigned64BitValue() : -1LL);
++	}
++	return kIOReturnSuccess;
++}
++
++IOHIDEvent *
++SweetHIDProx::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	return type == kIOHIDEventTypeProximity && fKnown ? event() : NULL;
++}
++
++void
++SweetHIDProx::update(bool isNear)
++{
++	if (fKnown && isNear == fNear) {
++		return;
++	}
++	fNear = isNear;
++	fKnown = true;
++	if (fChanges++ < 64) {
++		IOLog("TAIMEN SENSORS: proximity now %s (%u clients)\n", isNear ? "near" : "far", _clients ? _clients->getCount() : 0);
++	}
++	IOHIDEvent *e = event();
++	if (e) {
++		dispatchEvent(e);
++		e->release();
++	}
++}
++
++/*
++ * 0345: ambient light, kIOHIDEventTypeAmbientLightSensor with the level in lux, each sample (about 5 Hz).
++ * Neither locationd nor backboardd's own code builds an ALS matcher (auto-brightness is CoreBrightness,
++ * in the shared cache, not read here), so the pair is IOHIDFamily's AppleVendor AmbientLightSensor,
++ * 0xff00/4 (AppleHIDUsageTables.h): unverified. The kernel's event has no illuminance field (its size is
++ * IOHIDAmbientLightSensorEventData), so lux goes in the level and channel 0.
++ */
++class SweetHIDALS : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDALS);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = NULL, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++	void update(UInt32 lux);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 4; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 9; }
++private:
++	IOHIDEvent *event();
++	volatile UInt32 fLux;
++	volatile bool fKnown;
++	UInt32 fSaid, fSent;
++};
++OSDefineMetaClassAndStructors(SweetHIDALS, IOHIDEventService);
++static SweetHIDALS *gSweetALS;
++
++bool
++SweetHIDALS::start(IOService *provider)
++{
++	int level = 0;
++	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 8) {
++		return false;
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	gSweetALS = this;
++	registerService();
++	IOLog("TAIMEN SENSORS: SweetHIDALS up (0xff00/4, the SLPI's ambient light, lux)\n");
++	return true;
++}
++
++IOHIDEvent *
++SweetHIDALS::event()
++{
++	return IOHIDEvent::ambientLightSensorEvent(mach_absolute_time(), fLux, fLux);
++}
++
++IOReturn
++SweetHIDALS::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	if (fSaid < 16) {
++		fSaid++;
++		char keys[160];
++		prop_keys(d, keys, sizeof(keys));
++		IOLog("SWEET HID: SweetHIDALS properties [%s] (%u samples sent)\n", keys, fSent);
++	}
++	return kIOReturnSuccess;
++}
++
++IOHIDEvent *
++SweetHIDALS::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	return type == kIOHIDEventTypeAmbientLightSensor && fKnown ? event() : NULL;
++}
++
++void
++SweetHIDALS::update(UInt32 lux)
++{
++	fLux = lux;
++	fKnown = true;
++	if (fSent < 4) {
++		IOLog("TAIMEN SENSORS: ambient light %u lux (%u clients)\n", (unsigned)lux, _clients ? _clients->getCount() : 0);
++	}
++	IOHIDEvent *e = event();
++	if (e) {
++		dispatchEvent(e);
++		e->release();
++		fSent++;
++	}
++}
++
+ void
+ SweetHIDAccel::sample(int mx, int my, int mz)
+ {
+@@ -1149,6 +1380,40 @@ sweet_hid_compass_sample(int x, int y, int z)
+ 	return 1;
+ }
+ 
++/* 0345: the SLPI's barometer (IOFixed kPa), proximity (1 near) and ambient light (lux); 0 without the service */
++extern "C" int sweet_hid_pressure_sample(int kpa);
++extern "C" int
++sweet_hid_pressure_sample(int kpa)
++{
++	if (!gSweetPressure) {
++		return 0;
++	}
++	gSweetPressure->realFixed(kpa, 0, 0);
++	return 1;
++}
++
++extern "C" int sweet_hid_prox_sample(int is_near);
++extern "C" int
++sweet_hid_prox_sample(int is_near)
++{
++	if (!gSweetProx) {
++		return 0;
++	}
++	gSweetProx->update(is_near != 0);
++	return 1;
++}
++
++extern "C" int sweet_hid_als_sample(int lux);
++extern "C" int
++sweet_hid_als_sample(int lux)
++{
++	if (!gSweetALS) {
++		return 0;
++	}
++	gSweetALS->update(lux < 0 ? 0 : (UInt32)lux);
++	return 1;
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 4f69281..16660e1 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -103,6 +103,21 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDCompass;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDPressure;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDPressure;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDProx;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDProx;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDALS;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDALS;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
