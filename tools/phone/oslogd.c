@@ -14,6 +14,8 @@
  * idle forever once the stream fails instead of exiting (no restart loop).
  */
 #include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +27,7 @@
 
 /* the activity-stream SPI: flags, entry types, events */
 enum {
+	STREAM_PROCESS_ONLY = 0x1,
 	STREAM_INFO = 0x100,
 	STREAM_DEBUG = 0x20,
 	TYPE_LOG_MESSAGE = 0x0400,
@@ -72,6 +75,15 @@ static char *(*copy_formatted_message)(struct log_message *message);
 
 static char **names;
 static int nnames;
+
+/* libproc (not in the iOS SDK's headers) */
+#define PROC_ALL_PIDS           1
+int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+#define MAX_WATCHED             64
+static pid_t watched[MAX_WATCHED];
+static int nwatched;
 
 static bool
 wanted(const char *path)
@@ -131,31 +143,67 @@ main(int argc, char **argv)
 		goto idle;
 	}
 
-	stream_t stream = stream_for_pid(-1, STREAM_INFO | (debug ? STREAM_DEBUG : 0),
-	    ^bool (struct stream_entry *e, int error) {
-		if (error != 0 || e == NULL || e->type != TYPE_LOG_MESSAGE || !wanted(e->proc_imagepath)) {
+	/*
+	 * One process-only stream per running process of the list: boot 181 streamed every process and kept the
+	 * wanted ones here, which cost diagnosticd ~150% and oslogd ~75% of a CPU. The process list is scanned
+	 * every 2 s for new ones (a daemon restarted, an app launched).
+	 */
+	uint32_t flags = STREAM_INFO | STREAM_PROCESS_ONLY | (debug ? STREAM_DEBUG : 0);
+	entry_block_t on_entry = ^bool (struct stream_entry *e, int error) {
+		if (error != 0 || e == NULL || e->type != TYPE_LOG_MESSAGE) {
 			return true;
 		}
 		char *text = copy_formatted_message(&e->log_message);
-		const char *base = strrchr(e->proc_imagepath, '/');
-		printf("|oslog| %s[%d] %s:%s %s\n", base != NULL ? base + 1 : e->proc_imagepath, e->pid,
-		    e->log_message.subsystem != NULL ? e->log_message.subsystem : "",
+		const char *base = e->proc_imagepath != NULL ? strrchr(e->proc_imagepath, '/') : NULL;
+		printf("|oslog| %s[%d] %s:%s %s\n", base != NULL ? base + 1 : (e->proc_imagepath ? e->proc_imagepath : "?"),
+		    e->pid, e->log_message.subsystem != NULL ? e->log_message.subsystem : "",
 		    e->log_message.category != NULL ? e->log_message.category : "", text != NULL ? text : "(null)");
 		free(text);
 		shown++;
 		return true;
-	});
-	if (stream == NULL) {
-		printf("oslogd: os_activity_stream_for_pid refused (entitlement com.apple.diagnosticd.diagnostic?)\n");
-		goto idle;
-	}
-	stream_set_event_handler(stream, ^(stream_t s, uint32_t event) {
-		(void)s;
-		printf("oslogd: stream %s (%lu messages shown)\n", event == EVENT_STARTED ? "started" :
-		    event == EVENT_STOPPED ? "stopped" : event == EVENT_FAILED ? "FAILED" : "event", shown);
-	});
-	stream_resume(stream);
+	};
 	printf("oslogd: streaming %s messages of %s\n", debug ? "default, info and debug" : "default and info", list);
+	dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 2 * NSEC_PER_SEC, NSEC_PER_SEC / 10);
+	dispatch_source_set_event_handler(timer, ^{
+		static int pids[4096];
+		int n = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids)) / (int)sizeof(int);
+		for (int j = 0; j < nwatched;) {        /* forget the ones that are gone */
+			if (kill(watched[j], 0) != 0 && errno == ESRCH) {
+				watched[j] = watched[--nwatched];
+			} else {
+				j++;
+			}
+		}
+		for (int i = 0; i < n; i++) {
+			char path[4096];
+			if (pids[i] <= 0 || proc_pidpath(pids[i], path, sizeof(path)) <= 0 || !wanted(path)) {
+				continue;
+			}
+			bool known = false;
+			for (int j = 0; j < nwatched; j++) {
+				known = known || watched[j] == pids[i];
+			}
+			if (known || nwatched >= MAX_WATCHED) {
+				continue;
+			}
+			stream_t s = stream_for_pid(pids[i], flags, on_entry);
+			if (s == NULL) {
+				printf("oslogd: no stream for %s[%d] (entitlement com.apple.diagnosticd.diagnostic?)\n", path, pids[i]);
+				continue;
+			}
+			stream_set_event_handler(s, ^(stream_t st, uint32_t event) {
+				(void)st;
+				if (event == EVENT_FAILED) {
+					printf("oslogd: a stream FAILED (%lu messages shown)\n", shown);
+				}
+			});
+			stream_resume(s);
+			watched[nwatched++] = pids[i];
+			printf("oslogd: watching %s[%d]\n", strrchr(path, '/') != NULL ? strrchr(path, '/') + 1 : path, pids[i]);
+		}
+	});
+	dispatch_resume(timer);
 	dispatch_main();
 
 idle:
