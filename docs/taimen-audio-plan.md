@@ -580,7 +580,7 @@ Calendar:
 - **WCD9340 / SLIMbus for the speakers:** not on the path. The amps are on quaternary MI2S.
   - The tasha codec node is another board's: its probe fails (dmesg:2560).
   - The microphones need WCD9340 over SLIMbus: the NGD at 0x171C0000, whose bus the ADSP manages, the codec's register
-    init, and AFE SLIMBUS_0_TX 0x4001. That is a later plan of its own, for `/dev/redwood-mic`.
+    init, and AFE SLIMBUS_0_TX 0x4001. That is a later plan of its own, for `/dev/redwood-mic`: docs/taimen-mic-plan.md.
 - **Driving LPAIF DMA from APPS without the ADSP:** the ADSP owns LPASS on msm8998. There is no reference for HLOS LPAIF on
   this SoC (mainline's lpass-cpu covers other SoCs), and HackiOS saw aborts reading LPASS clock registers.
 - **Topaz's AudioReach graph (GPR/APM/SPF, TZ/0145-0146):** a different DSP framework. msm8998 is Elite APR (dmesg
