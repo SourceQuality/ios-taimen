@@ -1349,3 +1349,6 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   and the TX7 path (DMIC0 -> DEC7 -> TX7, MICB1 on): 82 registers read back as written, then all of it down again.
   The speaker kept working (a 148,480-frame session, 0 dropped). Next: M5-M7 (AFE SLIMBUS_0_TX, the ASM record
   stream, /dev/redwood-mic).
+- 2026-10-30 boot 193 (r164, mkrootfix --locationd writing mobile's com.apple.locationd.plist): **Location Services
+  on**: locationd's BigSwitch is 1, its location bundles are authorized, and Weather asks "Allow Weather to use your
+  location?" (no fix to give it yet: no GNSS or Wi-Fi). The speaker played as usual.
