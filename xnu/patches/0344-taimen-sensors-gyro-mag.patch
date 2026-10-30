@@ -1,0 +1,833 @@
+diff --git a/iokit/Kernel/arm/TaimenSensors.cpp b/iokit/Kernel/arm/TaimenSensors.cpp
+index 2846228..60b70a6 100644
+--- a/iokit/Kernel/arm/TaimenSensors.cpp
++++ b/iokit/Kernel/arm/TaimenSensors.cpp
+@@ -44,6 +44,23 @@
+  * indications (0x22) carry Q16.16 samples, mapped to iOS milli-g by one table (taimenaccelmap=,
+  * default "+y+x-z" from the plan: Linux's SMGR mount matrix, then iOS = -Android / 9.80665) into
+  * SweetHID's accelerometer (sweet_hid_accel_sample) (stage 11).
++ *
++ * 0344, plan M6 (taimensensors>=7): the gyro (type GYRO) and the magnetometer (type MAG) stream as the
++ * accelerometer does, each in a BUFFERING report of its own asked for right after the accelerometer's
++ * answer (report id = sensor id, one sample per report, as the Linux driver streams every sensor), 50 Hz
++ * each (taimengyrohz=, taimenmaghz=); stage 12. The accelerometer's default axis map is -y-x+z now:
++ * boot 185 read iOS z = -1 g lying face up with it, where 0341's +y+x-z read +1 g. So SMGR's frame is
++ * north-east-down (z into the back) and iOS's acceleration -(SMGR y, SMGR x, -SMGR z) / g; the x and y
++ * signs follow from that frame, not yet checked with a tilt. The gyro and the magnetometer come in the
++ * same frame (Qualcomm's SMGR rotates every sensor into it from the registry; the Linux driver has one
++ * mount matrix for all three), and iOS takes rotation (right hand) and field as Android has them, without
++ * the accelerometer's sign flip: their default maps are the accelerometer's negated, +y+x-z
++ * (taimengyromap=, taimenmagmap= override them). Units: SMGR's gyro is rad/s and its field Gauss, both
++ * Q16.16 (the census resolutions 0.00122 rad/s = the LSM6DSM's 70 mdps and 0.001495 G = the AK09915's
++ * 0.15 uT); locationd's CLGyro and CLMagnetometer HID callbacks copy kIOHIDEventFieldGyroX.. and
++ * CompassX.. unscaled into CoreMotion's rotation rate (rad/s) and magnetic field (uT), so the gyro goes
++ * through as IOFixed and the field x100. They feed SweetHIDGyro (sweet_hid_gyro_sample, in place of its
++ * still samples) and SweetHIDCompass (sweet_hid_compass_sample).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -93,6 +110,8 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
+ extern "C" bool sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+ extern "C" int sweet_hid_accel_sample(int mx, int my, int mz);        /* hid/SweetHID.cpp, 0341 */
++extern "C" int sweet_hid_gyro_sample(int x, int y, int z);            /* 0344: IOFixed rad/s */
++extern "C" int sweet_hid_compass_sample(int x, int y, int z);         /* 0344: IOFixed microtesla */
+ 
+ #define PT_LOAD                 1
+ #define MDT_TYPE_MASK           (7u << 24)
+@@ -1887,7 +1906,7 @@ struct smgr_sensor {
+ 	struct smgr_dt dt[SMGR_MAX_DT];
+ };
+ 
+-enum { SM_IDLE, SM_WAIT_ALL, SM_RETRY_ALL, SM_INFO, SM_WAIT_ONE, SM_PICK, SM_WAIT_BUF, SM_STREAM, SM_DONE };
++enum { SM_IDLE, SM_WAIT_ALL, SM_RETRY_ALL, SM_INFO, SM_WAIT_ONE, SM_PICK, SM_WAIT_BUF, SM_STREAM, SM_DONE, SM_WAIT_XBUF };
+ 
+ static struct smgr_sensor *smgr_s;              /* SMGR_MAX_SENSORS */
+ static uint32_t smgr_ns, smgr_cur, smgr_tries, smgr_state = SM_IDLE, smgr_stray;
+@@ -1895,15 +1914,21 @@ static uint16_t smgr_txn = 1, smgr_wait_txn;
+ static uint64_t smgr_sent_ms, smgr_next_ms;
+ 
+ /*
+- * M5's axis map: iOS x, y, z (milli-g) from the SMGR sample's axes. The plan's default, unverified:
+- * Linux's SMGR mount matrix (Android x = -SMGR y, Android y = -SMGR x, Android z = SMGR z), then
+- * iOS = -Android / 9.80665, so "+y+x-z". taimenaccelmap=SASASA overrides it (S sign, A axis).
++ * The axis maps: iOS x, y, z from the SMGR sample's axes. M5's (0341) default was the plan's "+y+x-z";
++ * boot 184 read iOS z = +1 g lying face up with it, boot 185 -1 g with -y-x+z, as iOS has it. So since
++ * 0344 the accelerometer's default is -y-x+z: SMGR's frame is north-east-down (z into the back) and
++ * iOS = -(SMGR y, SMGR x, -SMGR z) / 9.80665; x and y follow from that frame, unchecked by a tilt. M6's
++ * gyro and magnetometer maps are the accelerometer's negated (header). taimenaccelmap=, taimengyromap=
++ * and taimenmagmap=SASASA override them (S sign, A axis).
+  */
+ struct amap_e { uint8_t src; int8_t sign; };
+-static struct amap_e amap[3] = { { 1, 1 }, { 0, 1 }, { 2, -1 } };
+-static char amap_str[8] = "+y+x-z";
++static struct amap_e amap[3] = { { 1, -1 }, { 0, -1 }, { 2, 1 } };
++static char amap_str[8] = "-y-x+z";
++static struct amap_e gyromap[3], magmap[3];
++static char gyromap_str[8], magmap_str[8];
+ 
+ static int accel_sid = -1, accel_hz;
++static bool acc_on;                             /* 0344: the SMGR took the accelerometer's report */
+ static uint64_t acc_t0, acc_win_ms, acc_next_ms;
+ static uint32_t acc_samples, acc_reports, acc_win, acc_win_reports, acc_logged, acc_other_ids, acc_odd_tlvs;
+ static uint32_t acc_hid_missing, acc_last_ts;
+@@ -2221,18 +2246,30 @@ m4_summary(void)
+ 	LOG("10: t=%u.%03u M4: SMGR census: %u sensors, %u answered SINGLE_SENSOR_INFO:%s", T, smgr_ns, answered, line);
+ }
+ 
+-/* taimenaccelmap=SASASA: for iOS x, y, z an optional sign (+/-) and the SMGR axis (x/y/z) */
+ static void
+-amap_load(void)
++map_str(const struct amap_e *m, char *s)
++{
++	for (unsigned k = 0; k < 3; k++) {
++		s[2 * k] = m[k].sign < 0 ? '-' : '+';
++		s[2 * k + 1] = (char)('x' + m[k].src);
++	}
++	s[6] = 0;
++}
++
++/*
++ * boot-arg arg=SASASA: for iOS x, y, z an optional sign (+/-) and the SMGR axis (x/y/z). True when
++ * present and understood (then in out); a bad one is logged and leaves out as it was.
++ */
++static bool
++map_arg(const char *arg, struct amap_e *out, unsigned stage, const char *keep)
+ {
+ 	char s[16];
+ 	struct amap_e m[3];
+ 	uint32_t i = 0, used = 0;
+ 
+ 	bzero(s, sizeof(s));
+-	if (!PE_parse_boot_arg_str("taimenaccelmap", s, (int)sizeof(s))) {
+-		LOG("11: axis map %s (iOS x y z from SMGR's; the plan's default, unverified)", amap_str);
+-		return;
++	if (!PE_parse_boot_arg_str(arg, s, (int)sizeof(s))) {
++		return false;
+ 	}
+ 	bool ok = true;
+ 	for (unsigned k = 0; k < 3 && ok; k++) {
+@@ -2251,17 +2288,375 @@ amap_load(void)
+ 		}
+ 	}
+ 	if (!ok || s[i] != 0) {
+-		LOG("11: taimenaccelmap=%s not understood (want e.g. +y+x-z: sign and SMGR axis for iOS x, y, z); "
+-		    "keeping %s", s, amap_str);
++		LOG("%u: %s=%s not understood (want e.g. -y-x+z: sign and SMGR axis for iOS x, y, z); keeping %s", stage, arg,
++		    s, keep);
++		return false;
++	}
++	memcpy(out, m, sizeof(m));
++	return true;
++}
++
++/* taimenaccelmap= */
++static void
++amap_load(void)
++{
++	if (!map_arg("taimenaccelmap", amap, 11, amap_str)) {
++		LOG("11: axis map %s (iOS x y z from SMGR's; the default since 0344: z as boot 185 read it, x and y unchecked)",
++		    amap_str);
+ 		return;
+ 	}
+-	memcpy(amap, m, sizeof(amap));
++	map_str(amap, amap_str);
++	LOG("11: axis map %s from taimenaccelmap (iOS x y z from SMGR's)", amap_str);
++}
++
++/* 0344: the gyro's and the magnetometer's maps, the accelerometer's negated unless taimengyromap=/taimenmagmap= */
++static void
++m6_maps(void)
++{
+ 	for (unsigned k = 0; k < 3; k++) {
+-		amap_str[2 * k] = amap[k].sign < 0 ? '-' : '+';
+-		amap_str[2 * k + 1] = (char)('x' + amap[k].src);
++		gyromap[k].src = amap[k].src;
++		gyromap[k].sign = (int8_t)-amap[k].sign;
++	}
++	memcpy(magmap, gyromap, sizeof(magmap));
++	map_str(gyromap, gyromap_str);
++	map_str(magmap, magmap_str);
++	bool g = map_arg("taimengyromap", gyromap, 12, gyromap_str);
++	bool m = map_arg("taimenmagmap", magmap, 12, magmap_str);
++	map_str(gyromap, gyromap_str);
++	map_str(magmap, magmap_str);
++	LOG("12: M6 (taimensensors>=7): gyro and magnetometer streams after the accelerometer's; gyro map %s%s, "
++	    "magnetometer map %s%s (iOS x y z from SMGR's)", gyromap_str, g ? " from taimengyromap" : " (the accelerometer's negated)",
++	    magmap_str, m ? " from taimenmagmap" : " (the accelerometer's negated)");
++}
++
++/*
++ * 0344: the streams after the accelerometer's (M6 stage 12), each a BUFFERING report of its own: report
++ * id = sensor id (a second data type takes the next id no sensor or report has), one sample per report.
++ * They are asked for one after the other, each once the last one's answer came.
++ */
++enum { XS_IDLE, XS_WAIT, XS_ON, XS_OFF };
++enum { XK_GYRO, XK_MAG };
++struct xs_cfg {
++	const char *name, *type;        /* our name; the ALL_SENSOR_INFO type to stream */
++	uint8_t kind, dt, stage, level; /* XK_*, its data type, the log stage, the taimensensors level that asks */
++	int hz;                         /* the rate, unless boot-arg hz_arg says otherwise */
++	const char *hz_arg, *hid;       /* that boot-arg; the SweetHID service that takes the samples */
++};
++static const struct xs_cfg xs_tab[] = {
++	{ "gyro", "GYRO", XK_GYRO, 0, 12, 7, 50, "taimengyrohz", "SweetHIDGyro" },
++	{ "mag", "MAG", XK_MAG, 0, 12, 7, 50, "taimenmaghz", "SweetHIDCompass" },
++};
++#define XS_N                    (sizeof(xs_tab) / sizeof(xs_tab[0]))
++struct xstream {
++	int sid, rid, hz;
++	uint32_t st, tries;
++	uint64_t t0, win_ms, next_ms;
++	uint32_t samples, reports, win, win_reports, logged, last_ts, hid_missing;
++	int32_t raw[3], out[3];
++};
++static struct xstream xs[XS_N];
++static uint32_t xs_cur;
++
++static void
++xs_init(void)
++{
++	for (uint32_t i = 0; i < XS_N; i++) {
++		bzero(&xs[i], sizeof(xs[i]));
++		xs[i].sid = -1;
++		xs[i].rid = -1;
++	}
++}
++
++static bool
++smgr_streaming(void)
++{
++	bool on = acc_on;
++	for (uint32_t i = 0; i < XS_N; i++) {
++		on = on || xs[i].st == XS_ON;
++	}
++	return on;
++}
++
++static bool
++rid_used(int r)
++{
++	if (r == accel_sid) {
++		return true;
++	}
++	for (uint32_t k = 0; k < smgr_ns; k++) {
++		if (smgr_s[k].id == r) {
++			return true;
++		}
++	}
++	for (uint32_t i = 0; i < XS_N; i++) {
++		if (xs[i].rid == r) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* the report id: the sensor id for data type 0 (as the Linux driver), else the next one nobody has */
++static int
++rid_for(int sid, uint8_t dt)
++{
++	int r = sid;
++	for (unsigned n = 0; dt != 0 && n < 256; n++) {
++		r = (r + 1) & 0xFF;
++		if (!rid_used(r)) {
++			break;
++		}
++	}
++	return r;
++}
++
++static int32_t
++clamp32(int64_t v)
++{
++	return v > 0x7FFFFFFFLL ? 0x7FFFFFFF : v < -0x80000000LL ? (int32_t)(-0x7FFFFFFF - 1) : (int32_t)v;
++}
++
++/* a stream's last iOS value as text */
++static void
++xs_out_fmt(uint32_t i, char *b, size_t n)
++{
++	const struct xstream *x = &xs[i];
++	char v[3][24], m[24];
++	uint64_t sq = 0;
++	for (unsigned j = 0; j < 3; j++) {
++		q16_fmt(v[j], sizeof(v[j]), x->out[j], 3);
++		sq += (uint64_t)((int64_t)x->out[j] * x->out[j]);
++	}
++	uint64_t mag = isqrt64(sq);
++	q16_fmt(m, sizeof(m), mag > 0x7FFFFFFFull ? 0x7FFFFFFF : (int32_t)mag, 3);
++	switch (xs_tab[i].kind) {
++	case XK_GYRO:
++		snprintf(b, n, "%s %s %s rad/s (|w| %s)", v[0], v[1], v[2], m);
++		break;
++	case XK_MAG:
++		snprintf(b, n, "%s %s %s uT (|B| %s)", v[0], v[1], v[2], m);
++		break;
++	default:
++		snprintf(b, n, "?");
++		break;
++	}
++}
++
++static void
++xs_buffering(uint32_t i)
++{
++	const struct xs_cfg *c = &xs_tab[i];
++	struct xstream *x = &xs[i];
++	uint8_t m[48], it[9];
++	uint8_t rid = (uint8_t)x->rid, act = 1;
++	uint32_t rate = (uint32_t)x->hz << 16, n = 7;
++
++	n = qm_tlv(m, n, 0x01, &rid, 1);
++	n = qm_tlv(m, n, 0x02, &act, 1);
++	n = qm_tlv(m, n, 0x03, &rate, 4);
++	it[0] = 1;
++	it[1] = (uint8_t)x->sid;
++	it[2] = c->dt;
++	st16(it + 3, 3);
++	st16(it + 5, (uint16_t)x->hz);
++	st16(it + 7, 1);
++	n = qm_tlv(m, n, 0x04, it, 9);
++	smgr_send(m, n, SMGR_MSG_BUFFERING);
++	smgr_state = SM_WAIT_XBUF;
++	xs_cur = i;
++	x->st = XS_WAIT;
++	LOG("%u: t=%u.%03u smgr: %s BUFFERING add (txn %u, try %u): report id 0x%02x, report rate %#x (%d Hz x 65536), "
++	    "item {0x%02x, %u, 3, %d, 1}", c->stage, T, c->name, smgr_wait_txn, x->tries + 1, rid, rate, x->hz, x->sid, c->dt,
++	    x->hz);
++}
++
++/* find stream i's sensor and ask for it; false (stream off) without one */
++static bool
++xs_start(uint32_t i)
++{
++	const struct xs_cfg *c = &xs_tab[i];
++	struct xstream *x = &xs[i];
++	struct smgr_sensor *s = NULL;
++	const struct smgr_dt *t = NULL;
++
++	for (uint32_t k = 0; k < smgr_ns && s == NULL; k++) {
++		if (strlen(smgr_s[k].type) == strlen(c->type) && ci_has(smgr_s[k].type, c->type)) {
++			s = &smgr_s[k];
++		}
++	}
++	for (uint32_t k = 0; s != NULL && k < s->ndt && t == NULL; k++) {
++		if (s->dt[k].dt == c->dt) {
++			t = &s->dt[k];
++		}
++	}
++	if (t == NULL) {
++		x->st = XS_OFF;
++		LOG("%u: t=%u.%03u %s: no sensor of type %s%s among %u sensors; no %s stream", c->stage, T, c->name, c->type,
++		    s != NULL ? " with that data type" : "", smgr_ns, c->name);
++		return false;
++	}
++	int hz = c->hz;
++	if (c->hz_arg != NULL) {
++		(void)PE_parse_boot_argn(c->hz_arg, &hz, sizeof(hz));
++	}
++	if (hz < 1 || hz > 1000) {
++		hz = c->hz;
++	}
++	if (t->max_hz != 0 && (uint32_t)hz > t->max_hz) {
++		hz = (int)t->max_hz;
++	}
++	x->sid = s->id;
++	x->hz = hz;
++	x->rid = rid_for(s->id, c->dt);
++	x->tries = 0;
++	LOG("%u: t=%u.%03u %s: sensor id 0x%02x (type %s) data type %u '%s' vendor '%s', max %u Hz; %d Hz, one sample "
++	    "per report, report id 0x%02x, into %s", c->stage, T, c->name, s->id, s->type, c->dt, t->name, t->vendor, t->max_hz,
++	    hz, x->rid, c->hid);
++	xs_buffering(i);
++	return true;
++}
++
++/* the next stream to ask for; when none is left, streaming (or done, with nothing to stream) */
++static void
++xs_next(void)
++{
++	for (uint32_t i = 0; i < XS_N; i++) {
++		if (xs[i].st == XS_IDLE && sens_level >= xs_tab[i].level && xs_start(i)) {
++			return;
++		}
++	}
++	smgr_state = smgr_streaming() ? SM_STREAM : SM_DONE;
++	if (sens_level >= 7) {
++		static const char *const sn[] = { "-", "asked", "on", "off" };
++		char line[160];
++		size_t n = (size_t)snprintf(line, sizeof(line), "accel %s", acc_on ? "on" : "off");
++		for (uint32_t i = 0; i < XS_N && n + 24 < sizeof(line); i++) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, ", %s %s", xs_tab[i].name, sn[xs[i].st & 3]);
++		}
++		LOG("12: t=%u.%03u smgr streams: %s", T, line);
++	}
++}
++
++static void
++xs_buf_done(uint32_t res, uint32_t err, int rid, int ack)
++{
++	const struct xs_cfg *c = &xs_tab[xs_cur];
++	struct xstream *x = &xs[xs_cur];
++	LOG("%u: t=%u.%03u smgr: %s BUFFERING add -> result %u error %u, report id %d, ack/nak %d", c->stage, T, c->name, res,
++	    err, rid, ack);
++	if (res != 0) {
++		x->st = XS_OFF;
++		LOG("%u: the SMGR refused the %s stream", c->stage, c->name);
++	} else {
++		x->st = XS_ON;
++		x->t0 = x->win_ms = now_ms();
++		x->next_ms = x->t0 + 1000;
++	}
++	xs_next();
++}
++
++/* the stream of report id rid (asked for or on), else -1 */
++static int
++xs_by_rid(int rid)
++{
++	for (uint32_t i = 0; i < XS_N; i++) {
++		if (xs[i].rid == rid && (xs[i].st == XS_WAIT || xs[i].st == XS_ON)) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static void
++xs_sample(uint32_t i, const int32_t r[3], uint32_t ts, const uint8_t *s)
++{
++	const struct xs_cfg *c = &xs_tab[i];
++	struct xstream *x = &xs[i];
++	int32_t o[3] = { 0, 0, 0 };
++	int took = 0;
++
++	switch (c->kind) {
++	case XK_GYRO:
++	case XK_MAG: {
++		const struct amap_e *m = c->kind == XK_GYRO ? gyromap : magmap;
++		int64_t k = c->kind == XK_MAG ? 100 : 1;        /* Gauss -> microtesla */
++		for (unsigned j = 0; j < 3; j++) {
++			o[j] = clamp32((int64_t)r[m[j].src] * m[j].sign * k);
++		}
++		break;
++	}
++	default:
++		break;
++	}
++	x->samples++;
++	x->win++;
++	memcpy(x->raw, r, sizeof(x->raw));
++	memcpy(x->out, o, sizeof(x->out));
++	if (x->logged < 8) {
++		x->logged++;
++		char a[3][24], ob[96];
++		for (unsigned j = 0; j < 3; j++) {
++			q16_fmt(a[j], sizeof(a[j]), r[j], 3);
++		}
++		xs_out_fmt(i, ob, sizeof(ob));
++		LOG("%u: t=%u.%03u %s sample %u: raw %d %d %d = %s %s %s (Q16.16), ts %u (+%u ticks), extra %u %u %#x -> iOS %s",
++		    c->stage, T, c->name, x->samples, r[0], r[1], r[2], a[0], a[1], a[2], ts, x->samples > 1 ? ts - x->last_ts : 0,
++		    s[12], s[13], ld16(s + 14), ob);
++	}
++	x->last_ts = ts;
++	switch (c->kind) {
++	case XK_GYRO:
++		took = sweet_hid_gyro_sample(o[0], o[1], o[2]);
++		break;
++	case XK_MAG:
++		took = sweet_hid_compass_sample(o[0], o[1], o[2]);
++		break;
++	default:
++		break;
++	}
++	if (took == 0) {
++		x->hid_missing++;
++	}
++}
++
++static void
++xs_report(uint32_t i, const uint8_t *meta, const uint8_t *smp, uint16_t sl)
++{
++	struct xstream *x = &xs[i];
++	x->reports++;
++	x->win_reports++;
++	if (smp == NULL) {
++		return;
++	}
++	uint32_t ts = meta != NULL ? ld32(meta + 5) : 0;
++	for (uint32_t k = 0; k < smp[0] && 1 + 16 * (k + 1) <= sl; k++) {
++		const uint8_t *s = smp + 1 + 16 * k;
++		int32_t r[3] = { (int32_t)ld32(s), (int32_t)ld32(s + 4), (int32_t)ld32(s + 8) };
++		xs_sample(i, r, ts, s);
++	}
++}
++
++/* a rate line per stream each second for 10 s, then each minute */
++static void
++xs_stats(uint64_t now)
++{
++	for (uint32_t i = 0; i < XS_N; i++) {
++		const struct xs_cfg *c = &xs_tab[i];
++		struct xstream *x = &xs[i];
++		if (x->st != XS_ON || now < x->next_ms) {
++			continue;
++		}
++		char ob[96];
++		xs_out_fmt(i, ob, sizeof(ob));
++		LOG("%u: t=%u.%03u %s %d Hz: %u samples in %llu ms (%u reports), last iOS %s, raw %d %d %d; %u samples in %u "
++		    "reports in all%s%s%s", c->stage, T, c->name, x->hz, x->win, now - x->win_ms, x->win_reports, ob, x->raw[0],
++		    x->raw[1], x->raw[2], x->samples, x->reports, x->hid_missing != 0 ? " (no " : "", x->hid_missing != 0 ? c->hid : "",
++		    x->hid_missing != 0 ? " to take them)" : "");
++		x->win = 0;
++		x->win_reports = 0;
++		x->win_ms = now;
++		x->next_ms = now + (now - x->t0 < 10000 ? 1000 : 60000);
+ 	}
+-	amap_str[6] = 0;
+-	LOG("11: axis map %s from taimenaccelmap (iOS x y z from SMGR's)", amap_str);
+ }
+ 
+ static void
+@@ -2309,7 +2704,7 @@ accel_start(void)
+ 	if (a == NULL) {
+ 		LOG("11: t=%u.%03u no accelerometer among %u sensors (no type ACCEL, no data type 0 named accel); M5 stops", T,
+ 		    smgr_ns);
+-		smgr_state = SM_DONE;
++		xs_next();
+ 		return;
+ 	}
+ 	int hz = 50;
+@@ -2350,15 +2745,20 @@ smgr_buf_rx(const uint8_t *d, uint32_t len)
+ 			LOG("11: smgr: BUFFERING response TLV %#x, %u bytes (not decoded)", t, l);
+ 		}
+ 	}
++	if (smgr_state == SM_WAIT_XBUF) {
++		xs_buf_done(res, err, rid, ack);
++		return;
++	}
+ 	LOG("11: t=%u.%03u smgr: BUFFERING add -> result %u error %u, report id %d, ack/nak %d", T, res, err, rid, ack);
+ 	if (res != 0) {
+-		smgr_state = SM_DONE;
+ 		LOG("11: the SMGR refused the accelerometer stream; M5 stops");
++		xs_next();
+ 		return;
+ 	}
+-	smgr_state = SM_STREAM;
++	acc_on = true;
+ 	acc_t0 = acc_win_ms = now_ms();
+ 	acc_next_ms = acc_t0 + 1000;
++	xs_next();
+ }
+ 
+ static void
+@@ -2415,6 +2815,11 @@ smgr_report_rx(const uint8_t *d, uint32_t len)
+ 			LOG("11: smgr report: TLV %#x, %u bytes (not decoded)", t, l);
+ 		}
+ 	}
++	int xi = rid >= 0 ? xs_by_rid(rid) : -1;
++	if (xi >= 0) {
++		xs_report((uint32_t)xi, meta, smp, sl);
++		return;
++	}
+ 	if (accel_sid < 0 || rid != accel_sid) {
+ 		if (acc_other_ids++ < 8) {
+ 			LOG("11: t=%u.%03u smgr report for id %d (ours %d), %u bytes: ignored", T, rid, accel_sid, len);
+@@ -2451,7 +2856,7 @@ smgr_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+ 	bool want = type == QMI_RESP && txn == smgr_wait_txn &&
+ 	    ((msg == SMGR_MSG_ALL_INFO && smgr_state == SM_WAIT_ALL) ||
+ 	    (msg == SMGR_MSG_ONE_INFO && smgr_state == SM_WAIT_ONE) ||
+-	    (msg == SMGR_MSG_BUFFERING && smgr_state == SM_WAIT_BUF));
++	    (msg == SMGR_MSG_BUFFERING && (smgr_state == SM_WAIT_BUF || smgr_state == SM_WAIT_XBUF)));
+ 	if (!want) {
+ 		if (smgr_stray++ < 16) {
+ 			LOG("10: t=%u.%03u smgr: QMI type %u msg %#x txn %u from %u:%#x, %u bytes: not expected (state %u, txn %u)",
+@@ -2546,17 +2951,33 @@ smgr_poll(void)
+ 			if (++smgr_tries < 3) {
+ 				accel_buffering();
+ 			} else {
+-				smgr_state = SM_DONE;
+ 				LOG("11: no accelerometer stream; M5 stops");
++				xs_next();
+ 			}
+ 		}
+ 		break;
+-	case SM_STREAM:
+-		accel_stats(now);
++	case SM_WAIT_XBUF:
++		if (now - smgr_sent_ms >= SMGR_WAIT_MS) {
++			const struct xs_cfg *c = &xs_tab[xs_cur];
++			LOG("%u: t=%u.%03u smgr: no answer to the %s BUFFERING (txn %u) in %u ms", c->stage, T, c->name, smgr_wait_txn,
++			    SMGR_WAIT_MS);
++			if (++xs[xs_cur].tries < 3) {
++				xs_buffering(xs_cur);
++			} else {
++				xs[xs_cur].st = XS_OFF;
++				LOG("%u: no %s stream", c->stage, c->name);
++				xs_next();
++			}
++		}
+ 		break;
+ 	default:
+ 		break;
+ 	}
++	/* 0344: the rate lines of whatever streams, while the next stream is being asked for too */
++	if (acc_on) {
++		accel_stats(now);
++	}
++	xs_stats(now);
+ }
+ 
+ /* ---------------------------------------------------------------- M3: the loop (0340) */
+@@ -2603,9 +3024,13 @@ m3_run(int level)
+ 		smgr_s = (struct smgr_sensor *)IOMallocZero(SMGR_MAX_SENSORS * sizeof(struct smgr_sensor));
+ 		LOG("10: M4 (taimensensors>=5): the SMGR census once SMGR is up and its registry reads are done%s%s",
+ 		    level >= 6 ? "; M5: the accelerometer stream" : "", smgr_s == NULL ? " (NO MEMORY: off)" : "");
++		xs_init();
+ 		if (level >= 6) {
+ 			amap_load();
+ 		}
++		if (level >= 7) {
++			m6_maps();
++		}
+ 	}
+ 	if (!glink_init()) {
+ 		return;
+@@ -2650,8 +3075,8 @@ m3_run(int level)
+ 		if (busy) {
+ 			IODelay(200);
+ 		} else {
+-			/* 0341: 5 ms while the accelerometer streams (plan risk 11) */
+-			IOSleep(!summary ? 2 : smgr_state == SM_STREAM ? 5 : 20);
++			/* 0341: 5 ms while the accelerometer streams (plan risk 11); 0344: or any other sensor */
++			IOSleep(!summary ? 2 : smgr_streaming() ? 5 : 20);
+ 		}
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 869f227..b292bac 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -16,7 +16,9 @@
+  *                    samples come from sweet_hid_accel() (the USB control port's
+  *                    "accel"/"orient" today, the SLPI's sensor manager later)
+  *   SweetHIDGyro     a still gyro (0xff00/9, zero rates; 0339): locationd's orientation
+- *                    detector runs only with both ("No gyro; not detecting orientation!")
++ *                    detector runs only with both ("No gyro; not detecting orientation!");
++ *                    0344: the SLPI's rates (rad/s) while they flow
++ *   SweetHIDCompass  the SLPI's magnetometer (0xff00/0xa, microtesla; 0344, taimensensors>=7)
+  *   SweetHIDOrientation  the device orientation as a coprocessor reports it (0337:
+  *                    Sensor page 0x20 usage 0x8A, orientation events of type
+  *                    CMUsage), derived from SweetHIDAccel's samples
+@@ -576,6 +578,7 @@ public:
+ 	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
+ 	void sample(int mx, int my, int mz);
+ 	void realSample(int mx, int my, int mz);
++	void realFixed(IOFixed x, IOFixed y, IOFixed z);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 3; }
+@@ -583,10 +586,15 @@ protected:
+ 	/* 0339: the gyro below shares the streaming; these say what it sends */
+ 	virtual IOHIDEvent *event();
+ 	virtual IOHIDEventType eventType() { return kIOHIDEventTypeAccelerometer; }
+-private:
++	/* 0344: the services below that send the SLPI's samples only (no synthetic stand-in) say so here */
++	virtual int minLevel() { return 1; }                /* taimensensors */
++	virtual bool synthesizes() { return true; }         /* no real sample flowing: the timer sends event() */
++	virtual void stale() {}                             /* the real samples stopped */
++	virtual const char *describe() { return "synthetic: the control port's accel/orient"; }
+ 	static void tick(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fTimer;
+ 	volatile int fMg[3];            /* the current sample, milli-g */
++	volatile IOFixed fV[3];         /* 0344: the subclasses' last real sample (gyro rad/s, compass uT) */
+ 	volatile UInt32 fIntervalUS;    /* 0: not streaming */
+ 	UInt32 fSent, fSaid;
+ 	volatile uint64_t fRealAt;      /* 0341: mach time of the last real sensor sample (0: synthetic only) */
+@@ -594,12 +602,13 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDAccel, IOHIDEventService);
+ static SweetHIDAccel *gSweetAccel;
++static SweetHIDAccel *gSweetGyro, *gSweetCompass;       /* 0344 */
+ 
+ bool
+ SweetHIDAccel::start(IOService *provider)
+ {
+ 	int level = 0;
+-	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 1) {
++	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < minLevel()) {
+ 		return false;   /* no service: locationd sees no accelerometer, as before */
+ 	}
+ 	if (!IOHIDEventService::start(provider)) {
+@@ -614,10 +623,14 @@ SweetHIDAccel::start(IOService *provider)
+ 	}
+ 	if (eventType() == kIOHIDEventTypeAccelerometer) {
+ 		gSweetAccel = this;
++	} else if (eventType() == kIOHIDEventTypeGyro) {
++		gSweetGyro = this;
++	} else if (eventType() == kIOHIDEventTypeCompass) {
++		gSweetCompass = this;
+ 	}
+ 	registerService();
+-	IOLog("TAIMEN SENSORS: %s up (0xff00/%u, synthetic: the control port's accel/orient)\n", getName(),
+-	    (unsigned)getPrimaryUsage());
++	IOLog("TAIMEN SENSORS: %s up (%#x/%u, %s)\n", getName(), (unsigned)getPrimaryUsagePage(), (unsigned)getPrimaryUsage(),
++	    describe());
+ 	return true;
+ }
+ 
+@@ -648,6 +661,14 @@ SweetHIDAccel::tick(OSObject *owner, IOTimerEventSource *sender)
+ 		sender->setTimeoutUS(us);
+ 		return;
+ 	}
++	/* 0344: a compass sends real samples only; a gyro whose real rates stopped goes still again */
++	if (!me->synthesizes()) {
++		sender->setTimeoutUS(us);
++		return;
++	}
++	if (me->fRealAt != 0) {
++		me->stale();
++	}
+ 	IOHIDEvent *e = me->event();
+ 	if (e) {
+ 		me->dispatchEvent(e);
+@@ -702,10 +723,14 @@ SweetHIDAccel::setProperties(OSObject *properties)
+ IOHIDEvent *
+ SweetHIDAccel::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
+ {
+-	return type == eventType() ? event() : NULL;
++	return type == eventType() && (synthesizes() || fRealAt != 0) ? event() : NULL;
+ }
+ 
+-/* 0339: a gyro that never turns: zero rad/s, streamed as the accelerometer streams (its ReportInterval). */
++/*
++ * 0339: a gyro that never turns: zero rad/s, streamed as the accelerometer streams (its ReportInterval).
++ * 0344: the SLPI's rates (TaimenSensors.cpp M6, IOFixed rad/s: locationd's CLGyro copies the event's
++ * x, y, z into CoreMotion's rotation rate, rad/s) while they flow, still again 100 ms after they stop.
++ */
+ class SweetHIDGyro : public SweetHIDAccel {
+ 	OSDeclareDefaultStructors(SweetHIDGyro);
+ protected:
+@@ -714,16 +739,49 @@ protected:
+ 	virtual IOHIDEvent *event() APPLE_KEXT_OVERRIDE
+ 	{
+ 		uint64_t ts = mach_absolute_time();
+-		IOHIDEvent *e = IOHIDEvent::gyroEvent(ts, 0, 0, 0);
++		IOHIDEvent *e = IOHIDEvent::gyroEvent(ts, fV[0], fV[1], fV[2]);
+ 		if (e) {
+ 			add_sensor_time(e, ts);
+ 		}
+ 		return e;
+ 	}
+ 	virtual IOHIDEventType eventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeGyro; }
++	virtual void stale() APPLE_KEXT_OVERRIDE
++	{
++		fV[0] = 0;
++		fV[1] = 0;
++		fV[2] = 0;
++	}
+ };
+ OSDefineMetaClassAndStructors(SweetHIDGyro, SweetHIDAccel);
+ 
++/*
++ * 0344: the magnetometer, as locationd's CLMagnetometer opens it: usage pair {0xff00, 0xa} (the pair it
++ * builds its CLIoHidInterface device from, locationd 0x10073b4bc), kIOHIDEventTypeCompass events whose
++ * x, y, z it copies into CoreMotion's magnetic field (microtesla, IOFixed here). Real samples only
++ * (TaimenSensors.cpp M6), so taimensensors>=7; none while none flow.
++ */
++class SweetHIDCompass : public SweetHIDAccel {
++	OSDeclareDefaultStructors(SweetHIDCompass);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 0xa; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 7; }
++	virtual IOHIDEvent *event() APPLE_KEXT_OVERRIDE
++	{
++		uint64_t ts = mach_absolute_time();
++		IOHIDEvent *e = IOHIDEvent::compassEvent(ts, fV[0], fV[1], fV[2]);
++		if (e) {
++			add_sensor_time(e, ts);
++		}
++		return e;
++	}
++	virtual IOHIDEventType eventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeCompass; }
++	virtual int minLevel() APPLE_KEXT_OVERRIDE { return 7; }
++	virtual bool synthesizes() APPLE_KEXT_OVERRIDE { return false; }
++	virtual const char *describe() APPLE_KEXT_OVERRIDE { return "the SLPI's magnetometer, microtesla"; }
++};
++OSDefineMetaClassAndStructors(SweetHIDCompass, SweetHIDAccel);
++
+ void
+ SweetHIDAccel::sample(int mx, int my, int mz)
+ {
+@@ -771,6 +829,24 @@ SweetHIDAccel::realSample(int mx, int my, int mz)
+ 	}
+ }
+ 
++/* 0344: the same for the gyro and the compass: the sample as IOFixed, dispatched while a client streams */
++void
++SweetHIDAccel::realFixed(IOFixed x, IOFixed y, IOFixed z)
++{
++	fV[0] = x;
++	fV[1] = y;
++	fV[2] = z;
++	fRealAt = mach_absolute_time();
++	if (fIntervalUS != 0) {
++		IOHIDEvent *e = event();
++		if (e) {
++			dispatchEvent(e);
++			e->release();
++			fSent++;
++		}
++	}
++}
++
+ bool
+ SweetHIDKeyboard::start(IOService *provider)
+ {
+@@ -1050,6 +1126,29 @@ sweet_hid_accel_sample(int mx, int my, int mz)
+ 	return 1;
+ }
+ 
++/* 0344: the SLPI's gyro (IOFixed rad/s) and magnetometer (IOFixed microtesla); 0 without the service */
++extern "C" int sweet_hid_gyro_sample(int x, int y, int z);
++extern "C" int
++sweet_hid_gyro_sample(int x, int y, int z)
++{
++	if (!gSweetGyro) {
++		return 0;
++	}
++	gSweetGyro->realFixed(x, y, z);
++	return 1;
++}
++
++extern "C" int sweet_hid_compass_sample(int x, int y, int z);
++extern "C" int
++sweet_hid_compass_sample(int x, int y, int z)
++{
++	if (!gSweetCompass) {
++		return 0;
++	}
++	gSweetCompass->realFixed(x, y, z);
++	return 1;
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 6ea05ba..4f69281 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -98,6 +98,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDGyro;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDCompass;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDCompass;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
