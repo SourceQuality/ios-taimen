@@ -1958,6 +1958,20 @@ pub extern "C" fn nmb_render_set_depth_bias(encoder: *mut NmbEncoder, bias: f32,
     })
 }
 
+/// `setDepthClipMode:`: 0 MTLDepthClipModeClip, 1 MTLDepthClipModeClamp (Maps' VectorKit sets it, boot 189).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_depth_clip_mode(encoder: *mut NmbEncoder, mode: u64) -> bool {
+    guard(false, || {
+        let clamp = match mode {
+            0 => false,
+            1 => true,
+            _ => return Err(format!("depth clip mode {mode} is not a Metal value")),
+        };
+        render(encoder)?.set_depth_clamp(clamp);
+        Ok(true)
+    })
+}
+
 /// SPI `setLineWidth:`: the runtime accepts Metal's default width of 1 and refuses any other (Apple's wide-line rule is unmeasured).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_render_set_line_width(encoder: *mut NmbEncoder, width: f32) -> bool {

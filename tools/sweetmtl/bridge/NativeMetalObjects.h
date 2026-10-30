@@ -247,6 +247,7 @@ bool nmb_render_set_raster(NmbEncoder *, uint64_t cull_mode, uint64_t winding, u
 bool nmb_render_set_stencil_reference(NmbEncoder *, uint32_t front, uint32_t back);
 bool nmb_render_set_blend_color(NmbEncoder *, const float color[4]);
 bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, float clamp);
+bool nmb_render_set_depth_clip_mode(NmbEncoder *, uint64_t mode);
 bool nmb_render_set_line_width(NmbEncoder *, float width);
 bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset);
 bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);

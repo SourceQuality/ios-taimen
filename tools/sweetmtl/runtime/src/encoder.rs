@@ -495,6 +495,8 @@ pub struct RenderCommandEncoder {
     stencil_ref: [u32; 2],
     blend_color: [f32; 4],
     depth_bias: [f32; 3],
+    /// setDepthClipMode: MTLDepthClipModeClamp (Gallium depth_clamp) instead of Metal's default clip
+    depth_clamp: bool,
 }
 
 fn attachment(texture: &Texture, level: u64, slice: u64, depth_plane: u64, load: LoadAction, clear: [f64; 4],
@@ -714,6 +716,7 @@ impl CommandBuffer {
             stencil_ref: [0, 0],
             blend_color: [0.0; 4],
             depth_bias: [0.0; 3],
+            depth_clamp: false,
         })
     }
 }
@@ -796,6 +799,10 @@ impl RenderCommandEncoder {
     pub fn set_triangle_fill_mode(&mut self, mode: TriangleFillMode) -> Result<(), Error> {
         self.fill = mode;
         Ok(())
+    }
+    /// Metal's setDepthClipMode: false is MTLDepthClipModeClip (the default), true MTLDepthClipModeClamp.
+    pub fn set_depth_clamp(&mut self, clamp: bool) {
+        self.depth_clamp = clamp;
     }
     pub fn set_stencil_reference_values(&mut self, front: u32, back: u32) {
         self.stencil_ref = [front, back];
@@ -997,7 +1004,7 @@ impl RenderCommandEncoder {
             cull: self.cull.as_raw(),
             winding: self.winding.as_raw(),
             fill: self.fill.as_raw(),
-            depth_clip: 1,
+            depth_clip: if self.depth_clamp { 0 } else { 1 },
             samples: self.samples,
             depth_bias: self.depth_bias[0],
             depth_bias_slope: self.depth_bias[1],
