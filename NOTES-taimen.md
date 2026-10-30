@@ -1403,3 +1403,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   CLKUIMetalQuadView; PosterBoard shows the stored snapshot after that, which it encodes on the CPU from the IOSurface
   the GPU wrote. The GPU is not coherent with the CPU's cacheable mappings and IOSurface locks did no cache
   maintenance (only Mesa's own bos are prepared): 0358 cleans and invalidates a surface at the first lock after GPU use.
+- 2026-10-30 boot 201 (r170 = +0358): the IOSurface invalidation works (locks of the 1125x2436 snapshot surfaces after
+  GPU use: 686 pages cleaned and invalidated in 1.5-4 ms each), but the gallery is still drawn once and black after:
+  not (only) stale cache lines. PosterBoard reaps and retakes its gallery snapshots ("Failed to reap snapshot, not
+  reachable" for the gallery's .atx files): its snapshot lifecycle is the next suspect. Parked again.
+- 2026-10-30 boot 202 (r170, SweetMetal-da5dcafc = c84419d: pipeline variants): **Maps runs without a single Metal
+  refusal** (the srgb_textures variant compiles). Its map and labels draw, but no UIKit chrome and no status bar, and a
+  tap where the search card belongs changes nothing visible. Every swap is backboardd's one composited surface (no odd
+  swaps), so the chrome is lost in backboardd's CoreAnimation composition (sweetgl), not at the framebuffer: the Metal
+  layer's drawable seems to cover the app's other layers. Next: how backboardd composites a CAMetalLayer's drawable.
