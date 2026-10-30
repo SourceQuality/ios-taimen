@@ -1352,3 +1352,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-30 boot 193 (r164, mkrootfix --locationd writing mobile's com.apple.locationd.plist): **Location Services
   on**: locationd's BigSwitch is 1, its location bundles are authorized, and Weather asks "Allow Weather to use your
   location?" (no fix to give it yet: no GNSS or Wi-Fi). The speaker played as usual.
+- 2026-10-30 **boot 194 (r166 = +0350 heading, +0351/0352 mic M5/M6, taimenmic=6): the microphones hear.** M5: AFE
+  SLIMBUS_0_TX (16 bit, 1 ch, shared channel 135, 48 kHz) started (0), the codec's port 7 connected to channel 135
+  and activated (CONNECT_SRC, DEF_ACT_CHAN 0f 24 20 83, RECONFIG_NOW all acked), 2 s without overflow. M6: an ASM
+  record session (ADM 0x4001 TX copp 9, 8 reads of 20 ms through the LPASS SMMU bank) heard the speaker's 1 kHz
+  tone: quiet -64.2 dBFS; the tone 53.4 dB over quiet on DMIC0, 53.5 DMIC1, **61.8 DMIC2**, 45.6 DMIC4; 280 full
+  reads, 0 errors, 0 overflows. Compass: locationd found SweetHIDHeading ({0xff0c, 8}), set ReportInterval 20000,
+  and the kernel's reports flowed (heading 224-225 deg lying still, bias not yet: the phone never turned); after
+  "Allow While Using App" the Compass draws its dial at north and no heading: Use True North (the default) wants
+  a true heading, which needs a location fix.
