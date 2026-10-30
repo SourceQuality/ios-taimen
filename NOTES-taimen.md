@@ -1387,3 +1387,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
 - 2026-10-30 **boot 198 (r168x: 2d0f8d1 + 0357 built on macos-15 with Xcode 16.0): the defaults work** with no
   taimensensors or taimenmic boot-arg: all six streams on, M1-M4 and M7 at boot, and Voice Memos recorded through
   /dev/redwood-mic (up in 31 ms, 418,560 frames, 0 overflows).
+- 2026-10-30 **boot 199 (r169 = +0355/0356 device motion, +0357; the first macos-15 kernel from taimen; defaults;
+  SweetMetal-7efba317 with the blendable-format and anisotropy profile): the Compass works, Maps draws its labels.**
+  Compass reads "227 deg SW" with the dial turned to it: its in-process CoreMotion opened SweetHIDMotion9 ({0xff0c, 4},
+  ReportInterval 16667) and the kernel's integer Mahony fusion of the SLPI's gyro, accelerometer and magnetometer
+  streamed type-2 reports (gyro bias learned still: 15 2 -12 mrad/s; field not calibrated yet: the phone never
+  turned). Maps renders the map with its labels (NORTH AMERICA, North Pacific Ocean): the blend and anisotropy
+  refusals are gone; two draws still want a pipeline variant, and the UIKit chrome (search card, buttons) is absent.
+  Voice Memos: a 6 s recording (335,040 frames, 0 overflows) and its playback through the speaker (session 4,
+  1,142,528 frames, 0 dropped). "Configure failed" (CLDeviceMotionControl, the AppleSPU plug-in) stays: no client
+  needs it.
