@@ -1375,3 +1375,15 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   is what is missing: it adds match entries for the AOP's {0xff0c, 1}, {0xff0c, 4}, {0xff0c, 7} (and our {0xff0c, 8}),
   {0xff0c, 1} stays "not ready" and "[CLDeviceMotionControl] Configure failed". Next: emulate the AOP's
   device-motion service (attitude from the gyro, accelerometer and magnetometer) in SweetHID.
+- 2026-10-30 boot 197 (r167, taimensensors=8 taimenmic=7, what 0354 makes the default): a 13-minute soak, steady:
+  all six SLPI streams at their rates (36,937 accel samples), seven speaker sessions with 0 underflows, no panic,
+  hottest 68.3 C, one driverkitd crash. (Its Voice Memos steps never ran: Weather's location prompt stayed up.) M4
+  logged "(GPIO13 NOT configured)" from here on with the same register values as before; recordings still work.
+- 2026-10-30 **CI off macos-14.** GitHub browns the macos-14 image out every day 14:00-24:00 UTC until it retires it
+  on 2026-11-02 (actions/runner-images#13518): every build of the afternoon was cancelled. phone-tools, sweetgl and
+  sweetmtl moved to macos-15 with Xcode 16.4 (2d0f8d1); xnu needs Xcode 16's iig, which reads IORPC.kernelContent:
+  0357 adds the field, and xnu.yml runs on macos-15 too (376d497). macos-15 queues are long (capacity): rerun jobs
+  "not acquired by Runner".
+- 2026-10-30 **boot 198 (r168x: 2d0f8d1 + 0357 built on macos-15 with Xcode 16.0): the defaults work** with no
+  taimensensors or taimenmic boot-arg: all six streams on, M1-M4 and M7 at boot, and Voice Memos recorded through
+  /dev/redwood-mic (up in 31 ms, 418,560 frames, 0 overflows).
