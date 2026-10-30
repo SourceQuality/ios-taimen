@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 068d684..19faf88 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -477,12 +477,31 @@ SweetHIDOrientation::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * 0342: a motion coprocessor's events carry the sample's sensor time in a child event: CoreLocation's
++ * sensorTimeFromHidChildEvent() (CLIoHidUtils.mm, in locationd and backboardd) reads it from the first
++ * child's payload ("length == sensorTimeSize"; "Event has no children" otherwise), and an orientation
++ * without it is "stale @ 0" and dropped (boot 182, seen through oslogd). The child is vendor-defined
++ * (page 0xff0c, usage 0) with the 8-byte mach_absolute_time of the event itself.
++ */
++static void
++add_sensor_time(IOHIDEvent *e, uint64_t ts)
++{
++	IOHIDEvent *child = IOHIDEvent::vendorDefinedEvent(ts, 0xff0c, 0, 0, (UInt8 *)&ts, sizeof(ts));
++	if (child) {
++		e->appendChild(child);
++		child->release();
++	}
++}
++
+ IOHIDEvent *
+ SweetHIDOrientation::event()
+ {
+-	IOHIDEvent *e = IOHIDEvent::orientationEvent(mach_absolute_time(), kIOHIDOrientationTypeCMUsage);
++	uint64_t ts = mach_absolute_time();
++	IOHIDEvent *e = IOHIDEvent::orientationEvent(ts, kIOHIDOrientationTypeCMUsage);
+ 	if (e) {
+ 		e->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage, (SInt32)fUsage);
++		add_sensor_time(e, ts);
+ 	}
+ 	return e;
+ }
+@@ -604,8 +623,13 @@ SweetHIDAccel::start(IOService *provider)
+ IOHIDEvent *
+ SweetHIDAccel::event()
+ {
+-	return IOHIDEvent::accelerometerEvent(mach_absolute_time(), (IOFixed)(((int64_t)fMg[0] << 16) / 1000),
+-	           (IOFixed)(((int64_t)fMg[1] << 16) / 1000), (IOFixed)(((int64_t)fMg[2] << 16) / 1000));
++	uint64_t ts = mach_absolute_time();
++	IOHIDEvent *e = IOHIDEvent::accelerometerEvent(ts, (IOFixed)(((int64_t)fMg[0] << 16) / 1000),
++	    (IOFixed)(((int64_t)fMg[1] << 16) / 1000), (IOFixed)(((int64_t)fMg[2] << 16) / 1000));
++	if (e) {
++		add_sensor_time(e, ts);
++	}
++	return e;
+ }
+ 
+ void
+@@ -686,7 +710,15 @@ class SweetHIDGyro : public SweetHIDAccel {
+ protected:
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 9; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 6; }
+-	virtual IOHIDEvent *event() APPLE_KEXT_OVERRIDE { return IOHIDEvent::gyroEvent(mach_absolute_time(), 0, 0, 0); }
++	virtual IOHIDEvent *event() APPLE_KEXT_OVERRIDE
++	{
++		uint64_t ts = mach_absolute_time();
++		IOHIDEvent *e = IOHIDEvent::gyroEvent(ts, 0, 0, 0);
++		if (e) {
++			add_sensor_time(e, ts);
++		}
++		return e;
++	}
+ 	virtual IOHIDEventType eventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeGyro; }
+ };
+ OSDefineMetaClassAndStructors(SweetHIDGyro, SweetHIDAccel);
