@@ -43,6 +43,48 @@ async def pipe(r, w, key):
             pass
 
 
+def server_name(hello):
+    """the SNI host name of a TLS ClientHello record, or None"""
+    try:
+        if hello[0] != 0x16 or hello[5] != 1:
+            return None
+        p = 5 + 4 + 2 + 32                      # record and handshake headers, version, random
+        p += 1 + hello[p]                       # session id
+        p += 2 + int.from_bytes(hello[p:p + 2], 'big')  # cipher suites
+        p += 1 + hello[p]                       # compression methods
+        end = p + 2 + int.from_bytes(hello[p:p + 2], 'big')
+        p += 2
+        while p + 4 <= end:
+            kind, size = int.from_bytes(hello[p:p + 2], 'big'), int.from_bytes(hello[p + 2:p + 4], 'big')
+            p += 4
+            if kind == 0 and hello[p + 2] == 0:  # server_name, its first entry a host name
+                n = int.from_bytes(hello[p + 3:p + 5], 'big')
+                return hello[p + 5:p + 5 + n].decode('ascii')
+            p += size
+    except (IndexError, UnicodeDecodeError):
+        pass
+    return None
+
+
+async def via_ipv4(addr, port, r, w, why):
+    """A CONNECT to an IPv6 address the PC cannot reach (WSL has no IPv6 route; the phone resolves AAAA
+    records through 1.1.1.1: 228 of 235 failures on 2026-10-30). It is accepted, and the server its TLS
+    ClientHello names is reached over IPv4. Returns the upstream streams, a label and the ClientHello."""
+    w.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
+    await w.drain()
+    hello = await asyncio.wait_for(r.read(16384), 10)
+    while 5 <= len(hello) < 5 + int.from_bytes(hello[3:5], 'big'):
+        more = await asyncio.wait_for(r.read(16384), 10)
+        if not more:
+            break
+        hello += more
+    name = server_name(hello)
+    if not name:
+        raise OSError(f'{why}; no server name in its first {len(hello)} bytes')
+    ur, uw = await asyncio.wait_for(asyncio.open_connection(name, port, family=socket.AF_INET), 20)
+    return ur, uw, f'{name} (for {addr})', hello
+
+
 async def handle(head, r, w):
     """head: the app's request head, up to the blank line"""
     line, _, rest = head.partition(b'\r\n')
@@ -51,9 +93,18 @@ async def handle(head, r, w):
         if method == b'CONNECT':
             host, _, port = target.decode().rpartition(':')
             host, port = host.strip('[]'), int(port)
-            ur, uw = await asyncio.wait_for(asyncio.open_connection(host, port), 20)
-            w.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
-            await w.drain()
+            try:
+                ur, uw = await asyncio.wait_for(asyncio.open_connection(host, port), 20)
+            except OSError as e:
+                if ':' not in host:
+                    raise
+                ur, uw, host, hello = await via_ipv4(host, port, r, w, e)
+                stats['up'] += len(hello)
+                uw.write(hello)
+                await uw.drain()
+            else:
+                w.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
+                await w.drain()
         else:
             u = urllib.parse.urlsplit(target.decode())
             host, port = u.hostname, u.port or 80
