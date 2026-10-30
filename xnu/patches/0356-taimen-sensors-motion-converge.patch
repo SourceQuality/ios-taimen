@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index ddd3e99..0ff4bd3 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -1262,6 +1262,16 @@ motion_step(volatile int32_t q[4], const IOFixed w[3], uint32_t dt_us, const int
+ 	if (Um != NULL) {
+ 		int64_t e[3] = {(Um[1] * U[2] - Um[2] * U[1]) >> 14, (Um[2] * U[0] - Um[0] * U[2]) >> 14,
+ 			        (Um[0] * U[1] - Um[1] * U[0]) >> 14};
++		if (Um[0] * U[0] + Um[1] * U[1] + Um[2] * U[2] < 0) {
++			/* 0356: more than 90 degrees off, the cross product shrinks (to 0 at 180): turn at the full rate */
++			int32_t eu[3] = {0, 0, 0};
++			const int64_t px[3] = {0, Um[2], -Um[1]}, py[3] = {-Um[2], 0, Um[0]};   /* Um x x, Um x y */
++			if (unit14(e, eu) || unit14(px, eu) || unit14(py, eu)) {
++				for (int i = 0; i < 3; i++) {
++					e[i] = eu[i];
++				}
++			}
++		}
+ 		int64_t k = abs64(e[0]) + abs64(e[1]) + abs64(e[2]) > 4240 ? 16 : 4;   /* x4 for Q14 -> Q16 */
+ 		for (int i = 0; i < 3; i++) {
+ 			c[i] += e[i] * k;
+@@ -1276,6 +1286,9 @@ motion_step(volatile int32_t q[4], const IOFixed w[3], uint32_t dt_us, const int
+ 			int64_t e[3] = {(Nm[1] * N[2] - Nm[2] * N[1]) >> 14, (Nm[2] * N[0] - Nm[0] * N[2]) >> 14,
+ 				        (Nm[0] * N[1] - Nm[1] * N[0]) >> 14};
+ 			int64_t ev = (e[0] * U[0] + e[1] * U[1] + e[2] * U[2]) >> 14;    /* the yaw error, sin, Q14 */
++			if (Nm[0] * N[0] + Nm[1] * N[1] + Nm[2] * N[2] < 0) {
++				ev = ev < 0 ? -16384 : 16384;   /* 0356: more than 90 degrees off: the full rate */
++			}
+ 			int64_t k = abs64(ev) > 4240 ? 16 : 4;
+ 			for (int i = 0; i < 3; i++) {
+ 				c[i] += ((ev * U[i]) >> 14) * k;
+@@ -1378,7 +1391,7 @@ IOReturn
+ SweetHIDMotion9::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+     IOUserClient **handler)
+ {
+-	if (type != kIOHIDEventServiceUserClientType) {
++	if (type != 0x65737563u) {              /* 'esuc', kIOHIDEventServiceUserClientType (0356: no four-char constant) */
+ 		if (fRefused++ < 4) {
+ 			IOLog("TAIMEN SENSORS: %s refuses user client type %#x (CoreMotion's fast path; it reads the events)\n",
+ 			    getName(), (unsigned)type);
