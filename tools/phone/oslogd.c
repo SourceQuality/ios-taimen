@@ -10,7 +10,7 @@
  * (os_activity_stream_for_pid; entitlement com.apple.diagnosticd.diagnostic), the interface lldb's
  * debugserver used (DarwinLog). The declarations below are only the fields read here. Messages at
  * default and info level (--debug: debug too) of the processes whose executable name is in the
- * list, as "|oslog| NAME[pid] subsystem:category message". --daemon: as a KeepAlive launchd job,
+ * list, as "|oslog| NAME[pid] message". --daemon: as a KeepAlive launchd job,
  * idle forever once the stream fails instead of exiting (no restart loop).
  */
 #include <dlfcn.h>
@@ -153,11 +153,15 @@ main(int argc, char **argv)
 		if (error != 0 || e == NULL || e->type != TYPE_LOG_MESSAGE) {
 			return true;
 		}
+		/*
+		 * No subsystem:category: in iOS 16's entries those two fields are not where DarwinLog's
+		 * declaration puts them (always NULL here, and 0x10 in AegirPoster's messages, which crashed
+		 * printf: boot 185, four oslogd crashes). The formatted text and the process fields are right.
+		 */
 		char *text = copy_formatted_message(&e->log_message);
 		const char *base = e->proc_imagepath != NULL ? strrchr(e->proc_imagepath, '/') : NULL;
-		printf("|oslog| %s[%d] %s:%s %s\n", base != NULL ? base + 1 : (e->proc_imagepath ? e->proc_imagepath : "?"),
-		    e->pid, e->log_message.subsystem != NULL ? e->log_message.subsystem : "",
-		    e->log_message.category != NULL ? e->log_message.category : "", text != NULL ? text : "(null)");
+		printf("|oslog| %s[%d] %s\n", base != NULL ? base + 1 : (e->proc_imagepath ? e->proc_imagepath : "?"),
+		    e->pid, text != NULL ? text : "(null)");
 		free(text);
 		shown++;
 		return true;

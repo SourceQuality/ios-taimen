@@ -1276,3 +1276,28 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   the log (sweetlogp matches the exact executable name) and streaming every process cost diagnosticd ~150% and
   oslogd ~75% CPU: a4f59bb watches only the named processes (one process-only stream each); install it as
   /usr/local/bin/oslogd. Rotation with the still gyro (0339): still portrait.
+- 2026-10-30 **boot 182 (r158): os_log at last.** oslogd (a4f59bb as /usr/local/bin/oslogd) put 17,000 os_log lines
+  of PosterBoard, AegirPoster, locationd and backboardd into the XNU log. Rotation: backboardd and locationd take
+  0337's orientation events and decode them (3 landscape left, 4 right, 1 portrait), then "Event has no children" and
+  "Skipping stale orientation (3 @ 0)": CoreLocation's sensorTimeFromHidChildEvent() wants the sample's sensor time
+  in a child event, as the motion coprocessor sends it (0342). PosterBoard: the gallery's AegirPoster prewarm fails with
+  "Specified target process does not exist" (AegirPoster had exited), and CoreVideo says "Failed to read
+  HardwarePlatform, MG query returned NULL".
+- 2026-10-30 boot 183 (r160 = +0341 (off), +0342): the child is found now, but every orientation is "Event has no
+  timestamp", still stale @ 0. locationd's sensorTimeFromHidChildEvent (disassembled) returns the first child's 8-byte
+  payload only when the child is vendor-defined with usage page **0xff15, usage 2** (0342 sent 0xff0c/0); the caller
+  drops an orientation whose sensor time isn't past the last one. 0343 sends 0xff15/2.
+- 2026-10-30 **boot 184 (r160, taimensensors=6): sensors M4 and M5, the real accelerometer.** The SMGR census: 15
+  sensors, all answering SINGLE_SENSOR_INFO: 0x00 LSM6DSM accelerometer (max 400 Hz), 0x0a LSM6DSM gyroscope, 0x14
+  AK09915 magnetometer, 0x1e BMP280 pressure + temperature, 0x28 TMx490x proximity + ALS, 0x50 AK8789 hall effect,
+  0xf2 Elmyra raw (Active Edge), camera vsyncs, FTM4 double tap and long press, LSM6DSM activity / inactivity / step
+  detector, step count. The accelerometer streams through BUFFERING at 50.7 Hz (3,044 samples a minute, steady for
+  minutes); |a| = 10.1 at rest: Q16.16 m/s2. 0341's default axis map +y+x-z said face down (iOS z +1029 mg) for the
+  phone lying face up.
+- 2026-10-30 boot 185 (r160): taimenaccelmap=-y-x+z gives iOS z -1028 mg and "orientation now 0x69" (face up): iOS =
+  (-y, -x, +z) of SMGR (x/y signs from the same reasoning, not yet checked with a tilt). mkadt's root platform-name
+  t8015 with the MobileGestalt cache dropped: CoreVideo's "Failed to read HardwarePlatform" in PosterBoard is gone,
+  but the gallery is still drawn once (175 KB) then black (54 KB). PosterBoard's "Failed to copyDeviceTreeProperty
+  (/product display-corner-radius)" is not ours to fix (the real D22AP tree has none either). oslogd crashed four
+  times in printf: DarwinLog's subsystem/category offsets are wrong for iOS 16's entries (NULL every time, 0x10 in
+  AegirPoster's); oslogd no longer prints them.

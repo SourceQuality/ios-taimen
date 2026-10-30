@@ -365,6 +365,10 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, taimen=False):
         ('target-type', cstr(ident[2])),
         ('target-sub-type', cstr(ident[0])),
         ('manufacturer', cstr('Apple Inc.')),
+        # iBoot fills the root's platform-name (zeros in the IPSW's tree); MobileGestalt's
+        # HardwarePlatform reads it (boot 182: CoreVideo "Failed to read HardwarePlatform, MG query
+        # returned NULL" in PosterBoard). The A11 of both D20 and D22.
+        ('platform-name', cstr('t8015')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
