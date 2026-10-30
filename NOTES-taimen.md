@@ -1422,3 +1422,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   merges a backboardd entry of SWEETENV_EXTRA into the sweetgl one (f242519, 185c642: grep -v under pipefail);
   and editing WSL scripts through the Windows path had dropped their executable bit (e47ddec). The trace
   (out/maps-chrome/) is being read for the draw that covers the chrome.
+- 2026-10-30 boot 206 (r170 with its defaults, sweetgl b1defb6 built with Xcode 16.4, SweetMetal-da5dcafc): a 15-minute
+  soak with Weather's location prompt answered first: six rounds of Settings, Weather, Safari's video, Voice Memos,
+  Compass and Maps. Seven recordings through /dev/redwood-mic (up in 29-32 ms each, 0 errors, 0 overflows; up to
+  71 s), thirteen speaker sessions (0 underflows, 0 dropped), no panic, one driverkitd crash, hottest 56.9 C.
