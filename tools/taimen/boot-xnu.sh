@@ -56,7 +56,16 @@ if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 		fi
 		ROOTFIX=$SWEETGL_ROOTFIX
 	fi
-	args="sweetgpu=8 sweetgpuclk=710 taimengpucopy=1 taimengpuheap=256 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB sweetnull=backboardd ${args}"
+	# SWEETENV_EXTRA='NAME:VAR=VAL[;NAME:...]': more sweetenv entries (e.g. locationd:OS_ACTIVITY_MODE=info: with
+	# sweetlogp its os_log lines below Error reach the log too). The command line has no room for them (607
+	# bytes), so the whole sweetenv then goes to the ADT's sweet-boot-args (xnu 0309), which XNU reads for an
+	# argument the command line lacks.
+	senv="sweetenv=backboardd:DYLD_INSERT_LIBRARIES=$SWEETGL_LIB"
+	if [ -n "${SWEETENV_EXTRA:-}" ]; then
+		export TAIMEN_ADT_ARGS="${TAIMEN_ADT_ARGS:-} $senv;$SWEETENV_EXTRA"
+		senv=
+	fi
+	args="sweetgpu=8 sweetgpuclk=710 taimengpucopy=1 taimengpuheap=256 $senv sweetnull=backboardd ${args}"
 	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), RAM ${TAIMEN_BASE:-0x100000000} + $TAIMEN_MEM"
 fi
 # SHIM_WATCH=1: CPU 7 stays in the shim as a watcher (shim/taimen.c WATCH): XNU gets 7 cores, and
