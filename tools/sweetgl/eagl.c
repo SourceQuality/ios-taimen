@@ -73,7 +73,9 @@ static bool dump_shaders;       /* SWEETGL_TRACE=1: every shader source, no limi
  */
 #define WIN_SECS 30
 #define WIN_DRAWS 500
-#define WIN_TRIGGER(w, h) (((w) == 138 && (h) == 306) || ((w) == 296 && (h) == 296) || ((w) == 297 && (h) == 296))
+#define WIN_TRIGGER(w, h) (((w) == 138 && (h) == 306) || ((w) == 296 && (h) == 296) || ((w) == 297 && (h) == 296) || (trace_full && (w) >= 1080 && (h) >= 2000))
+/* SWEETGL_TRACE=full: also the panel-size composite (Maps' chrome lost under its CAMetalLayer, boots 202-203) */
+static bool trace_full;
 static int win_left;
 static time_t win_next;
 #define WTRACE(...) do { if (win_left > 0) TRACE(__VA_ARGS__); } while (0)
@@ -755,6 +757,11 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 	glGetIntegerv(GL_BLEND_SRC_ALPHA, &v[3]);
 	glGetIntegerv(GL_BLEND_DST_ALPHA, &v[4]);
 	v[10] = glIsEnabled(GL_SCISSOR_TEST);
+	v[5] = glIsEnabled(GL_DEPTH_TEST);
+	glGetIntegerv(GL_DEPTH_FUNC, &v[6]);
+	glGetIntegerv(GL_DEPTH_WRITEMASK, &v[7]);
+	v[8] = glIsEnabled(GL_STENCIL_TEST);
+	glGetIntegerv(GL_STENCIL_FUNC, &v[9]);
 	glGetBooleanv(GL_COLOR_WRITEMASK, m);
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &v[11]);
 	GLint vp[4] = {0}, sc[4] = {0};
@@ -772,8 +779,9 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &fbtex);
 	}
 	TRACE("draw prog %d samples%s into %d tex %u %u %u mode %#x n %d fb %d vp %d,%d %dx%d blend %d %#x/%#x %#x/%#x scissor %d %d,%d %dx%d "
-	    "mask %d%d%d%d", prog, samp, fbtex, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[0], vp[1], vp[2], vp[3],
-	    v[0], v[1], v[2], v[3], v[4], v[10], sc[0], sc[1], sc[2], sc[3], m[0], m[1], m[2], m[3]);
+	    "mask %d%d%d%d depth %d %#x w%d stencil %d %#x", prog, samp, fbtex, unit_held[0], unit_held[1], unit_held[2], mode, count,
+	    v[11], vp[0], vp[1], vp[2], vp[3], v[0], v[1], v[2], v[3], v[4], v[10], sc[0], sc[1], sc[2], sc[3], m[0], m[1], m[2], m[3],
+	    v[5], v[6], v[7], v[8], v[9]);
 	char line[400];
 	size_t len = 0;
 	GLint n = 0;
@@ -2470,7 +2478,8 @@ sweetgl_eagl_install(void)
 	const char *e = getenv("SWEETGL_GLERR");
 	sgl_check_errors = e && e[0] == '1';
 	const char *t = getenv("SWEETGL_TRACE");
-	trace_left = t && t[0] == '1' ? 20000 : 0;
+	trace_full = t && strcmp(t, "full") == 0;
+	trace_left = t && (t[0] == '1' || trace_full) ? 20000 : 0;
 	dump_shaders = trace_left > 0;
 	const char *f = getenv("SWEETGL_FINISH");
 	flush_waits = !(f && f[0] == '0');
