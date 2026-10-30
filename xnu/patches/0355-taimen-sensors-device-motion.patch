@@ -1,0 +1,716 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 96ad225..ddd3e99 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -22,6 +22,9 @@
+  *   SweetHIDPressure the SLPI's barometer (Sensor page 0x20 usage 0x31, kPa; 0345, taimensensors>=8)
+  *   SweetHIDProx     the SLPI's proximity (0xff00/8, Placement 1; 0345, taimensensors>=8)
+  *   SweetHIDALS      the SLPI's ambient light (0xff00/4, lux; 0345, taimensensors>=8)
++ *   SweetHIDHeading  the compass heading as the AOP reports it (0xff0c/8, CMDeviceMotionReport type 2; 0350)
++ *   SweetHIDMotion9  9-axis device motion (0xff0c/4, CMDeviceMotionReport type 2; 0355, taimensensors>=7)
++ *   SweetHIDMotion6  6-axis device motion (0xff0c/5, CMDeviceMotionReport type 3; 0355, taimensensors>=7)
+  *   SweetHIDOrientation  the device orientation as a coprocessor reports it (0337:
+  *                    Sensor page 0x20 usage 0x8A, orientation events of type
+  *                    CMUsage), derived from SweetHIDAccel's samples
+@@ -652,8 +655,8 @@ SweetHIDAccel::start(IOService *provider)
+ 		gSweetCompass = this;
+ 	} else if (eventType() == kIOHIDEventTypeAtmosphericPressure) {
+ 		gSweetPressure = this;
+-	} else if (eventType() == kIOHIDEventTypeVendorDefined) {
+-		gSweetHeading = this;
++	} else if (eventType() == kIOHIDEventTypeVendorDefined && getPrimaryUsage() == 8) {
++		gSweetHeading = this;           /* 0355: the device-motion services (usages 4 and 5) keep their own */
+ 	}
+ 	registerService();
+ 	IOLog("TAIMEN SENSORS: %s up (%#x/%u, %s)\n", getName(), (unsigned)getPrimaryUsagePage(), (unsigned)getPrimaryUsage(),
+@@ -955,6 +958,82 @@ put32(uint8_t *p, uint32_t v)
+ 	memcpy(p, &v, sizeof(v));
+ }
+ 
++/*
++ * 0355: the magnetometer's hard-iron bias, shared by the heading and device motion: the middle of each
++ * axis's range once every axis has spanned 40 uT (the phone turned around). 0350 tracked it inside the
++ * heading's report, so only while locationd streamed; now every sample counts (sweet_hid_compass_sample).
++ */
++static IOFixed gMagMin[3], gMagMax[3];
++static bool gMagSeen;
++
++static void
++mag_track(const IOFixed m[3])
++{
++	for (int i = 0; i < 3; i++) {
++		if (!gMagSeen || m[i] < gMagMin[i]) {
++			gMagMin[i] = m[i];
++		}
++		if (!gMagSeen || m[i] > gMagMax[i]) {
++			gMagMax[i] = m[i];
++		}
++	}
++	gMagSeen = true;
++}
++
++/* 0355: the bias (zero until calibrated); true once calibrated */
++static bool
++mag_bias(IOFixed b[3])
++{
++	bool calibrated = gMagSeen;
++	for (int i = 0; i < 3; i++) {
++		calibrated = calibrated && gMagMax[i] - gMagMin[i] >= (40 << 16);
++	}
++	for (int i = 0; i < 3; i++) {
++		b[i] = calibrated ? gMagMin[i] + (gMagMax[i] - gMagMin[i]) / 2 : 0;
++	}
++	return calibrated;
++}
++
++/*
++ * 0355 (0350's, factored out): the reference axes in device coordinates, Q14, from up (-accel) and a field
++ * (or any vector off the vertical): E = f x up (east), N = up x E (north, the field's horizontal part),
++ * W = U x N (west). The rows N, W, U make the rotation device -> North/West/Up. False when degenerate.
++ */
++static bool
++measured_frame(const int64_t up[3], const int64_t f[3], int32_t N[3], int32_t W[3], int32_t U[3], int32_t E[3])
++{
++	int64_t e[3], n[3];
++	e[0] = f[1] * up[2] - f[2] * up[1];
++	e[1] = f[2] * up[0] - f[0] * up[2];
++	e[2] = f[0] * up[1] - f[1] * up[0];
++	n[0] = up[1] * e[2] - up[2] * e[1];
++	n[1] = up[2] * e[0] - up[0] * e[2];
++	n[2] = up[0] * e[1] - up[1] * e[0];
++	if (!unit14(e, E) || !unit14(n, N) || !unit14(up, U)) {
++		return false;
++	}
++	W[0] = (int32_t)(((int64_t)U[1] * N[2] - (int64_t)U[2] * N[1]) / 16384);
++	W[1] = (int32_t)(((int64_t)U[2] * N[0] - (int64_t)U[0] * N[2]) / 16384);
++	W[2] = (int32_t)(((int64_t)U[0] * N[1] - (int64_t)U[1] * N[0]) / 16384);
++	return true;
++}
++
++/* 0355 (0350's): the heading in hundredths of a degree, 0..35999: the bearing of the top (+y) held within
++ * 60 degrees of flat, of the back (-z) when upright */
++static int32_t
++heading_cdeg(const int32_t N[3], const int32_t E[3], const int32_t U[3], bool *flatp)
++{
++	bool flat = 2 * abs64(U[2]) > 16384;
++	int32_t h = flat ? atan2_cdeg(E[1], N[1]) : atan2_cdeg(-(int64_t)E[2], -(int64_t)N[2]);
++	if (h < 0) {
++		h += 36000;
++	}
++	if (flatp) {
++		*flatp = flat;
++	}
++	return h;
++}
++
+ /*
+  * 0350: the compass heading. The iPhone X's locationd takes its heading ready-made, as the AOP computes it:
+  * CLCompass7 (picked by CLPlatformInfo::motionCaps bits 4/5 alone, factory at locationd 0x1006e42c8, so
+@@ -985,8 +1064,6 @@ protected:
+ 	{
+ 		return "the heading from the SLPI's magnetometer and accelerometer, CMDeviceMotionReport type 2";
+ 	}
+-	IOFixed fMin[3], fMax[3];
+-	bool fSeen;
+ 	UInt32 fReports, fLogged;
+ 	uint64_t fLoggedAt;
+ };
+@@ -1005,43 +1082,18 @@ SweetHIDHeading::event()
+ 	if (gSweetGyro && gSweetGyro->flowing()) {
+ 		gSweetGyro->latestFixed(g);
+ 	}
+-	bool calibrated = true;
+-	for (int i = 0; i < 3; i++) {
+-		if (!fSeen || m[i] < fMin[i]) {
+-			fMin[i] = m[i];
+-		}
+-		if (!fSeen || m[i] > fMax[i]) {
+-			fMax[i] = m[i];
+-		}
+-		calibrated = calibrated && fMax[i] - fMin[i] >= (40 << 16);
+-	}
+-	fSeen = true;
+-	int64_t f[3], up[3], e[3], n[3];
++	bool calibrated = mag_bias(b);  /* 0355: tracked at every sample (sweet_hid_compass_sample) */
++	int64_t f[3], up[3];
+ 	for (int i = 0; i < 3; i++) {
+-		if (calibrated) {
+-			b[i] = fMin[i] + (fMax[i] - fMin[i]) / 2;
+-		}
+ 		f[i] = ((int64_t)m[i] - b[i]) / 64;     /* uT in Q10 */
+ 		up[i] = -a[i];                          /* mg */
+ 	}
+-	e[0] = f[1] * up[2] - f[2] * up[1];
+-	e[1] = f[2] * up[0] - f[0] * up[2];
+-	e[2] = f[0] * up[1] - f[1] * up[0];
+-	n[0] = up[1] * e[2] - up[2] * e[1];
+-	n[1] = up[2] * e[0] - up[0] * e[2];
+-	n[2] = up[0] * e[1] - up[1] * e[0];
+ 	int32_t E[3], N[3], U[3], W[3];
+-	if (!unit14(e, E) || !unit14(n, N) || !unit14(up, U)) {
++	if (!measured_frame(up, f, N, W, U, E)) {
+ 		return NULL;
+ 	}
+-	W[0] = (int32_t)(((int64_t)U[1] * N[2] - (int64_t)U[2] * N[1]) / 16384);
+-	W[1] = (int32_t)(((int64_t)U[2] * N[0] - (int64_t)U[0] * N[2]) / 16384);
+-	W[2] = (int32_t)(((int64_t)U[0] * N[1] - (int64_t)U[1] * N[0]) / 16384);
+-	bool flat = 2 * abs64(U[2]) > 16384;
+-	int32_t h = flat ? atan2_cdeg(E[1], N[1]) : atan2_cdeg(-(int64_t)E[2], -(int64_t)N[2]);
+-	if (h < 0) {
+-		h += 36000;
+-	}
++	bool flat;
++	int32_t h = heading_cdeg(N, E, U, &flat);
+ 	const int32_t r[3][3] = {{N[0], N[1], N[2]}, {W[0], W[1], W[2]}, {U[0], U[1], U[2]}};
+ 	int32_t q[4];
+ 	quat14(r, q);
+@@ -1080,6 +1132,505 @@ SweetHIDHeading::event()
+ 	return ev;
+ }
+ 
++/*
++ * 0355: device motion, as the iPhone X's motion coprocessor serves it. CoreMotion runs the fusion client
++ * inside each app (boot 196: Compass[282] "Starting device motion, mode=0xf ... Starting device motion
++ * service 2", then "Service for device with usage pair {65292, 4} is not ready" for good). The same code
++ * (CoreLocation/Shared/Motion/DeviceMotion) is in locationd, where these addresses are:
++ * - CLDeviceMotion::start (0x100d05400) picks per mode, by CLPlatformInfo::motionCaps (D22's mask has bits
++ *   3, 4, 5 and 7): 9-axis modes 7/0xf/0x8f (xArbitraryCorrected, xMagneticNorth, xTrueNorth) ->
++ *   CLSensorFusionService9AxisSPU (bit 4), usage pair {0xff0c, 4}; 6-axis modes 3/0x43 (xArbitraryZVertical)
++ *   -> CLSensorFusionService6AxisSPU (bit 3), {0xff0c, 5}; gyro-only mode 2 -> 3AxisSPU (bit 7), {0xff0c, 7}
++ *   (also CLSPU's command channel, so not served here); 0x22 (the parallax) runs on the raw gyro.
++ * - CLSensorFusionServiceSPU::start (0x10017adac) sets ReportInterval (us; 16667 from the Compass app) and
++ *   takes every event in 0x10017b20c -> populateDeviceMotion (0x10017b370): IOHIDEventGetVendorDefinedData,
++ *   timestamp = the event's; the payload, memcpy'd only when its length matches its type (0x1002152fc), is
++ *   type 2 (88 bytes: the Compass layout of 0350, read as attitude + rate + user acceleration + field - bias +
++ *   heading + accuracy, mode 0xf), type 3 (52 bytes, mode 3) or type 4 (52 bytes, mode 2):
++ *     0 u8 type, 1 u16 flags, 3 u8 -, 4 u64 0, 12 f32[4] attitude x y z w, 28 f32[3] rotation rate rad/s,
++ *     40 f32[3] user acceleration g.
++ *   Flags as 0350's: bit 8 initialized, 2 gravity correction, 3 yaw correction, 4 bias estimation; the level
++ *   byte (type 2) becomes CMMagneticFieldCalibrationAccuracy (-1..2). The service's "fast path" (an extra
++ *   user client for polling) may fail: it then serves the last event's sample (0x10017b290).
++ * - CLDeviceMotion (0x100d05c74) hands service 2's samples to the 9-axis, north and (with a declination)
++ *   true-north clients, service 1's to the 6-axis ones. The attitude is device -> reference: R(q)'s rows are
++ *   the reference axes (North/X, West/Y, Up/Z) in device coordinates, gravity = -row 2.
++ * locationd's CLDeviceMotionControl "Configure failed" (a 4-byte command {2, alwaysOn, gyroController,
++ * visualLocalization} through CLSPUHIDDriverInterface: IOCreatePlugInInterfaceForService type
++ * 3BC5CC87-845E-48AB-A9C2-9436001BA68A, the AppleSPU user-client plugin) is not needed for any of this.
++ *
++ * Here: a complementary (Mahony) filter in integer math at each of the SLPI's gyro samples (50 Hz):
++ * q' = q + q (x) (0, (w + k e) dt / 2), renormalized, with e = measured up x estimated up (accelerometer
++ * within 0.8..1.2 g; k = 1/s, 4/s past 15 degrees off) plus, for 9 axes, the vertical part of measured north
++ * x estimated north (the field's horizontal part, hard-iron bias removed, 15..100 uT). The gyro bias is
++ * learned while the phone is still. Two attitudes: 9-axis (always running, yaw on magnetic north) and
++ * 6-axis (gyro and accelerometer only, its yaw restarted at 0 when a client starts it). Each service sends
++ * one report per gyro sample while streamed, at most one per 3/4 of its ReportInterval. A gyro check logs,
++ * per axis, how the gyro's rotation agrees with the accelerometer's and field's frames (100: it agrees,
++ * -100: that axis is flipped; taimengyromap= fixes the map). taimensensors>=7.
++ */
++static struct {
++	volatile int32_t q9[4], q6[4];  /* attitude x y z w, Q30, device -> reference */
++	volatile bool init9, init6, reset6;
++	volatile bool yaw9;             /* the last 9-axis step had a usable field */
++	volatile IOFixed w[3];          /* the last rotation rate, bias removed, rad/s */
++	IOFixed bias[3];                /* the gyro's bias, rad/s */
++	UInt32 still;                   /* samples the bias learned from */
++	int lastA[3];                   /* the accelerometer at the last step, mg */
++	uint64_t at;                    /* mach time of the last gyro sample */
++	int64_t turn[3];                /* the gyro check: the gyro's rotation since the last field sample, Q16 rad */
++	int64_t chkS[3], chkG[3];
++	UInt32 chkN;
++	int32_t prev[3][3];             /* the last measured frame, rows N W U, Q14 */
++	bool prevOK;
++} gMotion;
++
++/* 0355: the rows of R(q) (q Q30 x y z w), Q30: the reference axes North/X, West/Y, Up/Z in device coordinates */
++static void
++quat_rows(const int32_t q[4], int64_t r[3][3])
++{
++	int64_t x = q[0], y = q[1], z = q[2], w = q[3];
++#define M30(a, b) (((a) * (b)) >> 30)
++	r[0][0] = (1LL << 30) - 2 * (M30(y, y) + M30(z, z));
++	r[0][1] = 2 * (M30(x, y) - M30(z, w));
++	r[0][2] = 2 * (M30(x, z) + M30(y, w));
++	r[1][0] = 2 * (M30(x, y) + M30(z, w));
++	r[1][1] = (1LL << 30) - 2 * (M30(x, x) + M30(z, z));
++	r[1][2] = 2 * (M30(y, z) - M30(x, w));
++	r[2][0] = 2 * (M30(x, z) - M30(y, w));
++	r[2][1] = 2 * (M30(y, z) + M30(x, w));
++	r[2][2] = (1LL << 30) - 2 * (M30(x, x) + M30(y, y));
++#undef M30
++}
++
++/* 0355: q = v / |v| (Q30); false for a zero vector */
++static bool
++quat_norm30(const int64_t v[4], volatile int32_t q[4])
++{
++	uint64_t n2 = 0;
++	for (int i = 0; i < 4; i++) {
++		n2 += (uint64_t)(v[i] * v[i]);
++	}
++	int64_t n = (int64_t)hid_isqrt(n2);
++	if (n == 0) {
++		return false;
++	}
++	for (int i = 0; i < 4; i++) {
++		q[i] = (int32_t)(v[i] * (1LL << 30) / n);
++	}
++	return true;
++}
++
++/* 0355: an attitude straight from up (mg) and a field (Q10 uT), or with none, yaw 0 on the device's x (y if x is vertical) */
++static bool
++motion_init(volatile int32_t q[4], const int64_t up[3], const int64_t *f)
++{
++	int64_t axis[3] = {1024, 0, 0};
++	if (f == NULL) {
++		uint64_t len = hid_isqrt((uint64_t)(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]));
++		if (10 * (uint64_t)abs64(up[0]) > 9 * len) {
++			axis[0] = 0;
++			axis[1] = 1024;
++		}
++		f = axis;
++	}
++	int32_t N[3], W[3], U[3], E[3], q14[4];
++	if (!measured_frame(up, f, N, W, U, E)) {
++		return false;
++	}
++	const int32_t r[3][3] = {{N[0], N[1], N[2]}, {W[0], W[1], W[2]}, {U[0], U[1], U[2]}};
++	quat14(r, q14);
++	const int64_t v[4] = {(int64_t)q14[0] * 65536, (int64_t)q14[1] * 65536, (int64_t)q14[2] * 65536, (int64_t)q14[3] * 65536};
++	return quat_norm30(v, q);
++}
++
++/*
++ * 0355: one filter step: w the rotation rate (rad/s, Q16), Um the measured up (Q14) or NULL, f the field
++ * (Q10 uT, bias removed) or NULL; true when the field corrected the yaw.
++ */
++static bool
++motion_step(volatile int32_t q[4], const IOFixed w[3], uint32_t dt_us, const int32_t *Um, const int64_t *f)
++{
++	const int32_t qq[4] = {q[0], q[1], q[2], q[3]};
++	int64_t r[3][3];
++	quat_rows(qq, r);
++	int64_t N[3], U[3], c[3] = {0, 0, 0};   /* Q14; the correction, rad/s Q16 */
++	for (int i = 0; i < 3; i++) {
++		N[i] = r[0][i] >> 16;
++		U[i] = r[2][i] >> 16;
++	}
++	if (Um != NULL) {
++		int64_t e[3] = {(Um[1] * U[2] - Um[2] * U[1]) >> 14, (Um[2] * U[0] - Um[0] * U[2]) >> 14,
++			        (Um[0] * U[1] - Um[1] * U[0]) >> 14};
++		int64_t k = abs64(e[0]) + abs64(e[1]) + abs64(e[2]) > 4240 ? 16 : 4;   /* x4 for Q14 -> Q16 */
++		for (int i = 0; i < 3; i++) {
++			c[i] += e[i] * k;
++		}
++	}
++	bool yaw = false;
++	if (f != NULL) {
++		int64_t em[3] = {f[1] * U[2] - f[2] * U[1], f[2] * U[0] - f[0] * U[2], f[0] * U[1] - f[1] * U[0]};
++		int64_t nm[3] = {U[1] * em[2] - U[2] * em[1], U[2] * em[0] - U[0] * em[2], U[0] * em[1] - U[1] * em[0]};
++		int32_t Nm[3];
++		if (unit14(nm, Nm)) {
++			int64_t e[3] = {(Nm[1] * N[2] - Nm[2] * N[1]) >> 14, (Nm[2] * N[0] - Nm[0] * N[2]) >> 14,
++				        (Nm[0] * N[1] - Nm[1] * N[0]) >> 14};
++			int64_t ev = (e[0] * U[0] + e[1] * U[1] + e[2] * U[2]) >> 14;    /* the yaw error, sin, Q14 */
++			int64_t k = abs64(ev) > 4240 ? 16 : 4;
++			for (int i = 0; i < 3; i++) {
++				c[i] += ((ev * U[i]) >> 14) * k;
++			}
++			yaw = true;
++		}
++	}
++	int64_t h[3];                           /* half the turn, Q30 */
++	for (int i = 0; i < 3; i++) {
++		h[i] = ((int64_t)w[i] + c[i]) * dt_us * 8192 / 1000000;
++	}
++	const int64_t x = qq[0], y = qq[1], z = qq[2], s = qq[3];
++	const int64_t v[4] = {
++		x + ((s * h[0] + y * h[2] - z * h[1]) >> 30),
++		y + ((s * h[1] + z * h[0] - x * h[2]) >> 30),
++		z + ((s * h[2] + x * h[1] - y * h[0]) >> 30),
++		s - ((x * h[0] + y * h[1] + z * h[2]) >> 30),
++	};
++	quat_norm30(v, q);
++	return yaw;
++}
++
++/*
++ * 0355: the device-motion services: {0xff0c, 4} sends 88-byte type 2 reports from the 9-axis attitude,
++ * {0xff0c, 5} (SweetHIDMotion6) 52-byte type 3 reports from the 6-axis one.
++ */
++class SweetHIDMotion9 : public SweetHIDAccel {
++	OSDeclareDefaultStructors(SweetHIDMotion9);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	void motionTick();
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff0c; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 4; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 12; }
++	virtual IOHIDEvent *event() APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEventType eventType() APPLE_KEXT_OVERRIDE { return kIOHIDEventTypeVendorDefined; }
++	virtual int minLevel() APPLE_KEXT_OVERRIDE { return 7; }
++	virtual bool synthesizes() APPLE_KEXT_OVERRIDE { return false; }
++	virtual const char *describe() APPLE_KEXT_OVERRIDE
++	{
++		return "9-axis device motion (gyro, accelerometer, field; magnetic north), CMDeviceMotionReport type 2";
++	}
++	virtual bool nine() { return true; }
++	uint64_t fLastAt, fLoggedAt;
++	UInt32 fReports, fLogged, fRefused;
++};
++OSDefineMetaClassAndStructors(SweetHIDMotion9, SweetHIDAccel);
++
++class SweetHIDMotion6 : public SweetHIDMotion9 {
++	OSDeclareDefaultStructors(SweetHIDMotion6);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 5; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 13; }
++	virtual const char *describe() APPLE_KEXT_OVERRIDE
++	{
++		return "6-axis device motion (gyro, accelerometer; arbitrary yaw), CMDeviceMotionReport type 3";
++	}
++	virtual bool nine() APPLE_KEXT_OVERRIDE { return false; }
++};
++OSDefineMetaClassAndStructors(SweetHIDMotion6, SweetHIDMotion9);
++
++static SweetHIDMotion9 *gSweetMotion9, *gSweetMotion6;
++
++bool
++SweetHIDMotion9::start(IOService *provider)
++{
++	if (!SweetHIDAccel::start(provider)) {
++		return false;
++	}
++	if (nine()) {
++		gSweetMotion9 = this;
++	} else {
++		gSweetMotion6 = this;
++	}
++	return true;
++}
++
++IOReturn
++SweetHIDMotion9::setProperties(OSObject *properties)
++{
++	UInt32 was = fIntervalUS;
++	IOReturn ret = SweetHIDAccel::setProperties(properties);
++	if ((was == 0) != (fIntervalUS == 0)) {
++		if (fIntervalUS != 0 && !nine()) {
++			gMotion.reset6 = true;  /* a new 6-axis session: yaw 0 where the phone points now */
++		}
++		fLogged = 0;
++		IOLog("TAIMEN SENSORS: %s %s (every %u us; %s)\n", getName(), fIntervalUS ? "streams" : "stops", fIntervalUS,
++		    gMotion.init9 ? "attitude ready" : "no attitude yet: no accelerometer or gyro samples");
++	}
++	return ret;
++}
++
++/* 0355: only the event user client: CoreMotion's fast path (another type) then fails and it uses the events */
++IOReturn
++SweetHIDMotion9::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++    IOUserClient **handler)
++{
++	if (type != kIOHIDEventServiceUserClientType) {
++		if (fRefused++ < 4) {
++			IOLog("TAIMEN SENSORS: %s refuses user client type %#x (CoreMotion's fast path; it reads the events)\n",
++			    getName(), (unsigned)type);
++		}
++		return kIOReturnUnsupported;
++	}
++	return SweetHIDAccel::newUserClient(owningTask, securityID, type, properties, handler);
++}
++
++/* 0355: after each filter step: a report while streamed, at most one per 3/4 of the ReportInterval */
++void
++SweetHIDMotion9::motionTick()
++{
++	uint64_t now = mach_absolute_time(), gap;
++	fRealAt = now;
++	UInt32 us = fIntervalUS;
++	if (us == 0) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)us * 750, &gap);
++	if (fLastAt != 0 && now - fLastAt < gap) {
++		return;
++	}
++	fLastAt = now;
++	IOHIDEvent *e = event();
++	if (e) {
++		dispatchEvent(e);
++		e->release();
++		fSent++;
++	}
++}
++
++IOHIDEvent *
++SweetHIDMotion9::event()
++{
++	bool nine9 = nine();
++	if (!(nine9 ? gMotion.init9 : gMotion.init6)) {
++		return NULL;
++	}
++	int32_t q[4];
++	for (int i = 0; i < 4; i++) {
++		q[i] = nine9 ? gMotion.q9[i] : gMotion.q6[i];
++	}
++	int64_t r[3][3];
++	quat_rows(q, r);
++	int32_t N[3], U[3], E[3];
++	for (int i = 0; i < 3; i++) {
++		N[i] = (int32_t)(r[0][i] >> 16);
++		E[i] = (int32_t)(-r[1][i] >> 16);
++		U[i] = (int32_t)(r[2][i] >> 16);
++	}
++	int a[3] = {0, 0, -1000};
++	if (gSweetAccel) {
++		gSweetAccel->latestMg(a);
++	}
++	IOFixed w[3] = {gMotion.w[0], gMotion.w[1], gMotion.w[2]};
++	unsigned flags = 0x0104 | (gMotion.still >= 50 ? 0x10 : 0);     /* initialized, gravity (+ bias estimation) */
++	uint8_t rep[88];
++	bzero(rep, sizeof(rep));
++	UInt32 len, qo, ro, uo;
++	IOFixed m[3] = {0, 0, 0}, b[3];
++	bool cal = mag_bias(b), flat = true;
++	int32_t h = 0;
++	if (nine9) {
++		if (gSweetCompass) {
++			gSweetCompass->latestFixed(m);
++		}
++		if (gMotion.yaw9) {
++			flags |= 0x08;                  /* yaw correction */
++		}
++		h = heading_cdeg(N, E, U, &flat);
++		rep[0] = 2;
++		rep[1] = (uint8_t)(cal ? 2 : 1);    /* CMMagneticFieldCalibrationAccuracy high / medium */
++		rep[2] = (uint8_t)flags;
++		rep[3] = (uint8_t)(flags >> 8);
++		put32(rep + 12, f32_bits(-1, 0));
++		for (int i = 0; i < 3; i++) {
++			put32(rep + 16 + 4 * i, f32_bits(m[i], 16));
++			put32(rep + 76 + 4 * i, f32_bits(b[i], 16));
++		}
++		put32(rep + 68, f32_bits((int64_t)h * 256 / 100, 8));
++		put32(rep + 72, f32_bits(cal ? 15 : 30, 0));
++		len = 88;
++		qo = 28;
++		ro = 44;
++		uo = 56;
++	} else {
++		rep[0] = 3;
++		rep[1] = (uint8_t)flags;
++		rep[2] = (uint8_t)(flags >> 8);
++		len = 52;
++		qo = 12;
++		ro = 28;
++		uo = 40;
++	}
++	for (int i = 0; i < 4; i++) {
++		put32(rep + qo + 4 * i, f32_bits(q[i], 30));
++	}
++	int32_t ua[3];
++	for (int i = 0; i < 3; i++) {
++		ua[i] = (int32_t)((int64_t)a[i] * 16384 / 1000 + U[i]);   /* user acceleration = accel - gravity, gravity = -up; g Q14 */
++		put32(rep + ro + 4 * i, f32_bits(w[i], 16));
++		put32(rep + uo + 4 * i, f32_bits(ua[i], 14));
++	}
++	uint64_t ts = mach_absolute_time(), minute;
++	IOHIDEvent *ev = IOHIDEvent::vendorDefinedEvent(ts, 0xff0c, getPrimaryUsage(), 0, rep, len);
++	fReports++;
++	nanoseconds_to_absolutetime(60 * NSEC_PER_SEC, &minute);
++	if (fLogged < 3 || ts - fLoggedAt > minute) {
++		fLogged++;
++		fLoggedAt = ts;
++		char chk[96] = "no turns yet";
++		if (gMotion.chkN != 0) {
++			int pc[3];
++			for (int i = 0; i < 3; i++) {
++				pc[i] = gMotion.chkG[i] > 0 ? (int)(gMotion.chkS[i] * 100 / gMotion.chkG[i]) : 0;
++			}
++			snprintf(chk, sizeof(chk), "x %d y %d z %d over %u turns", pc[0], pc[1], pc[2], gMotion.chkN);
++		}
++		IOLog("TAIMEN SENSORS: %s report %u (type %u): q %d %d %d %d /16384, heading %d.%02d (%s, field %s), "
++		    "up %d %d %d /16384, rate %d %d %d mrad/s, user accel %d %d %d mg, gyro bias %d %d %d mrad/s "
++		    "(still %u), gyro check %s\n", getName(), fReports, (unsigned)rep[0], q[0] >> 16, q[1] >> 16, q[2] >> 16, q[3] >> 16,
++		    h / 100, h % 100, nine9 ? (flat ? "flat: the top" : "upright: the back") : "6-axis: none",
++		    nine9 ? (cal ? "calibrated" : "not calibrated yet") : "unused", U[0], U[1], U[2],
++		    (int)((int64_t)w[0] * 1000 / 65536), (int)((int64_t)w[1] * 1000 / 65536), (int)((int64_t)w[2] * 1000 / 65536),
++		    ua[0] * 1000 / 16384, ua[1] * 1000 / 16384, ua[2] * 1000 / 16384,
++		    (int)((int64_t)gMotion.bias[0] * 1000 / 65536), (int)((int64_t)gMotion.bias[1] * 1000 / 65536),
++		    (int)((int64_t)gMotion.bias[2] * 1000 / 65536), gMotion.still, chk);
++	}
++	return ev;
++}
++
++/* 0355: a gyro sample (IOFixed rad/s): one step of both attitudes, then the reports */
++static void
++motion_gyro(IOFixed gx, IOFixed gy, IOFixed gz)
++{
++	uint64_t now = mach_absolute_time(), ns = 20 * NSEC_PER_MSEC;
++	if (gMotion.at != 0) {
++		absolutetime_to_nanoseconds(now - gMotion.at, &ns);
++	}
++	gMotion.at = now;
++	uint32_t dt_us = (uint32_t)(ns / 1000 > 40000 ? 40000 : ns / 1000);
++	if (!gSweetAccel || !gSweetAccel->flowing()) {
++		return;                         /* no tilt reference: no device motion */
++	}
++	int a[3];
++	gSweetAccel->latestMg(a);
++	const IOFixed raw[3] = {gx, gy, gz};
++	bool still = true;
++	for (int i = 0; i < 3; i++) {
++		still = still && abs64((int64_t)raw[i] - gMotion.bias[i]) < 3932 && abs64(a[i] - gMotion.lastA[i]) < 25;
++	}
++	IOFixed w[3];
++	for (int i = 0; i < 3; i++) {
++		if (still) {
++			gMotion.bias[i] += (raw[i] - gMotion.bias[i]) / 32;      /* 0.06 rad/s and 25 mg: still */
++		}
++		w[i] = raw[i] - gMotion.bias[i];
++		gMotion.w[i] = w[i];
++		gMotion.lastA[i] = a[i];
++		gMotion.turn[i] += (int64_t)w[i] * dt_us / 1000000;
++	}
++	if (still) {
++		gMotion.still++;
++	}
++	int64_t up[3] = {-a[0], -a[1], -a[2]};
++	uint64_t g = hid_isqrt((uint64_t)(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]));
++	int32_t Um[3];
++	bool tilt = g > 800 && g < 1200 && unit14(up, Um);
++	IOFixed m[3] = {0, 0, 0}, b[3] = {0, 0, 0};
++	int64_t f[3] = {0, 0, 0};
++	bool field = gSweetCompass && gSweetCompass->flowing();
++	if (field) {
++		gSweetCompass->latestFixed(m);
++		mag_bias(b);
++		for (int i = 0; i < 3; i++) {
++			f[i] = ((int64_t)m[i] - b[i]) / 64;     /* uT in Q10 */
++		}
++		uint64_t ut = hid_isqrt((uint64_t)(f[0] * f[0] + f[1] * f[1] + f[2] * f[2])) / 1024;
++		field = ut >= 15 && ut <= 100;
++	}
++	if (tilt && !gMotion.init9) {
++		gMotion.init9 = motion_init(gMotion.q9, up, field ? f : NULL);
++	} else if (gMotion.init9) {
++		gMotion.yaw9 = motion_step(gMotion.q9, w, dt_us, tilt ? Um : NULL, field ? f : NULL);
++	}
++	if (tilt && (!gMotion.init6 || gMotion.reset6)) {
++		gMotion.reset6 = false;
++		gMotion.init6 = motion_init(gMotion.q6, up, NULL);
++	} else if (gMotion.init6) {
++		motion_step(gMotion.q6, w, dt_us, tilt ? Um : NULL, NULL);
++	}
++	if (gSweetMotion9) {
++		gSweetMotion9->motionTick();
++	}
++	if (gSweetMotion6) {
++		gSweetMotion6->motionTick();
++	}
++}
++
++/*
++ * 0355: a field sample: the gyro check. The frame measured from the accelerometer and field turns by
++ * dR = D' D^T (D's columns the reference axes in device coordinates; dD/dt = -[w]x D), so its turn is
++ * x = (dR12 - dR21) / 2, y = (dR20 - dR02) / 2, z = (dR01 - dR10) / 2; against the gyro's turn over the
++ * same time, while turning faster than about 0.5 rad/s and near 1 g.
++ */
++static void
++motion_field(const IOFixed m[3])
++{
++	int a[3];
++	if (!gSweetAccel || !gSweetAccel->flowing()) {
++		gMotion.prevOK = false;
++		return;
++	}
++	gSweetAccel->latestMg(a);
++	int64_t up[3] = {-a[0], -a[1], -a[2]}, f[3];
++	IOFixed b[3];
++	mag_bias(b);
++	for (int i = 0; i < 3; i++) {
++		f[i] = ((int64_t)m[i] - b[i]) / 64;
++	}
++	uint64_t g = hid_isqrt((uint64_t)(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]));
++	int32_t N[3], W[3], U[3], E[3];
++	int64_t turn[3] = {gMotion.turn[0], gMotion.turn[1], gMotion.turn[2]};
++	gMotion.turn[0] = gMotion.turn[1] = gMotion.turn[2] = 0;
++	if (g < 900 || g > 1100 || !measured_frame(up, f, N, W, U, E)) {
++		gMotion.prevOK = false;
++		return;
++	}
++	if (gMotion.prevOK && abs64(turn[0]) + abs64(turn[1]) + abs64(turn[2]) > 655) {   /* 0.01 rad */
++		int64_t d[3][3];
++		for (int i = 0; i < 3; i++) {
++			for (int j = 0; j < 3; j++) {
++				d[i][j] = (int64_t)N[i] * gMotion.prev[0][j] + (int64_t)W[i] * gMotion.prev[1][j] +
++				    (int64_t)U[i] * gMotion.prev[2][j];     /* Q28 */
++			}
++		}
++		const int64_t obs[3] = {(d[1][2] - d[2][1]) >> 13, (d[2][0] - d[0][2]) >> 13, (d[0][1] - d[1][0]) >> 13};
++		for (int i = 0; i < 3; i++) {
++			gMotion.chkS[i] += turn[i] * obs[i];
++			gMotion.chkG[i] += turn[i] * turn[i];
++		}
++		gMotion.chkN++;
++	}
++	for (int i = 0; i < 3; i++) {
++		gMotion.prev[0][i] = N[i];
++		gMotion.prev[1][i] = W[i];
++		gMotion.prev[2][i] = U[i];
++	}
++	gMotion.prevOK = true;
++}
++
+ /*
+  * 0345: the barometer, as locationd's CLPressure opens it: usage pair {0x20, 0x31} (Sensor page,
+  * Environmental: Atmospheric Pressure; locationd 0x101431558), kIOHIDEventTypeAtmosphericPressure events
+@@ -1656,6 +2207,9 @@ sweet_hid_gyro_sample(int x, int y, int z)
+ 		return 0;
+ 	}
+ 	gSweetGyro->realFixed(x, y, z);
++	if (gSweetMotion9 || gSweetMotion6) {
++		motion_gyro(x, y, z);           /* 0355: device motion at each gyro sample */
++	}
+ 	return 1;
+ }
+ 
+@@ -1666,7 +2220,12 @@ sweet_hid_compass_sample(int x, int y, int z)
+ 	if (!gSweetCompass) {
+ 		return 0;
+ 	}
++	const IOFixed m[3] = {x, y, z};
++	mag_track(m);                           /* 0355: the hard-iron bias from every sample */
+ 	gSweetCompass->realFixed(x, y, z);
++	if (gSweetMotion9) {
++		motion_field(m);                /* 0355: the gyro check */
++	}
+ 	if (gSweetHeading) {
+ 		gSweetHeading->realFixed(x, y, z);      /* 0350: a heading at each field sample */
+ 	}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 086ad24..4f957f5 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -108,6 +108,16 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDHeading;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDMotion9;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDMotion9;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDMotion6;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDMotion6;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDPressure;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDPressure;"
