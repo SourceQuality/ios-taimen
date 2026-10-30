@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 21c33df..2bc8627 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1307,6 +1307,18 @@ taimen_present_scaled(const uint8_t *rec, uint32_t mask, uintptr_t panel, uint32
+ 		return false;
+ 	}
+ 	uint32_t id = get32(rec, 0x54);
++	/*
++	 * 0360: only layer 0 is shown here. CoreAnimation puts a detached full-screen layer (a CAMetalLayer's drawable)
++	 * on layer 0 and its composite of everything else on layer 1: Maps lost its status bar and chrome that way
++	 * (boots 202-206) until sweetgl set CA_DISABLE_DETACHED=1. Say so when another layer turns up.
++	 */
++	if (mask & ~1u) {
++		static unsigned extra;
++		if (extra++ < 10) {
++			IOLog("TAIMEN SCALE: swap %u mask 0x%x: only layer 0 is shown (surfaces %u %u %u %u)\n", get32(rec, 0x50),
++			    mask, id, get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60));
++		}
++	}
+ 	SweetSurface *s = (mask & 1u) && id ? sweet_surface_copy(id) : NULL;
+ 	if (s == NULL || s->width != TAIMEN_CANVAS_W || s->height != TAIMEN_CANVAS_H || s->kernelAddress() == 0 ||
+ 	    (s->bytesPerElement != 4 && s->bytesPerElement != 0) ||
