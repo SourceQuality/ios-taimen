@@ -1463,3 +1463,14 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   PhoneRootViewController appeared, AVConferencePreview set its front video layer: camera Invalid, no camera;
   Supports Front/Back Camera: NO) and then goes quiet; the screen stays black but for the status bar, the scan
   buffer too (FBRAM row 1440 sum 0). Next: sample its threads (sweetsample=FaceTime).
+- 2026-10-30 boot 212 (r173 = +0361, SweetMetal-ed8f80b's build, sweetsample=FaceTime every 20 s): FaceTime black again.
+  The sampler showed its t0 frozen in dyld's start (forEachLoadCommand under loadDependents) in all 38 samples while
+  the app logged its whole UI lifecycle and used no CPU: the samples repeat the state of the first one, taken during
+  the launch, so they say nothing about the black screen. FaceTime parked (no camera, cellular or Apple ID here
+  anyway). The boot scripts' stdout reaches the PC only when they end (tr buffers it): a READY line cannot be
+  waited for, so the hand-driven scripts touch OUT/ready (boots 209 and 212 lost their hand windows to this).
+- 2026-10-30 **boot 213 (r173, the attachment fix ed8f80b): Look Around works.** Maps opens at the Ferry Building; its
+  Look Around preview shows the street imagery, full screen too (the Bay Bridge, a ferry, The Embarcadero), and a
+  swipe turns the view. The attachment refusals are gone; what is left is 32 render pipelines that read the
+  framebuffer in a multisampled pass (storage form: SampleRateShading, and the runtime's "attachments read as storage
+  images"), and Look Around's round overview map stays a black disc.
