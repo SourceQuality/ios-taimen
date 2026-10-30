@@ -17,7 +17,7 @@ use crate::pipeline::{spec_merge, spec_of, ComputePipelineState, DepthStencilSta
 use crate::resource::{sg_box, vk_format, Buffer, Origin, SgTexture, Texture};
 use crate::sync::Fence;
 use metal2vulkan::bind::{BindState, Dispatch, DrawCall, IndexBufferRef};
-use metal2vulkan::metal::{CullMode, IndexType, PrimitiveType, RenderStages, TextureType, TextureUsage, TriangleFillMode, Winding};
+use metal2vulkan::metal::{CullMode, IndexType, PrimitiveType, RenderStages, TextureType, TriangleFillMode, Winding};
 use metal2vulkan::pipeline::Stage;
 use metal2vulkan::vk;
 use std::ops::Range;
@@ -502,9 +502,10 @@ pub struct RenderCommandEncoder {
 
 fn attachment(texture: &Texture, level: u64, slice: u64, depth_plane: u64, load: LoadAction, clear: [f64; 4],
               keep: &mut Vec<Arc<SgTexture>>) -> Result<(ffi::sg_attachment, u32, u32, u32, u32), Error> {
-    if !texture.usage().contains(TextureUsage::RENDER_TARGET) {
-        return Err(invalid("an attachment without MTLTextureUsageRenderTarget"));
-    }
+    // A texture without MTLTextureUsageRenderTarget is still an attachment: only Metal's validation layer refuses it,
+    // and Maps renders into such textures (boot 211: its Look Around thumbnail stayed black while 12 command buffers
+    // were refused). The shim makes every uncompressed texture a render target or depth/stencil one (sg_resource.c,
+    // for blits), and a format that cannot render is refused where its surface is made.
     let layer = if texture.texture_type() == TextureType::Type3D { depth_plane } else { slice };
     let (l, s) = texture.image_level_slice(level, if texture.texture_type() == TextureType::Type3D { 0 } else { layer })?;
     let s = if texture.texture_type() == TextureType::Type3D { u32_of(depth_plane, "depth plane")? } else { s };
