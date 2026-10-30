@@ -1,0 +1,290 @@
+diff --git a/bsd/dev/taimen_slim.c b/bsd/dev/taimen_slim.c
+index bd9989b..8acd9a7 100644
+--- a/bsd/dev/taimen_slim.c
++++ b/bsd/dev/taimen_slim.c
+@@ -32,6 +32,7 @@ extern void sweet_spi_mask(uint32_t intid, bool masked);      /* pexpert/arm/pe_
+ typedef void (*taimen_slim_idle_t)(void);
+ bool taimen_slim_up(taimen_slim_idle_t idle);
+ bool taimen_slim_ready(void);
++int taimen_slim_addr_query(const uint8_t ea[6], unsigned tries, uint8_t *la, unsigned *used);
+ void taimen_mic_msleep(unsigned ms);
+ uint64_t taimen_mic_now_ms(void);
+ 
+@@ -87,6 +88,7 @@ static vm_offset_t slim_base, ngd;
+ static uint32_t slim_ver;
+ static bool ngd_up, slim_dead;
+ static taimen_slim_idle_t slim_idle;
++static uint8_t next_tid;
+ static int want_mc = -1;                /* the reply in flight: its MC (-1: none) and TID */
+ static uint8_t want_tid;
+ static bool got;
+@@ -266,6 +268,39 @@ tx(const uint8_t *m, unsigned rl)
+ 	return 0;
+ }
+ 
++/* Send and, for reply_mc >= 0, wait for the reply with that MC and TID. */
++static int
++xfer(const uint8_t *m, unsigned rl, int reply_mc, uint8_t tid, unsigned wait_ms)
++{
++	int err;
++	unsigned spins = 0;
++	uint64_t t;
++
++	want_mc = reply_mc;
++	want_tid = tid;
++	got = false;
++	err = tx(m, rl);
++	if (err != 0 || reply_mc < 0) {
++		want_mc = -1;
++		return err;
++	}
++	t = taimen_mic_now_ms();
++	while (!got) {
++		if (since(t) >= wait_ms) {
++			want_mc = -1;
++			n_timeouts++;
++			return ETIMEDOUT;
++		}
++		if ((ngd_r(NGD_INT_STAT) & INT_RX_RCVD) != 0) {
++			rx_drain();
++			continue;
++		}
++		step(&spins);
++	}
++	want_mc = -1;
++	return 0;
++}
++
+ static unsigned
+ hdr(uint8_t *m, unsigned mt, unsigned mc, uint8_t la, unsigned payload)
+ {
+@@ -276,6 +311,12 @@ hdr(uint8_t *m, unsigned mt, unsigned mc, uint8_t la, unsigned payload)
+ 	return rl;
+ }
+ 
++static uint8_t
++tid_new(void)
++{
++	return next_tid++;
++}
++
+ bool
+ taimen_slim_ready(void)
+ {
+@@ -387,4 +428,44 @@ taimen_slim_up(taimen_slim_idle_t idle)
+ 	    cap_buf[4], cap_buf[5], cap_buf[6], cap_buf[7], n != 0 ? " after NACKs" : "");
+ 	return true;
+ }
++
++/*
++ * ADDR_QUERY for an enumeration address: the manager's ADDR_REPLY carries the EA back (all zero:
++ * not present) and the logical address (WH ngd_get_laddr, ngd_slim_rx). 0 with *la, ENXIO absent.
++ */
++int
++taimen_slim_addr_query(const uint8_t ea[6], unsigned tries, uint8_t *la, unsigned *used)
++{
++	static const uint8_t zero[6] = {0, 0, 0, 0, 0, 0};
++	uint8_t m[12];
++	unsigned i;
++	int err = ETIMEDOUT;
++
++	*la = 0xFF;
++	for (i = 0; i < tries; i++) {
++		uint8_t tid = tid_new();
++		unsigned rl = hdr(m, MT_DEST_USER, MC_ADDR_QUERY, LA_MGR, 7);
++		m[3] = tid;
++		memcpy(m + 4, ea, 6);
++		err = xfer(m, rl, (int)MC_ADDR_REPLY, tid, ADDR_WAIT_MS);
++		if (err == 0) {
++			if (got_rl >= 11 && memcmp(got_buf + 4, zero, 6) != 0) {
++				if (memcmp(got_buf + 4, ea, 6) != 0) {
++					LOG("2: ADDR_REPLY tid %u names %02x %02x %02x %02x %02x %02x", tid, got_buf[4], got_buf[5],
++					    got_buf[6], got_buf[7], got_buf[8], got_buf[9]);
++				}
++				*la = got_buf[10];
++				*used = i + 1;
++				return 0;
++			}
++			err = ENXIO;
++		}
++		if (slim_dead || err == ENODEV) {
++			break;
++		}
++		taimen_mic_msleep(20);
++	}
++	*used = i;
++	return err;
++}
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/bsd/dev/taimen_wcd934x.c b/bsd/dev/taimen_wcd934x.c
+index 93c37e7..85fa9ca 100644
+--- a/bsd/dev/taimen_wcd934x.c
++++ b/bsd/dev/taimen_wcd934x.c
+@@ -7,6 +7,9 @@
+  * changes; the interface device's port registers are elements 0x800 + reg, unpaged (LA 0xCE).
+  *   census (taimenmic>=1)  TLMM gpio64 (codec reset), gpio54 (codec IRQ), PM8998 GPIO13 (MCLK out):
+  *                          read only
++ *   M2 (taimenmic>=2)      gpio64 low 20 ms, high 20 ms (taimenmicrst=0: no low pulse if it is
++ *                          already high); ADDR_QUERY for the generic and interface devices and the
++ *                          absent WCD9335 (a negative control)
+  * Call from the audio thread, after taimen_slim_up.
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+@@ -19,7 +22,10 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern int taimen_slim_addr_query(const uint8_t ea[6], unsigned tries, uint8_t *la, unsigned *used);
++extern void taimen_mic_msleep(unsigned ms);
+ void taimen_wcd_census(void);
++bool taimen_wcd_m2(void);
+ 
+ #define LOG(fmt, ...)           printf("TAIMEN MIC: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -27,9 +33,14 @@ void taimen_wcd_census(void);
+ #define CDC_RST_GPIO            64u             /* qcom,cdc-rst-n-gpio (live.dts cdc_reset_ctrl) */
+ #define CDC_IRQ_GPIO            54u             /* wcd9xxx-irq, qcom,gpio-connect */
+ #define TLMM_OE                 (1u << 9)
++#define RST_ACTIVE              0x3C1u          /* OE, 16 mA, function 0, pull-down: cdc_reset_active */
++#define RST_SLEEP               0x3C0u          /* OE, 16 mA, function 0, no pull: cdc_reset_sleep */
+ #define MCLK_PPID               0x0CCu          /* PM8998 GPIO 13, SPMI 0xCC00 (live.dts gpio@cc00) */
+ 
++#define LA_NONE                 0xFFu
++
+ static vm_offset_t rst_pin;
++static uint8_t la_gen = LA_NONE, la_ifd = LA_NONE;
+ 
+ struct pmg {                    /* PM8998 GPIO: subtype, mode, vin, pull, LV/MV source, out, enable */
+ 	uint8_t sub, mode, vin, pull, src, out, en;
+@@ -42,6 +53,14 @@ rd32(vm_offset_t a)
+ 	return *(volatile uint32_t *)a;
+ }
+ 
++static void
++wr32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ static void
+ pmg_read(struct pmg *g)
+ {
+@@ -72,4 +91,75 @@ taimen_wcd_census(void)
+ 	    "pull %#x src %#x out %#x en %#x", rd32(rst_pin), rd32(rst_pin + 4), rd32(irq), rd32(irq + 4),
+ 	    g.ok ? "" : " (SPMI READ FAILED)", g.sub, g.mode, g.vin, g.pull, g.src, g.out, g.en);
+ }
++
++/* ---- M2: reset and logical addresses ---- */
++
++static const struct {
++	const char *name;
++	uint8_t ea[6];
++} cdc_ea[3] = {
++	{"generic", {0x00, 0x01, 0x50, 0x02, 0x17, 0x02}},     /* live.dts tavil elemental-addr */
++	{"interface", {0x00, 0x00, 0x50, 0x02, 0x17, 0x02}},   /* tavil slim-ifc-dev */
++	{"WCD9335 (absent)", {0x00, 0x01, 0xA0, 0x01, 0x17, 0x02}},    /* tasha: a negative control */
++};
++
++bool
++taimen_wcd_m2(void)
++{
++	uint32_t cfg0, io0;
++	int pulse = 1;
++	unsigned i, used = 0;
++	uint8_t la[3] = {LA_NONE, LA_NONE, LA_NONE};
++	int err[3] = {0, 0, 0};
++
++	if (rst_pin == 0) {
++		rst_pin = ml_io_map(TLMM_PA(CDC_RST_GPIO), 0x1000);
++	}
++	if (rst_pin == 0) {
++		LOG("2: no TLMM mapping for gpio%u", CDC_RST_GPIO);
++		return false;
++	}
++	(void)PE_parse_boot_argn("taimenmicrst", &pulse, sizeof(pulse));
++	cfg0 = rd32(rst_pin);
++	io0 = rd32(rst_pin + 4);
++	if (pulse == 0 && (cfg0 & TLMM_OE) != 0 && (io0 & 2u) != 0) {
++		/* WH wcd9xxx_reset: avoid_cdc_rstlow */
++		wr32(rst_pin, RST_ACTIVE);
++		LOG("2: codec reset (gpio64 was cfg %#x in/out %#x): already high, no low pulse (taimenmicrst=0); "
++		    "now cfg %#x in/out %#x", cfg0, io0, rd32(rst_pin), rd32(rst_pin + 4));
++	} else {
++		/* WH wcd9xxx_reset: the sleep state (low) 20 ms, the active state (high) 20 ms */
++		wr32(rst_pin + 4, 0);
++		wr32(rst_pin, RST_SLEEP);
++		taimen_mic_msleep(20);
++		wr32(rst_pin + 4, 2u);
++		wr32(rst_pin, RST_ACTIVE);
++		taimen_mic_msleep(20);
++		LOG("2: codec reset (gpio64 was cfg %#x in/out %#x): low 20 ms, high 20 ms; now cfg %#x in/out %#x", cfg0,
++		    io0, rd32(rst_pin), rd32(rst_pin + 4));
++	}
++	for (i = 0; i < 3; i++) {
++		const uint8_t *e = cdc_ea[i].ea;
++		err[i] = taimen_slim_addr_query(e, 5, &la[i], &used);
++		if (err[i] == 0) {
++			LOG("2: ADDR_QUERY %02x %02x %02x %02x %02x %02x (%s) -> LA %#x (try %u)", e[0], e[1], e[2], e[3], e[4],
++			    e[5], cdc_ea[i].name, la[i], used);
++		} else {
++			LOG("2: ADDR_QUERY %02x %02x %02x %02x %02x %02x (%s) -> %s after %u tries", e[0], e[1], e[2], e[3],
++			    e[4], e[5], cdc_ea[i].name, err[i] == ENXIO ? "absent" : err[i] == ETIMEDOUT ? "no ADDR_REPLY" :
++			    "not sent", used);
++		}
++	}
++	if (err[2] == 0) {
++		LOG("2: the absent WCD9335 has an address: the EA bytes may be in the wrong order");
++	}
++	if (err[0] != 0 || err[1] != 0) {
++		LOG("2: the WCD9340 is NOT on the bus (generic %d, interface %d): check gpio64 high and S4", err[0], err[1]);
++		return false;
++	}
++	la_gen = la[0];
++	la_ifd = la[1];
++	LOG("2: M2 the WCD9340 is on the bus: generic %#x, interface %#x", la_gen, la_ifd);
++	return true;
++}
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index d729c23..6351c19 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -49,6 +49,9 @@
+  * 1 (0346): census of the codec's pins; the ADSP's slimbus QMI service (0x301 v1 inst 0, from its
+  *   NEW_SERVER) from our port 0x4002: SELECT_INSTANCE(0, MASTER), POWER(ACTIVE); then the NGD in
+  *   register mode, its logical address, MASTER_CAPABILITY and our REPORT_SATELLITE.
++ * 2 (0347): the codec's reset (TLMM gpio64 low 20 ms, high 20 ms; taimenmicrst=0: no low pulse
++ *   if it is already high), then ADDR_QUERY for its generic and interface devices (Android: LA
++ *   0xcf and 0xce) and for the absent WCD9335 as a negative control.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -82,6 +85,7 @@ extern "C" {                                    /* bsd/dev/taimen_slim.c, taimen
+ typedef void (*taimen_slim_idle_t)(void);
+ bool taimen_slim_up(taimen_slim_idle_t idle);
+ void taimen_wcd_census(void);
++bool taimen_wcd_m2(void);
+ }
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+@@ -2783,8 +2787,16 @@ mic_stages(void)
+ 		MLOG("1: M1 NOT reached; the microphone stages end here (the speaker is not affected)");
+ 		return;
+ 	}
+-	if (mic_level > 1) {
+-		MLOG("taimenmic=%d: stages 2 and up are not built yet", mic_level);
++	if (mic_level < 2) {
++		return;
++	}
++	MLOG("t=%u.%03u stage 2", T);
++	if (!taimen_wcd_m2()) {
++		MLOG("2: M2 NOT reached; the microphone stages end here");
++		return;
++	}
++	if (mic_level > 2) {
++		MLOG("taimenmic=%d: stages 3 and up are not built yet", mic_level);
+ 	}
+ }
+ 
