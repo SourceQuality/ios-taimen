@@ -1,0 +1,98 @@
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index bc37e9b..7d06044 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -42,7 +42,7 @@
+  * host id, items and doorbell bits. Only partitions APPS is a host of are read (another pair's
+  * header hung a CPU, boot 109).
+  *
+- * Microphones (docs/taimen-mic-plan.md section 6): boot-arg taimenmic=N (default 0: nothing runs)
++ * Microphones (docs/taimen-mic-plan.md section 6): boot-arg taimenmic=N (default 7 since 0354; 0: nothing runs)
+  * runs the microphone stages 1..N once, at the end of the stage 4 setup above (the speaker's
+  * feeder decided, its port stopped), with lines "TAIMEN MIC:". The SLIMbus NGD is
+  * bsd/dev/taimen_slim.c, the WCD9340 bsd/dev/taimen_wcd934x.c; the QMI client lives here.
+@@ -2762,7 +2762,7 @@ feeder_poll(void)
+ #define SLIM_PM_ACTIVE          2u              /* SLIMBUS_PM_ACTIVE_V01 (INACTIVE 1 is never sent) */
+ #define SLIM_QMI_WAIT_MS        1000            /* WH SLIM_QMI_RESP_TOUT */
+ 
+-static int mic_level;                   /* taimenmic=N, default 0 */
++static int mic_level = 7;               /* taimenmic=N, default 7 (0354: /dev/redwood-mic for iOS since boot 195) */
+ static uint16_t mic_txn = 1, mic_wait_txn, mic_wait_msg;
+ static bool mic_qmi_got;
+ static uint32_t mic_qmi_res, mic_qmi_err, mic_qmi_stray;
+diff --git a/iokit/Kernel/arm/TaimenSensors.cpp b/iokit/Kernel/arm/TaimenSensors.cpp
+index 0f59566..49bf39e 100644
+--- a/iokit/Kernel/arm/TaimenSensors.cpp
++++ b/iokit/Kernel/arm/TaimenSensors.cpp
+@@ -3159,7 +3159,7 @@ sensors_thread(void *arg, wait_result_t)
+ void
+ taimen_sensors_init(void)
+ {
+-	int level = 0;
++	int level = 8;  /* 0354: the default, every stream (taimensensors=0 or 1: no SLPI) */
+ 	thread_t t;
+ 	(void)PE_parse_boot_argn("taimensensors", &level, sizeof(level));
+ 	if (level < 2) {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 783545b..96ad225 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -465,11 +465,26 @@ private:
+ OSDefineMetaClassAndStructors(SweetHIDOrientation, IOHIDEventService);
+ static SweetHIDOrientation *gSweetOrientation;
+ 
++/*
++ * 0354: taimensensors=N, default 8 on taimen (every SLPI stream since boots 188-190: the soaks held) and 0
++ * elsewhere; taimensensors=0 turns the services off, a lower N stops at that milestone.
++ */
++static int
++sensors_level(void)
++{
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	int level = 8;
++#else
++	int level = 0;
++#endif
++	(void)PE_parse_boot_argn("taimensensors", &level, sizeof(level));
++	return level;
++}
++
+ bool
+ SweetHIDOrientation::start(IOService *provider)
+ {
+-	int level = 0;
+-	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 1) {
++	if (sensors_level() < 1) {
+ 		return false;
+ 	}
+ 	if (!IOHIDEventService::start(provider)) {
+@@ -616,8 +631,7 @@ static SweetHIDAccel *gSweetHeading;                    /* 0350 */
+ bool
+ SweetHIDAccel::start(IOService *provider)
+ {
+-	int level = 0;
+-	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < minLevel()) {
++	if (sensors_level() < minLevel()) {
+ 		return false;   /* no service: locationd sees no accelerometer, as before */
+ 	}
+ 	if (!IOHIDEventService::start(provider)) {
+@@ -1141,8 +1155,7 @@ static SweetHIDProx *gSweetProx;
+ bool
+ SweetHIDProx::start(IOService *provider)
+ {
+-	int level = 0;
+-	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 8) {
++	if (sensors_level() < 8) {
+ 		return false;
+ 	}
+ 	if (!IOHIDEventService::start(provider)) {
+@@ -1234,8 +1247,7 @@ static SweetHIDALS *gSweetALS;
+ bool
+ SweetHIDALS::start(IOService *provider)
+ {
+-	int level = 0;
+-	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 8) {
++	if (sensors_level() < 8) {
+ 		return false;
+ 	}
+ 	if (!IOHIDEventService::start(provider)) {
