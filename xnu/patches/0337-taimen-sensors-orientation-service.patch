@@ -1,0 +1,169 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index c0e672c..03f163f 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -15,6 +15,9 @@
+  *                    iPhone X's AOP publishes it), taimensensors=1 (0335): its
+  *                    samples come from sweet_hid_accel() (the USB control port's
+  *                    "accel"/"orient" today, the SLPI's sensor manager later)
++ *   SweetHIDOrientation  the device orientation as a coprocessor reports it (0337:
++ *                    Sensor page 0x20 usage 0x8A, orientation events of type
++ *                    CMUsage), derived from SweetHIDAccel's samples
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+  * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+@@ -421,6 +424,128 @@ static SweetHIDKeyboard *gSweetKeyboard;
+  * while the event system asks for them (ReportInterval/BatchInterval in us, 0 = stop), at most
+  * 100 Hz, and copyEvent returns the last one.
+  */
++/*
++ * 0337: boot 172 streamed SweetHIDAccel's samples to the event system, but nothing rotated: locationd's
++ * own orientation detector also wants a gyro ("No gyro; not detecting orientation!"), and on a phone
++ * with a motion coprocessor the orientation arrives ready-made, as backboardd's HID system takes it
++ * (hidSystem:receivedUpdatedDeviceOrientation:). That is this service: a Device Orientation collection
++ * (Sensor page 0x20, usage 0x8A) whose events are kIOHIDEventTypeOrientation of type CMUsage carrying
++ * one of the AppleVendorMotion (0xff0c) usages 0x64 ambiguous, 0x65 portrait, 0x66 upside down,
++ * 0x67 landscape left, 0x68 landscape right, 0x69 face up, 0x6a face down (IOHIDFamily's
++ * HIDOrientationCoreMotion descriptor and its event-driver test).
++ */
++enum {
++	kOrientAmbiguous = 0x64, kOrientPortrait, kOrientUpsideDown, kOrientLandscapeLeft, kOrientLandscapeRight,
++	kOrientFaceUp, kOrientFaceDown,
++};
++
++class SweetHIDOrientation : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDOrientation);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++	void update(UInt32 usage);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Sensor; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 0x8A; }    /* Orientation: Device Orientation */
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 5; }
++private:
++	IOHIDEvent *event();
++	volatile UInt32 fUsage;
++	UInt32 fSaid;
++};
++OSDefineMetaClassAndStructors(SweetHIDOrientation, IOHIDEventService);
++static SweetHIDOrientation *gSweetOrientation;
++
++bool
++SweetHIDOrientation::start(IOService *provider)
++{
++	int level = 0;
++	if (!PE_parse_boot_argn("taimensensors", &level, sizeof(level)) || level < 1) {
++		return false;
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	fUsage = kOrientPortrait;
++	gSweetOrientation = this;
++	registerService();
++	IOLog("TAIMEN SENSORS: SweetHIDOrientation up (0x20/0x8a, CMUsage orientation events), portrait\n");
++	return true;
++}
++
++IOHIDEvent *
++SweetHIDOrientation::event()
++{
++	IOHIDEvent *e = IOHIDEvent::orientationEvent(mach_absolute_time(), kIOHIDOrientationTypeCMUsage);
++	if (e) {
++		e->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage, (SInt32)fUsage);
++	}
++	return e;
++}
++
++IOReturn
++SweetHIDOrientation::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	if (fSaid < 16) {
++		fSaid++;
++		char keys[160] = "";
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		if (it) {
++			size_t n = 0;
++			for (OSString *k; (k = OSDynamicCast(OSString, it->getNextObject())) != NULL && n + 2 < sizeof(keys);) {
++				n += (size_t)snprintf(keys + n, sizeof(keys) - n, "%s%s", n ? " " : "", k->getCStringNoCopy());
++			}
++			it->release();
++		}
++		IOLog("SWEET HID: SweetHIDOrientation properties [%s]\n", keys);
++	}
++	return kIOReturnSuccess;
++}
++
++IOHIDEvent *
++SweetHIDOrientation::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	return type == kIOHIDEventTypeOrientation ? event() : NULL;
++}
++
++void
++SweetHIDOrientation::update(UInt32 usage)
++{
++	if (usage == fUsage) {
++		return;
++	}
++	fUsage = usage;
++	IOHIDEvent *e = event();
++	if (e) {
++		IOLog("TAIMEN SENSORS: orientation now 0x%x (%u clients)\n", (unsigned)usage, _clients ? _clients->getCount() : 0);
++		dispatchEvent(e);
++		e->release();
++	}
++}
++
++/* the orientation of a still phone from gravity (milli-g): the largest axis, if it clearly leads */
++static UInt32
++orientation_of(int x, int y, int z)
++{
++	int ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = z < 0 ? -z : z;
++	if (ax > ay + 200 && ax > az + 200) {
++		return x < 0 ? kOrientLandscapeLeft : kOrientLandscapeRight;
++	}
++	if (ay > ax + 200 && ay > az + 200) {
++		return y < 0 ? kOrientPortrait : kOrientUpsideDown;
++	}
++	if (az > ax + 200 && az > ay + 200) {
++		return z < 0 ? kOrientFaceUp : kOrientFaceDown;
++	}
++	return kOrientAmbiguous;
++}
++
+ class SweetHIDAccel : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDAccel);
+ public:
+@@ -551,6 +676,9 @@ SweetHIDAccel::sample(int mx, int my, int mz)
+ 		dispatchEvent(e);
+ 		e->release();
+ 	}
++	if (gSweetOrientation) {
++		gSweetOrientation->update(orientation_of(mx, my, mz));
++	}
+ }
+ 
+ bool
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index ae0b2cb..8628164 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -88,6 +88,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDAccel;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDOrientation;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDOrientation;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
