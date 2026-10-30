@@ -1263,3 +1263,16 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (not even driverkitd's), hottest sensor 53-57 C. But the poster gallery drew the poster only in round 1
   (171 KB shot, as boot 174); rounds 2-8 showed black cards (54,129 B, as boot 167) while AegirPoster stayed up
   (one exec, no crash): later frames from it never arrive. Next with oslogd and AegirPoster's stderr.
+- 2026-10-30 boot 179 (r157): the poster gallery again with AegirPoster/PosterBoard stderr: visit 1 drawn (173 KB),
+  2-3 black; PosterBoard asked for a Metal device twice (pids 233 and 322: it relaunched) and got nil (not a client).
+- 2026-10-30 **boot 180 (r158 = +0340): sensors M3, the SLPI talks.** GLINK on the dsps edge: SLPI VERSION 1 features 0x7
+  (ACK 1, 0x1); it opened fastrpcglink-apps-dsp, glink_ssr, IPCRTR (ours, up both ways) and LOOPBACK_CTL_DSPS. QRTR
+  HELLO from **node 9**; 29 QMI servers on node 9, among them **SNS_SMGR 0x100 v1 instance 50 (port 0x25)**, 0x10d v2,
+  0x12c, 0x115, 0x118 v2 inst 10, 0x15a-0x16b inst 50, 0x42 inst 90, 0x2b v2 inst 22, 0xf inst 8/9. The SLPI found our
+  SNS_REG (svc 0x10f, instance word 0x0002) without a lookup and read its calibration: 42 groups served (3300-3329,
+  2800, ...), 11 unknown (3500-3509, 3051); at 60 s still slave-kernel 0x6, SMGR up. PosterBoard as a Metal client
+  (m4d) takes the device (129 ms), but gallery visits 2-3 stay black, with no refusal on stderr.
+- 2026-10-30 boot 181 (r158): oslogd ran (exec oslogd-12486bd2) and diagnosticd streamed to it, but nothing reached
+  the log (sweetlogp matches the exact executable name) and streaming every process cost diagnosticd ~150% and
+  oslogd ~75% CPU: a4f59bb watches only the named processes (one process-only stream each); install it as
+  /usr/local/bin/oslogd. Rotation with the still gyro (0339): still portrait.
