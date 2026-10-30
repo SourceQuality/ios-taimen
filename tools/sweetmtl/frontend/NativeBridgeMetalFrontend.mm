@@ -1351,6 +1351,10 @@ static char sweetMemoryOwnerKey;
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
 - (BOOL)hasUnifiedMemory {return YES;}
+// Metal's private memory sizes: CoreImage reads sharedMemorySize when Maps opens its search sheet (boot 208 aborted on the missing selector).
+// The Adreno has no memory of its own; it shares the system's.
+- (uint64_t)sharedMemorySize {return [NSProcessInfo processInfo].physicalMemory;}
+- (uint64_t)dedicatedMemorySize {return 0;}
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
