@@ -1574,7 +1574,13 @@ static char sweetMemoryOwnerKey;
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
- if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
+ if(!handle){
+  // which pipeline, ahead of the reason (the kernel log cuts a long reason short: boot 209's 26 framebuffer-fetch refusals named nothing)
+  if(gFailsLogged<32)NBINFO(@"native-metal: render pipeline \"%@\" refused: vertex %@, fragment %@, %lu samples, color 0 format %lu",
+                            d.label?:@"",d.vertexFunction.name,d.fragmentFunction.name,(unsigned long)d.rasterSampleCount,
+                            (unsigned long)d.colorAttachments[0].pixelFormat);
+  return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
+ }
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
