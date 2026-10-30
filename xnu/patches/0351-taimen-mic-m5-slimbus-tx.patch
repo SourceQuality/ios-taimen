@@ -1,0 +1,607 @@
+diff --git a/bsd/dev/taimen_slim.c b/bsd/dev/taimen_slim.c
+index ba8589e..0b520a1 100644
+--- a/bsd/dev/taimen_slim.c
++++ b/bsd/dev/taimen_slim.c
+@@ -12,6 +12,8 @@
+  *   RX         INT_STAT bit 30: word 0 of NGD_RX_MSG has RL in bits 4:0; (RL + 3) / 4 words, then
+  *              INT_CLR bit 30 (WH qcom,rxreg-access)
+  *   messages   word 0 = RL | MT << 5 | MC << 8 | LA << 16, the payload from byte 3, RL = 3 + payload
++ *   channels   0351: user messages to the manager (CONNECT_SRC, DEF_ACT_CHAN, RECONFIG_NOW, CHAN_CTRL,
++ *              DISCONNECT_PORT), each answered by GENERIC_ACK (bit 5 of its code: success)
+  * The ADSP powers and clocks the block: the caller has had QMI POWER(ACTIVE) answered 0 before
+  * taimen_slim_up, and each new register block is announced in the log before its first access.
+  * Every wait is bounded; three TX timeouts in a row end all SLIMbus traffic for the boot. One
+@@ -36,6 +38,9 @@ int taimen_slim_addr_query(const uint8_t ea[6], unsigned tries, uint8_t *la, uns
+ int taimen_slim_read(uint8_t la, uint16_t elem, uint8_t *buf, unsigned n);
+ int taimen_slim_write(uint8_t la, uint16_t elem, const uint8_t *buf, unsigned n);
+ void taimen_slim_counts(unsigned *reads, unsigned *writes, unsigned *nacks, unsigned *timeouts);
++int taimen_slim_user(unsigned mc, const uint8_t *pre, unsigned npre, const uint8_t *post, unsigned npost, uint8_t *ack);
++uint32_t taimen_slim_int_stat(void);
++bool taimen_slim_resume(void);
+ void taimen_mic_msleep(unsigned ms);
+ uint64_t taimen_mic_now_ms(void);
+ 
+@@ -77,6 +82,7 @@ uint64_t taimen_mic_now_ms(void);
+ #define MC_REPORT_SAT           0x01u
+ #define MC_ADDR_QUERY           0x0Du
+ #define MC_ADDR_REPLY           0x0Eu
++#define MC_GENERIC_ACK          0x25u
+ #define MC_REQUEST_VALUE        0x60u
+ #define MC_REPLY_VALUE          0x64u
+ #define MC_CHANGE_VALUE         0x68u
+@@ -86,6 +92,8 @@ uint64_t taimen_mic_now_ms(void);
+ #define VALUE_WAIT_MS           200u
+ #define ADDR_WAIT_MS            200u
+ #define RW_TRIES                3u              /* WH WCD9XXX_SLIM_RW_MAX_TRIES, 5 ms apart */
++#define ACK_WAIT_MS             1000u           /* WH ngd_xferandwait_ack: HZ */
++#define SAT_SUCCESS             0x20u           /* WH MSM_SAT_SUCCSS */
+ 
+ static vm_offset_t slim_base, ngd;
+ static uint32_t slim_ver;
+@@ -555,6 +563,69 @@ taimen_slim_write(uint8_t la, uint16_t elem, const uint8_t *buf, unsigned n)
+ 	return err;
+ }
+ 
++/*
++ * A user message to the manager (MT 2, LA 0xFF): pre, then a TID, then post; the manager's
++ * GENERIC_ACK (MT 6, MC 0x25: TID, code) answers it (WH ngd_xferandwait_ack, ngd_slim_rx). 0 when
++ * the code has bit 5 (success), EIO with the code in *ack otherwise, ETIMEDOUT, ENODEV.
++ */
++int
++taimen_slim_user(unsigned mc, const uint8_t *pre, unsigned npre, const uint8_t *post, unsigned npost, uint8_t *ack)
++{
++	uint8_t m[20];
++	uint8_t tid = tid_new();
++	unsigned rl;
++	int err;
++
++	*ack = 0;
++	if (npre + 1 + npost > 12) {
++		return EINVAL;
++	}
++	rl = hdr(m, MT_DEST_USER, mc, LA_MGR, npre + 1 + npost);
++	if (npre != 0) {
++		memcpy(m + 3, pre, npre);
++	}
++	m[3 + npre] = tid;
++	if (npost != 0) {
++		memcpy(m + 4 + npre, post, npost);
++	}
++	err = xfer(m, rl, (int)MC_GENERIC_ACK, tid, ACK_WAIT_MS);
++	if (err != 0) {
++		return err;
++	}
++	*ack = (uint8_t)(got_rl >= 5 ? got_buf[4] : 0);
++	return (*ack & SAT_SUCCESS) != 0 ? 0 : EIO;
++}
++
++/* INT_STAT, for a session's log (0 when the NGD is not up) */
++uint32_t
++taimen_slim_int_stat(void)
++{
++	return ngd_up && !slim_dead ? ngd_r(NGD_INT_STAT) : 0;
++}
++
++/*
++ * Before a session: the NGD as M1 left it (LADDR, INT_EN), or, if the ADSP reset the block
++ * (WH ngd_slim_power_up after a power collapse), enabled again with a new capability exchange.
++ */
++bool
++taimen_slim_resume(void)
++{
++	uint32_t st, ien;
++
++	if (!ngd_up || slim_dead) {
++		return false;
++	}
++	st = ngd_r(NGD_STATUS);
++	ien = ngd_r(NGD_INT_EN);
++	if ((st & NGD_LADDR) != 0 && ien != 0) {
++		return true;
++	}
++	LOG("slim: the NGD lost its state (status %#x int_en %#x): enabling it again", st, ien);
++	ngd_up = false;
++	cap_seen = false;
++	return taimen_slim_up(slim_idle);
++}
++
+ void
+ taimen_slim_counts(unsigned *reads, unsigned *writes, unsigned *nacks, unsigned *timeouts)
+ {
+diff --git a/bsd/dev/taimen_wcd934x.c b/bsd/dev/taimen_wcd934x.c
+index 3b21844..74a41ac 100644
+--- a/bsd/dev/taimen_wcd934x.c
++++ b/bsd/dev/taimen_wcd934x.c
+@@ -16,6 +16,11 @@
+  *                          register defaults and CPR, the clock (master bias, MCLK_PRG), the TX
+  *                          path DMICn -> DEC7 -> SLIM TX7 (muted), every register read back; then all
+  *                          down again and DIV_CLK1 off. taimenmicdmic (0), taimenmicgain (+4 dB)
++ *   sessions (0351, >=5)   the clock and the TX path up for a recording (one DMIC, or all for the
++ *                          census) and down again; the codec's TX port 7 on SLIMbus channel 135
++ *                          (interface registers, CONNECT_SRC, DEF_ACT_CHAN, RECONFIG_NOW) and off
++ *                          (CHAN_CTRL remove, RECONFIG_NOW); taimenmicla5=0 sends the full LA in
++ *                          DEF_ACT_CHAN's first byte
+  * Call from the audio thread, after taimen_slim_up.
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+@@ -189,6 +194,7 @@ static unsigned n_cdc_writes, n_cdc_same, n_cdc_err;
+ static uint16_t first_bad_reg;
+ static int first_bad_err;
+ static uint8_t chip_id[4];
++static bool m4_ok;                      /* M4 set the codec up once: sessions may follow */
+ 
+ static int
+ shadow_find(uint16_t reg)
+@@ -747,6 +753,280 @@ taimen_wcd_m4(void)
+ 	LOG("4: down: TX7 CTL %#x, DMIC%u_CTL %#x, MICB%u %#x, MCLK_PRG %#x, ANA_BIAS %#x, PSTATE %#x; DIV_CLK1 off: %s",
+ 	    cdc_get(R_TX7_PATH_CTL), (unsigned)dmic / 2, cdc_get(dctl), micb_n, cdc_get(micb), cdc_get(R_CLK_SYS_MCLK_PRG),
+ 	    cdc_get(R_ANA_BIAS), cdc_get(R_PSTATE_CTL_0), off ? "ok" : "NOT acked");
+-	return err == 0 && bad == 0;
++	m4_ok = err == 0 && bad == 0;
++	return m4_ok;
++}
++
++/* ---- sessions (taimenmic>=5): the clock and TX path for a recording, the codec's TX port on channel 135 ---- */
++
++#define IFD_TX_PORT_MCH0_7      0x011Cu         /* SB_PGD_TX_PORT_MULTI_CHANNEL_0(7) */
++#define IFD_TX_PORT_MCH1_7      0x011Du         /* SB_PGD_TX_PORT_MULTI_CHANNEL_1(7) */
++#define IFD_TX_PORT_CFG_7       0x0057u         /* SB_PGD_PORT_CFG_BYTE_ADDR(0x50, 7): watermark 12 bytes, enable */
++#define IFD_INT_STATUS_TX_0     0x0036u         /* PGD_PORT_INT_STATUS_TX_0: bit 7 is port 7 */
++#define IFD_INT_CLR_TX_0        0x003Au         /* PGD_PORT_INT_CLR_TX_0 (WH tavil_slimbus_irq) */
++#define IFD_INT_SOURCE_TX_7     0x0077u         /* PGD_PORT_INT_RX_SOURCE0 + 16 + 7: bit 0 overflow, 1 underflow */
++#define IFD_INT_STATUS_7        0x0087u         /* L SLIM_PGD_PORT_INT_STATUS(7) */
++#define CODEC_TX_PORT           7u
++#define SLIM_CHANNEL            135u            /* WH msm8998.c tx_ch_tavil[7] */
++#define MC_DEF_ACT_CHAN         0x21u
++#define MC_CHAN_CTRL            0x23u
++#define MC_RECONFIG_NOW         0x24u
++#define MC_CONNECT_SRC          0x2Cu
++#define MC_DISCONNECT_PORT      0x2Eu
++
++extern int taimen_slim_user(unsigned mc, const uint8_t *pre, unsigned npre, const uint8_t *post, unsigned npost,
++    uint8_t *ack);
++extern uint32_t taimen_slim_int_stat(void);
++bool taimen_wcd_up(unsigned st, int dmic, bool census, bool verbose);
++void taimen_wcd_mute(bool mute);
++void taimen_wcd_settle(void);
++bool taimen_wcd_select(int dmic);
++void taimen_wcd_down(unsigned st, bool verbose);
++bool taimen_wcd_port_up(unsigned st, bool verbose);
++void taimen_wcd_port_down(unsigned st, bool verbose);
++bool taimen_wcd_port_log(unsigned st, const char *what);
++
++static const uint16_t sess_micb[3] = {R_MICB1, R_MICB3, R_MICB4};       /* DMIC0/1, DMIC2/3, DMIC4/5 */
++static const unsigned sess_micb_n[3] = {1, 3, 4};
++static bool sess_up, sess_census, port_connected, chan_defined;
++static int sess_dmic;
++
++static const char *
++ack_err(int e)
++{
++	return e == 0 ? "" : e == EIO ? " (NACK)" : e == ETIMEDOUT ? " (no ACK)" : " (not sent)";
++}
++
++/*
++ * The codec for a recording (WH __tavil_cdc_mclk_enable, the mixer path's muxes, the DMIC and DEC7
++ * widgets, as M4): DIV_CLK1, the SVS vote, master bias, MCLK_PRG, then DMICn -> DEC7 -> TX7 muted
++ * with the HPF at 150 Hz. census: MIC BIAS 1, 3, 4 and the DMIC0-2 clocks all on, for stepping.
++ */
++bool
++taimen_wcd_up(unsigned st, int dmic, bool census, bool verbose)
++{
++	int gain = 4, err;
++	bool rpm;
++	unsigned i, k;
++	uint8_t vol;
++
++	if (!m4_ok) {
++		LOG("%u: no codec (M4)", st);
++		return false;
++	}
++	(void)PE_parse_boot_argn("taimenmicgain", &gain, sizeof(gain));
++	if (gain < -84) {
++		gain = -84;
++	} else if (gain > 40) {
++		gain = 40;
++	}
++	vol = (uint8_t)(int8_t)gain;
++	sess_dmic = dmic >= 0 && dmic <= 5 ? dmic : 0;
++	sess_census = census;
++	k = (unsigned)sess_dmic / 2;
++	rpm = sweet_rpm_xo_buffer(RPM_DIV_CLK1);
++	sess_up = true;
++	tracking = false;
++	n_cdc_err = 0;
++	err = cdc_update(R_PSTATE_CTL_0, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x80, 0x80);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x40, 0x40);
++	taimen_mic_msleep(1);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x40, 0x00);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x20, 0x00);
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x80, 0x80);
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x30, 0x00);
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x02, 0x00);
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_FS_CNT_CONTROL, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_MCLK_CONTROL, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_RPM_CLK_GATE, 0x03, 0x00);
++	delay(10);
++	err = err != 0 ? err : cdc_update(R_ADC_MUX3_CFG1, 0x0C, 0x00);
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CFG0, 0x80, 0x80);
++	err = err != 0 ? err : cdc_update(R_ADC_MUX7_CFG0, 0x38, (uint8_t)((sess_dmic + 1) << 3));
++	err = err != 0 ? err : cdc_update(R_IF_ROUTER_TX_MUX_CFG1, 0xC0, 0x80);
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CTL, 0x0F, 0x04);
++	for (i = 0; i < 3; i++) {
++		if (census || i == k) {
++			err = err != 0 ? err : cdc_update(sess_micb[i], 0xC0, 0x40);
++		}
++	}
++	taimen_mic_msleep(1);
++	for (i = 0; i < 3; i++) {
++		if (census || i == k) {
++			err = err != 0 ? err : cdc_update((uint16_t)(R_DMIC0_CTL + i), 0x0E, 2u << 1);
++			err = err != 0 ? err : cdc_update((uint16_t)(R_DMIC0_CTL + i), 0x01, 0x01);
++		}
++	}
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CTL, 0x10, 0x10);
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CTL, 0x20, 0x20);
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CFG0, 0x60, 2u << 5);
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_SEC2, 0x02, 0x02);
++	taimen_mic_msleep(1);
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_SEC2, 0x02, 0x00);
++	err = err != 0 ? err : cdc_write(R_TX7_VOL_CTL, vol);
++	if (verbose || err != 0 || !rpm) {
++		LOG("%u: codec up: DIV_CLK1 %s; ANA_BIAS %#x MCLK_PRG %#x; DMIC%d%s -> DEC7: TX7 CTL %#x CFG0 %#x VOL %#x%s", st,
++		    rpm ? "on" : "NOT acked", cdc_get(R_ANA_BIAS), cdc_get(R_CLK_SYS_MCLK_PRG), sess_dmic,
++		    census ? " (census: MIC BIAS 1/3/4, DMIC0-2 clocks)" : "", cdc_get(R_TX7_PATH_CTL), cdc_get(R_TX7_PATH_CFG0),
++		    cdc_get(R_TX7_VOL_CTL), err != 0 ? " (an access FAILED)" : "");
++	}
++	if (err != 0) {
++		LOG("%u: codec register %#06x FAILED (%d)", st, first_bad_reg, first_bad_err);
++	}
++	return err == 0;
++}
++
++/* the PGA mute, lifted tx_unmute_delay (40 ms) after the start (WH tavil_tx_mute_update_callback) */
++void
++taimen_wcd_mute(bool mute)
++{
++	(void)cdc_update(R_TX7_PATH_CTL, 0x10, mute ? 0x10 : 0x00);
++}
++
++/* 300 ms after the start: the HPF back to its corner (0: 4 Hz) with the gate pulse (WH tx_hpf_corner_freq_callback) */
++void
++taimen_wcd_settle(void)
++{
++	(void)cdc_update(R_TX7_PATH_CFG0, 0x60, 0x00);
++	(void)cdc_update(R_TX7_PATH_SEC2, 0x02, 0x02);
++	taimen_mic_msleep(1);
++	(void)cdc_update(R_TX7_PATH_SEC2, 0x02, 0x00);
++}
++
++/* DMIC MUX7 = DMICn (its clock and bias must be on: the census) */
++bool
++taimen_wcd_select(int dmic)
++{
++	return dmic >= 0 && dmic <= 5 && cdc_update(R_ADC_MUX7_CFG0, 0x38, (uint8_t)((dmic + 1) << 3)) == 0;
++}
++
++void
++taimen_wcd_down(unsigned st, bool verbose)
++{
++	unsigned i, k = (unsigned)sess_dmic / 2;
++	bool off;
++
++	if (!sess_up) {
++		return;
++	}
++	(void)cdc_update(R_TX7_PATH_CTL, 0x10, 0x10);
++	(void)cdc_update(R_TX7_PATH_CTL, 0x20, 0x00);
++	for (i = 0; i < 3; i++) {
++		if (sess_census || i == k) {
++			(void)cdc_update((uint16_t)(R_DMIC0_CTL + i), 0x01, 0x00);
++			(void)cdc_update((uint16_t)(R_DMIC0_CTL + i), 0x0E, 5u << 1);
++			(void)cdc_update(sess_micb[i], 0xC0, 0x00);
++		}
++	}
++	(void)cdc_update(R_CLK_SYS_MCLK_PRG, 0x81, 0x00);
++	(void)cdc_update(R_ANA_BIAS, 0xA0, 0x00);
++	(void)cdc_update(R_PSTATE_CTL_0, 0x01, 0x00);
++	off = sweet_rpm_kv_both("clka div_clk1 off", RPM_CLKA, RPM_DIV_CLK1, RPM_SWEN, 0);
++	sess_up = false;
++	if (verbose || !off) {
++		LOG("%u: codec down: TX7 CTL %#x, MCLK_PRG %#x, ANA_BIAS %#x; MIC BIAS%u %#x; DIV_CLK1 off: %s", st,
++		    cdc_get(R_TX7_PATH_CTL), cdc_get(R_CLK_SYS_MCLK_PRG), cdc_get(R_ANA_BIAS), sess_micb_n[k], cdc_get(sess_micb[k]),
++		    off ? "ok" : "NOT acked");
++	}
++}
++
++/*
++ * The codec's TX port 7 on channel 135 (WH wcd9xxx_cfg_slim_sch_tx, ngd_allocbw; plan 2.7): the
++ * interface registers, CONNECT_SRC (LA, port, channel), DEF_ACT_CHAN (48 kHz, 16 bits, AUTO_ISO as
++ * downstream computes it: 0f 24 20 83, then the channel), RECONFIG_NOW; then the port's status cleared.
++ */
++bool
++taimen_wcd_port_up(unsigned st, bool verbose)
++{
++	int la5 = 1, e1, e2 = -1, e3 = -1;
++	uint8_t v[4] = {0xEE, 0xEE, 0xEE, 0xEE}, a1 = 0, a2 = 0, a3 = 0, pre[4], post[1];
++	bool ok;
++
++	(void)PE_parse_boot_argn("taimenmicla5", &la5, sizeof(la5));
++	ok = ifd_write(IFD_TX_OR_UR_CFG_7, 0x02) == 0 && ifd_write(IFD_TX_PORT_MCH0_7, 1u << CODEC_TX_PORT) == 0 &&
++	    ifd_write(IFD_TX_PORT_MCH1_7, 0x00) == 0 && ifd_write(IFD_TX_PORT_CFG_7, 0x05) == 0;
++	(void)ifd_read(IFD_TX_OR_UR_CFG_7, &v[0]);
++	(void)ifd_read(IFD_TX_PORT_MCH0_7, &v[1]);
++	(void)ifd_read(IFD_TX_PORT_MCH1_7, &v[2]);
++	(void)ifd_read(IFD_TX_PORT_CFG_7, &v[3]);
++	if (verbose || !ok) {
++		LOG("%u: ifd port 7: %02x %02x %02x %02x%s", st, v[0], v[1], v[2], v[3], ok ? "" : " (a write FAILED)");
++	}
++	if (!ok) {
++		return false;
++	}
++	pre[0] = la_gen;
++	pre[1] = CODEC_TX_PORT;
++	pre[2] = SLIM_CHANNEL;
++	e1 = taimen_slim_user(MC_CONNECT_SRC, pre, 3, NULL, 0, &a1);
++	port_connected = e1 == 0;
++	if (e1 == 0) {
++		pre[0] = (uint8_t)(la5 != 0 ? (la_gen & 0x1F) : la_gen);     /* data format 0 << 5 | LA */
++		pre[1] = 0x24;          /* 16 bits >> 2 | coefficient 3 << 5 */
++		pre[2] = 0x20;          /* root exponent 2 << 4 | HARD_ISO */
++		pre[3] = 0x83;          /* presence rate: the 4 kHz family, 12 = 3 x 2^2, exact */
++		post[0] = SLIM_CHANNEL;
++		e2 = taimen_slim_user(MC_DEF_ACT_CHAN, pre, 4, post, 1, &a2);
++		chan_defined = e2 == 0;
++	}
++	if (e2 == 0) {
++		post[0] = la_gen;
++		e3 = taimen_slim_user(MC_RECONFIG_NOW, NULL, 0, post, 1, &a3);
++	}
++	if (verbose || e3 != 0) {
++		LOG("%u: CONNECT_SRC %#x:7 -> 135 ack %#x%s; DEF_ACT_CHAN %02x 24 20 83 ack %#x%s; RECONFIG_NOW ack %#x%s", st,
++		    la_gen, a1, ack_err(e1), la5 != 0 ? (la_gen & 0x1F) : la_gen, a2, ack_err(e2), a3, ack_err(e3));
++	}
++	if (e3 != 0) {
++		taimen_wcd_port_down(st, true);
++		return false;
++	}
++	(void)ifd_write(IFD_INT_CLR_TX_0, 1u << CODEC_TX_PORT);       /* what latched before the channel ran */
++	return true;
++}
++
++/* CHAN_CTRL remove (2 << 6 | LA & 0x1F) and RECONFIG_NOW; a port connected without a channel: DISCONNECT_PORT */
++void
++taimen_wcd_port_down(unsigned st, bool verbose)
++{
++	uint8_t pre[2], post[1], a1 = 0, a2 = 0;
++	int e1 = -1, e2 = -1;
++
++	if (chan_defined) {
++		pre[0] = (uint8_t)(0x80 | (la_gen & 0x1F));
++		post[0] = SLIM_CHANNEL;
++		e1 = taimen_slim_user(MC_CHAN_CTRL, pre, 1, post, 1, &a1);
++		post[0] = la_gen;
++		e2 = taimen_slim_user(MC_RECONFIG_NOW, NULL, 0, post, 1, &a2);
++		if (verbose || e1 != 0 || e2 != 0) {
++			LOG("%u: channel 135 removed: CHAN_CTRL ack %#x%s, RECONFIG_NOW ack %#x%s", st, a1, ack_err(e1), a2,
++			    ack_err(e2));
++		}
++	} else if (port_connected) {
++		pre[0] = la_gen;
++		pre[1] = CODEC_TX_PORT;
++		e1 = taimen_slim_user(MC_DISCONNECT_PORT, pre, 2, NULL, 0, &a1);
++		LOG("%u: DISCONNECT_PORT %#x:7 ack %#x%s", st, la_gen, a1, ack_err(e1));
++	}
++	chan_defined = false;
++	port_connected = false;
++}
++
++/* The codec port's interrupt status (WH tavil_slimbus_irq: the summary, then the port's source byte). */
++bool
++taimen_wcd_port_log(unsigned st, const char *what)
++{
++	uint8_t sum = 0xEE, src = 0xEE, l = 0xEE;
++	bool okr, of, uf;
++
++	okr = ifd_read(IFD_INT_STATUS_TX_0, &sum) == 0 && ifd_read(IFD_INT_SOURCE_TX_7, &src) == 0;
++	(void)ifd_read(IFD_INT_STATUS_7, &l);
++	of = okr && (sum & 0x80) != 0 && (src & 0x01) != 0;
++	uf = okr && (sum & 0x80) != 0 && (src & 0x02) != 0;
++	LOG("%u: %s: codec port 7 tx status %#x source %#x int %#x (%s), NGD int %#x", st, what, sum, src, l,
++	    !okr ? "NOT read" : of ? "OVERFLOW: produced, not taken" : uf ? "underflow" : "no overflow", taimen_slim_int_stat());
++	return okr && !of && !uf;
+ }
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index f36b316..a5939e9 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -58,6 +58,10 @@
+  *   defaults, CPR and clock, then the TX path DMICn -> DEC7 -> SLIM TX7, muted (taimenmicdmic=n,
+  *   default 0; taimenmicgain=dB, default +4); every register written is read back, then all of
+  *   it goes down again and DIV_CLK1 off. Nothing is recorded yet.
++ * 5 (0351): AFE SLIMBUS_0_TX (0x4001: the codec slave config, 16 bit, 1 channel on shared channel
++ *   135, 48 kHz; DEVICE_START), the codec's clock and TX path, its TX port 7 connected to channel 135
++ *   and the channel defined and activated (SLIMbus user messages to the ADSP, GENERIC_ACK each); 2 s
++ *   running, the port's status; then all of it down. POWER(ACTIVE) again before each session.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -94,6 +98,12 @@ void taimen_wcd_census(void);
+ bool taimen_wcd_m2(void);
+ bool taimen_wcd_m3(void);
+ bool taimen_wcd_m4(void);
++bool taimen_slim_resume(void);
++bool taimen_wcd_up(unsigned st, int dmic, bool census, bool verbose);
++void taimen_wcd_down(unsigned st, bool verbose);
++bool taimen_wcd_port_up(unsigned st, bool verbose);
++void taimen_wcd_port_down(unsigned st, bool verbose);
++bool taimen_wcd_port_log(unsigned st, const char *what);
+ }
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+@@ -2786,11 +2796,144 @@ mic_m1(void)
+ 	return taimen_slim_up(mic_idle);
+ }
+ 
++/* ---------------------------------------------------------------- microphones: SLIMBUS_0_TX (M5) */
++
++#define APR_PORT_SLIM0_TX                   0x4001  /* AFE_PORT_ID_SLIMBUS_MULTI_CHAN_0_TX */
++#define AFE_MODULE_CDC_DEV_CFG              0x00010234u
++#define AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG  0x00010235u
++#define AFE_PARAM_ID_SLIMBUS_CONFIG         0x00010212u
++#define MIC_SLIM_CHANNEL                    135     /* WH msm8998.c tx_ch_tavil[7] */
++
++struct afe_slim_slave_cfg {
++	uint32_t minor, ea_lsw, ea_msw;
++	uint16_t tx_offset, rx_offset;
++} __attribute__((packed));
++struct afe_svc_set_slave {
++	uint32_t payload_size, lsw, msw, handle;
++	struct afe_param_hdr p;
++	struct afe_slim_slave_cfg cfg;
++} __attribute__((packed));
++struct afe_slim_cfg {
++	uint32_t minor;
++	uint16_t dev_id, bit_width, data_format, channels;
++	uint8_t  map[8];
++	uint32_t rate;
++} __attribute__((packed));
++struct afe_port_set_slim {
++	uint16_t port_id, payload_size;
++	uint32_t lsw, msw, handle;
++	struct afe_param_hdr p;
++	struct afe_slim_cfg cfg;
++} __attribute__((packed));
++
++static int mic_dmic;                    /* taimenmicdmic: 0 (DMIC0) */
++static bool mic_slave_sent, mic_afe_on;
++
++/* plan risk 2: the slimbus block is the ADSP's to clock; ask for it again before each session */
++static bool
++mic_power_active(unsigned st)
++{
++	uint8_t m[16];
++	uint32_t pm = SLIM_PM_ACTIVE;
++	unsigned took = 0;
++	uint32_t n = qm_tlv(m, 7, 0x01, &pm, 4);
++	if (mic_qmi_call(SLIM_QMI_POWER, m, n, &took) != 0 || mic_qmi_res != 0) {
++		MLOG("%u: POWER(ACTIVE) before the session: %s %u/%u after %u ms", st, mic_qmi_got ? "answered" : "NO answer",
++		    mic_qmi_res, mic_qmi_err, took);
++		return false;
++	}
++	return taimen_slim_resume();
++}
++
++/*
++ * AFE SLIMBUS_0_TX (plan 4.1): the codec's slave config once (AFE_SVC_CMD_SET_PARAM, needed only
++ * for HW MAD), the port config (16 bits, 1 channel on shared channel 135, 48 kHz), DEVICE_START.
++ * No clock command: the bus clock is the ADSP's.
++ */
++static bool
++mic_afe_start(unsigned st, bool verbose)
++{
++	int rs = 0, rc, rd = -3;
++	if (!mic_slave_sent) {
++		struct afe_svc_set_slave sl;
++		bzero(&sl, sizeof(sl));
++		sl.payload_size = sizeof(sl.p) + sizeof(sl.cfg);
++		sl.p.module_id = AFE_MODULE_CDC_DEV_CFG;
++		sl.p.param_id = AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG;
++		sl.p.param_size = sizeof(sl.cfg);
++		sl.cfg.minor = 1;
++		sl.cfg.ea_lsw = 0x02500100u;            /* the generic device's EA 00 01 50 02 17 02 */
++		sl.cfg.ea_msw = 0x00000217u;
++		sl.cfg.tx_offset = 0;
++		sl.cfg.rx_offset = 16;
++		rs = apr_call("AFE SLIMBUS slave cfg", APR_SVC_AFE, 0, AFE_SVC_CMD_SET_PARAM, &sl, sizeof(sl), 1000);
++		mic_slave_sent = rs == 0;
++	}
++	struct afe_port_set_slim c;
++	bzero(&c, sizeof(c));
++	c.port_id = APR_PORT_SLIM0_TX;
++	c.payload_size = sizeof(c.p) + sizeof(c.cfg);
++	c.p.module_id = AFE_MODULE_AUDIO_DEV_INTERFACE;
++	c.p.param_id = AFE_PARAM_ID_SLIMBUS_CONFIG;
++	c.p.param_size = sizeof(c.cfg);
++	c.cfg.minor = 1;
++	c.cfg.dev_id = 0;                               /* AFE_SLIMBUS_DEVICE_1 */
++	c.cfg.bit_width = 16;
++	c.cfg.data_format = 0;
++	c.cfg.channels = 1;
++	c.cfg.map[0] = MIC_SLIM_CHANNEL;
++	c.cfg.rate = 48000;
++	rc = apr_call("AFE SLIMBUS_0_TX cfg", APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, &c, sizeof(c), 1000);
++	uint16_t start[2] = { APR_PORT_SLIM0_TX, 0 };
++	if (rc == 0) {
++		rd = apr_call("AFE DEVICE_START 0x4001", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 1000);
++	}
++	mic_afe_on = rd == 0;
++	if (verbose || rd != 0) {
++		MLOG("%u: AFE slave cfg %d; SLIMBUS_0_TX cfg (16 bit, 1 ch, ch 135, 48000) %d; DEVICE_START %d", st, rs, rc, rd);
++	}
++	return rd == 0;
++}
++
++static void
++mic_afe_stop(void)
++{
++	if (!mic_afe_on) {
++		return;
++	}
++	uint16_t stop[2] = { APR_PORT_SLIM0_TX, 0 };
++	apr_call("AFE DEVICE_STOP 0x4001", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 1000);
++	mic_afe_on = false;
++}
++
++/* M5: the AFE port and the codec's port on channel 135, 2 s, without a stream; then down (plan 4.4's order). */
++static bool
++mic_m5(void)
++{
++	bool ok = mic_power_active(5) && taimen_wcd_up(5, mic_dmic, false, true) && mic_afe_start(5, true) &&
++	    taimen_wcd_port_up(5, true);
++	if (ok) {
++		uint64_t t = now_ms();
++		while (now_ms() - t < 2000) {
++			mic_idle();
++		}
++		if (!taimen_wcd_port_log(5, "M5 channel 135 active 2 s")) {
++			MLOG("5: (the port status is a hint only: M6's samples decide)");
++		}
++	}
++	taimen_wcd_port_down(5, true);
++	mic_afe_stop();
++	taimen_wcd_down(5, true);
++	return ok;
++}
++
+ /* The microphone stages 1..taimenmic, once; a failure ends them and nothing else. */
+ static void
+ mic_stages(void)
+ {
+ 	MLOG("t=%u.%03u taimenmic=%d: stage 1", T, mic_level);
++	(void)PE_parse_boot_argn("taimenmicdmic", &mic_dmic, sizeof(mic_dmic));
++	mic_dmic = mic_dmic >= 0 && mic_dmic <= 5 ? mic_dmic : 0;
+ 	if (!mic_m1()) {
+ 		MLOG("1: M1 NOT reached; the microphone stages end here (the speaker is not affected)");
+ 		return;
+@@ -2819,7 +2962,16 @@ mic_stages(void)
+ 		MLOG("4: M4 NOT reached (the codec's clock and TX path are down again)");
+ 		return;
+ 	}
+-	MLOG("t=%u.%03u M4 done%s", T, mic_level > 4 ? "; stages 5 and up are not built yet" : "");
++	MLOG("t=%u.%03u M4 done", T);
++	if (mic_level < 5) {
++		return;
++	}
++	MLOG("t=%u.%03u stage 5", T);
++	if (!mic_m5()) {
++		MLOG("5: M5 NOT reached; the microphone stages end here");
++		return;
++	}
++	MLOG("t=%u.%03u M5 done%s", T, mic_level > 5 ? "; stages 6 and up are not built yet" : "");
+ }
+ 
+ /* ---------------------------------------------------------------- the thread */
