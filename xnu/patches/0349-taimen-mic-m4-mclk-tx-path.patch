@@ -1,0 +1,466 @@
+diff --git a/bsd/dev/taimen_wcd934x.c b/bsd/dev/taimen_wcd934x.c
+index b0d10be..3b21844 100644
+--- a/bsd/dev/taimen_wcd934x.c
++++ b/bsd/dev/taimen_wcd934x.c
+@@ -12,6 +12,10 @@
+  *                          absent WCD9335 (a negative control)
+  *   M3 (taimenmic>=3)      chip id 01 00 08 01, wcd934x_bringup, an interface register written and
+  *                          read back
++ *   M4 (taimenmic>=4)      MCLK on (RPM DIV_CLK1 out of PM8998 GPIO13 func2, 9.6 MHz), the codec's
++ *                          register defaults and CPR, the clock (master bias, MCLK_PRG), the TX
++ *                          path DMICn -> DEC7 -> SLIM TX7 (muted), every register read back; then all
++ *                          down again and DIV_CLK1 off. taimenmicdmic (0), taimenmicgain (+4 dB)
+  * Call from the audio thread, after taimen_slim_up.
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+@@ -173,11 +177,15 @@ taimen_wcd_m2(void)
+ /* ---- codec registers (WH wcd9xxx_page_write, wcd9xxx_slim_read_device / write_device) ---- */
+ 
+ #define SHADOW_N                160u
++#define EXPECT_N                128u
+ 
+ static int cur_page = -1;
+ static struct { uint16_t reg; uint8_t val; } shadow[SHADOW_N];
+ static unsigned n_shadow;
+-static unsigned n_cdc_writes, n_cdc_err;
++static struct { uint16_t reg; uint8_t mask, val; } expect[EXPECT_N];
++static unsigned n_expect;
++static bool tracking;
++static unsigned n_cdc_writes, n_cdc_same, n_cdc_err;
+ static uint16_t first_bad_reg;
+ static int first_bad_err;
+ static uint8_t chip_id[4];
+@@ -207,6 +215,28 @@ shadow_set(uint16_t reg, uint8_t v)
+ 	}
+ }
+ 
++static void
++expect_set(uint16_t reg, uint8_t mask, uint8_t v)
++{
++	unsigned i;
++	for (i = 0; i < n_expect; i++) {
++		if (expect[i].reg == reg) {
++			break;
++		}
++	}
++	if (i == n_expect) {
++		if (n_expect == EXPECT_N) {
++			return;
++		}
++		expect[i].reg = reg;
++		expect[i].mask = 0;
++		expect[i].val = 0;
++		n_expect++;
++	}
++	expect[i].mask = (uint8_t)(expect[i].mask | mask);
++	expect[i].val = (uint8_t)((expect[i].val & ~mask) | (v & mask));
++}
++
+ static void
+ cdc_failed(uint16_t reg, int err)
+ {
+@@ -263,6 +293,40 @@ cdc_write(uint16_t reg, uint8_t v)
+ 	if (err == 0) {
+ 		n_cdc_writes++;
+ 		shadow_set(reg, v);
++		if (tracking) {
++			expect_set(reg, 0xFF, v);
++		}
++	}
++	return err;
++}
++
++/* regmap_update_bits: read (once), change the bits, write if they changed */
++static int
++cdc_update(uint16_t reg, uint8_t mask, uint8_t v)
++{
++	int i = shadow_find(reg), err;
++	uint8_t cur = 0, nv;
++	if (i >= 0) {
++		cur = shadow[i].val;
++	} else {
++		err = cdc_read_hw(reg, &cur, 1);
++		if (err != 0) {
++			return err;
++		}
++		shadow_set(reg, cur);
++	}
++	nv = (uint8_t)((cur & ~mask) | (v & mask));
++	if (tracking) {
++		expect_set(reg, mask, v);
++	}
++	if (nv == cur) {
++		n_cdc_same++;
++		return 0;
++	}
++	err = cdc_write_n(reg, &nv, 1);
++	if (err == 0) {
++		n_cdc_writes++;
++		shadow_set(reg, nv);
+ 	}
+ 	return err;
+ }
+@@ -367,4 +431,322 @@ taimen_wcd_m3(void)
+ 	    e2 != 0 || v != 0x02 || rst != 0x07 || hm != 0x03 ? " (a read-back above is NOT as written)" : "");
+ 	return true;
+ }
++
++/* ---- M4: MCLK, the codec's defaults and CPR, its clock, the TX path; all read back, then down ---- */
++
++#define RPM_DIV_CLK1            0xBu            /* RPM clka DIV_CLK1_ID (W/msm-clocks-hwio-8998.h) */
++#define RPM_CLKA                0x616b6c63u     /* "clka" */
++#define RPM_SWEN                0x6e657773u     /* "swen" */
++#define R_PSTATE_CTL_0          0x0202u         /* CPE_SS_PWR_SYS_PSTATE_CTL_0: the SVS vote */
++#define R_DMIC0_CTL             0x0218u         /* CPE_SS_DMIC0_CTL; DMIC1_CTL, DMIC2_CTL follow */
++#define R_ANA_BIAS              0x0601u
++#define R_MICB1                 0x0622u
++#define R_MICB2                 0x0623u
++#define R_MICB3                 0x0625u
++#define R_MICB4                 0x0626u
++#define R_CLK_SYS_MCLK_PRG      0x0711u
++#define R_TX7_PATH_CTL          0x0AA1u         /* [3:0] rate, [4] mute, [5] clock (the DEC7 widget) */
++#define R_TX7_PATH_CFG0         0x0AA2u         /* [7] DMIC select, [6:5] HPF corner */
++#define R_TX7_VOL_CTL           0x0AA4u
++#define R_TX7_PATH_SEC2         0x0AA9u
++#define R_ADC_MUX3_CFG1         0x0D25u         /* [3:2] ADC MUX7: 0 DMIC */
++#define R_ADC_MUX7_CFG0         0x0D29u         /* [5:3] DMIC MUX7: DMICn + 1 */
++#define R_IF_ROUTER_TX_MUX_CFG1 0x0D3Bu         /* [7:6] CDC_IF TX7 MUX: 2 DEC7 */
++#define R_MCLK_CONTROL          0x0D41u         /* CDC_CLK_RST_CTRL_MCLK_CONTROL */
++#define R_FS_CNT_CONTROL        0x0D42u         /* CDC_CLK_RST_CTRL_FS_CNT_CONTROL */
++#define R_CPR_WR_DATA_0         0x5001u
++#define R_CPR_WR_ADDR_0         0x5005u
++#define R_CPR_SVS2_MIN_CX_VDD   0x5027u
++#define R_PAD_DRVCTL_0          0x803Bu         /* TEST_DEBUG_PAD_DRVCTL_0 */
++#define NELEM(a)                ((unsigned)(sizeof(a) / sizeof((a)[0])))
++
++extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++extern bool sweet_rpm_xo_buffer(uint32_t id);
++extern bool sweet_rpm_kv_both(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++bool taimen_wcd_m4(void);
++
++struct cdc_rmv {
++	uint16_t reg;
++	uint8_t mask, val;
++};
++
++/* WH tavil_codec_reg_defaults (regmap_update_bits at the platform probe) */
++static const struct cdc_rmv tavil_defaults[] = {
++	{0x0629, 0xFF, 0x75},   /* BIAS_VBG_FINE_ADJ */
++	{0x5022, 0xFF, 0x7C},   /* CODEC_CPR_SVS_CX_VDD */
++	{0x5023, 0xFF, 0x58},   /* CODEC_CPR_SVS2_CX_VDD */
++	{0x0B53, 0x01, 0x01},   /* CDC_RX0_RX_PATH_DSMDEM_CTL */
++	{0x0B67, 0x01, 0x01},   /* CDC_RX1_RX_PATH_DSMDEM_CTL */
++	{0x0B7B, 0x01, 0x01},   /* CDC_RX2_RX_PATH_DSMDEM_CTL */
++	{0x0B8F, 0x01, 0x01},   /* CDC_RX3_RX_PATH_DSMDEM_CTL */
++	{0x0BA3, 0x01, 0x01},   /* CDC_RX4_RX_PATH_DSMDEM_CTL */
++	{0x0BDF, 0x01, 0x01},   /* CDC_RX7_RX_PATH_DSMDEM_CTL */
++	{0x0BF3, 0x01, 0x01},   /* CDC_RX8_RX_PATH_DSMDEM_CTL */
++	{0x0B40, 0x1E, 0x18},   /* CDC_COMPANDER8_CTL7 */
++	{0x0B38, 0x1E, 0x18},   /* CDC_COMPANDER7_CTL7 */
++	{0x0B49, 0x08, 0x00},   /* CDC_RX0_RX_PATH_SEC0 */
++	{0x0C03, 0x03, 0x00},   /* CDC_CLSH_DECAY_CTRL */
++	{0x066C, 0x07, 0x01},   /* MICB1_TEST_CTL_2 */
++	{0x0C1B, 0x3F, 0x12},   /* CDC_BOOST0_BOOST_CFG1 */
++	{0x0C1C, 0x1C, 0x08},   /* CDC_BOOST0_BOOST_CFG2 */
++	{0x0C23, 0x3F, 0x12},   /* CDC_BOOST1_BOOST_CFG1 */
++	{0x0C24, 0x1C, 0x08},   /* CDC_BOOST1_BOOST_CFG2 */
++	{0x0213, 0x1F, 0x09},   /* CPE_SS_CPARMAD_BUFRDY_INT_PERIOD */
++	{0x0A33, 0x01, 0x00},   /* CDC_TX0_TX_PATH_CFG1 */
++	{0x0A43, 0x01, 0x00},   /* CDC_TX1_TX_PATH_CFG1 */
++	{0x0A53, 0x01, 0x00},   /* CDC_TX2_TX_PATH_CFG1 */
++	{0x0A63, 0x01, 0x00},   /* CDC_TX3_TX_PATH_CFG1 */
++	{0x0A73, 0x01, 0x00},   /* CDC_TX4_TX_PATH_CFG1 */
++	{0x0A83, 0x01, 0x00},   /* CDC_TX5_TX_PATH_CFG1 */
++	{0x0A93, 0x01, 0x00},   /* CDC_TX6_TX_PATH_CFG1 */
++	{0x0AA3, 0x01, 0x00},   /* CDC_TX7_TX_PATH_CFG1 */
++	{0x0AB3, 0x01, 0x00},   /* CDC_TX8_TX_PATH_CFG1 */
++	{0x06B6, 0x0F, 0x02},   /* RX_OCP_CTL */
++	{0x06CE, 0xFF, 0x3A},   /* HPH_OCP_CTL */
++	{0x06D4, 0x01, 0x01},   /* HPH_L_TEST */
++	{0x06D7, 0x01, 0x01},   /* HPH_R_TEST */
++	{0x0111, 0xFF, 0x20},   /* CPE_FLL_CONFIG_CTL_2 */
++};
++
++/* WH tavil_codec_reg_init_common_val (snd_soc_update_bits at the codec probe) */
++static const struct cdc_rmv tavil_common[] = {
++	{0x0C0A, 0x0F, 0x00},   /* CDC_CLSH_K2_MSB */
++	{0x0C0B, 0xFF, 0x60},   /* CDC_CLSH_K2_LSB */
++	{0x021B, 0x80, 0x00},   /* CPE_SS_DMIC_CFG: the DMICs out of reset */
++	{0x0C1A, 0x70, 0x50},   /* CDC_BOOST0_BOOST_CTL */
++	{0x0C22, 0x70, 0x50},   /* CDC_BOOST1_BOOST_CTL */
++	{0x0BCF, 0x08, 0x08},   /* CDC_RX7_RX_PATH_CFG1 */
++	{0x0BE3, 0x08, 0x08},   /* CDC_RX8_RX_PATH_CFG1 */
++	{0x0D82, 0x02, 0x02},   /* CDC_TOP_TOP_CFG1 */
++	{0x0D82, 0x01, 0x01},   /* CDC_TOP_TOP_CFG1 */
++	{0x0AC3, 0x01, 0x01},   /* CDC_TX9_SPKR_PROT_PATH_CFG0 */
++	{0x0AC7, 0x01, 0x01},   /* CDC_TX10_SPKR_PROT_PATH_CFG0 */
++	{0x0ACB, 0x01, 0x01},   /* CDC_TX11_SPKR_PROT_PATH_CFG0 */
++	{0x0ACF, 0x01, 0x01},   /* CDC_TX12_SPKR_PROT_PATH_CFG0 */
++	{0x006C, 0x01, 0x01},   /* DATA_HUB_SB_TX11_INP_CFG */
++	{0x0D42, 0x01, 0x01},   /* CDC_CLK_RST_CTRL_FS_CNT_CONTROL */
++	{0x0B34, 0x80, 0x80},   /* CDC_COMPANDER7_CTL3 */
++	{0x0B3C, 0x80, 0x80},   /* CDC_COMPANDER8_CTL3 */
++	{0x0B38, 0x01, 0x01},   /* CDC_COMPANDER7_CTL7 */
++	{0x0B40, 0x01, 0x01},   /* CDC_COMPANDER8_CTL7 */
++	{0x0002, 0x08, 0x00},   /* CODEC_RPM_CLK_GATE */
++	{0x8019, 0xFF, 0x0A},   /* TLMM_DMIC3_CLK_PINCFG */
++	{0x801A, 0xFF, 0x0A},   /* TLMM_DMIC3_DATA_PINCFG */
++	{0x0214, 0x60, 0x00},   /* CPE_SS_SVA_CFG */
++	{0x021C, 0x10, 0x10},   /* CPE_SS_CPAR_CFG */
++};
++
++/* WH tavil_codec_reg_init_1_1_val */
++static const struct cdc_rmv tavil_1_1[] = {
++	{0x0B08, 0x1E, 0x06},   /* CDC_COMPANDER1_CTL7 */
++	{0x0B10, 0x1E, 0x06},   /* CDC_COMPANDER2_CTL7 */
++	{0x0733, 0xFF, 0x84},   /* HPH_NEW_INT_RDAC_HD2_CTL_L */
++	{0x0736, 0xFF, 0x84},   /* HPH_NEW_INT_RDAC_HD2_CTL_R */
++	{0x0B85, 0xFC, 0xF4},   /* CDC_RX3_RX_PATH_SEC0 */
++	{0x0B99, 0xFC, 0xF4},   /* CDC_RX4_RX_PATH_SEC0 */
++};
++
++/* WH cpr_defaults: {wr_data, wr_addr}, each 4 bytes little-endian to CPR_WR_DATA_0 / WR_ADDR_0 */
++static const uint32_t tavil_cpr[16][2] = {
++	{0x00000820, 0x00000094}, {0x00000fC0, 0x00000048}, {0x0000f000, 0x00000044}, {0x0000bb80, 0xC0000178},
++	{0x00000000, 0x00000160}, {0x10854522, 0x00000060}, {0x10854509, 0x00000064}, {0x108544dd, 0x00000068},
++	{0x108544ad, 0x0000006C}, {0x0000077E, 0x00000070}, {0x000007da, 0x00000074}, {0x00000000, 0x00000078},
++	{0x00000000, 0x0000007C}, {0x00042029, 0x00000080}, {0x4002002A, 0x00000090}, {0x4002002B, 0x00000090},
++};
++
++static int
++cdc_table(const struct cdc_rmv *t, unsigned n)
++{
++	unsigned i;
++	int err = 0;
++	for (i = 0; i < n && err == 0; i++) {
++		err = cdc_update(t[i].reg, t[i].mask, t[i].val);
++	}
++	return err;
++}
++
++static int
++cdc_write32(uint16_t reg, uint32_t v)   /* one 4-byte CHANGE_VALUE, as regmap_bulk_write */
++{
++	uint8_t b[4];
++	b[0] = (uint8_t)v;
++	b[1] = (uint8_t)(v >> 8);
++	b[2] = (uint8_t)(v >> 16);
++	b[3] = (uint8_t)(v >> 24);
++	return cdc_write_n(reg, b, 4);
++}
++
++static void
++gpio13_log(const char *when, const struct pmg *g)
++{
++	LOG("4: pm8998 gpio13 %s:%s subtype %#x mode %#x vin %#x pull %#x src %#x out %#x en %#x", when,
++	    g->ok ? "" : " (SPMI READ FAILED)", g->sub, g->mode, g->vin, g->pull, g->src, g->out, g->en);
++}
++
++/*
++ * PM8998 GPIO13 as live.dts gpio@cc00: output, CMOS, no pull (5), VIN0, low strength (1), source 3
++ * = func2 (DIV_CLK1), enabled. LV/MV subtypes (0x10, 0x11) have the source in register 0x44.
++ */
++static bool
++gpio13_mclk(const struct pmg *g)
++{
++	bool lvmv = g->sub == 0x10 || g->sub == 0x11;
++	bool ok = sweet_pmic_write(MCLK_PPID, 0x41, 0x00) && sweet_pmic_write(MCLK_PPID, 0x42, 0x05);
++	if (lvmv) {
++		ok = ok && sweet_pmic_write(MCLK_PPID, 0x44, 0x03) && sweet_pmic_write(MCLK_PPID, 0x45, 0x01) &&
++		    sweet_pmic_write(MCLK_PPID, 0x40, 0x01);
++	} else {
++		ok = ok && sweet_pmic_write(MCLK_PPID, 0x45, 0x01) && sweet_pmic_write(MCLK_PPID, 0x40, 0x16);
++	}
++	return ok && sweet_pmic_write(MCLK_PPID, 0x46, 0x80);
++}
++
++bool
++taimen_wcd_m4(void)
++{
++	struct pmg g0, g1;
++	int dmic = 0, gain = 4, err = 0;
++	bool rpm, pins, v11, off;
++	uint16_t micb, dctl;
++	unsigned micb_n, i, bad = 0, ncpr = 0;
++	uint8_t vol;
++
++	if (la_gen == LA_NONE || !chip_is_tavil()) {
++		LOG("4: no codec (M3)");
++		return false;
++	}
++	(void)PE_parse_boot_argn("taimenmicdmic", &dmic, sizeof(dmic));
++	(void)PE_parse_boot_argn("taimenmicgain", &gain, sizeof(gain));
++	if (dmic < 0 || dmic > 5) {
++		dmic = 0;
++	}
++	if (gain < -84) {
++		gain = -84;
++	} else if (gain > 40) {
++		gain = 40;
++	}
++	vol = (uint8_t)(int8_t)gain;            /* SOC_SINGLE_SX_TLV: dB as a signed byte */
++	micb = (uint16_t)(dmic < 2 ? R_MICB1 : dmic < 4 ? R_MICB3 : R_MICB4);
++	micb_n = dmic < 2 ? 1u : dmic < 4 ? 3u : 4u;
++	dctl = (uint16_t)(R_DMIC0_CTL + (unsigned)dmic / 2);
++	v11 = chip_id[0] == 0x01 && chip_id[1] == 0x00;
++
++	/* MCLK 9.6 MHz: RPM DIV_CLK1 (clka 0xb, swen) out of PM8998 GPIO13 (WH audio-ext-clk.c audio_pmi_clk) */
++	pmg_read(&g0);
++	gpio13_log("before", &g0);
++	rpm = sweet_rpm_xo_buffer(RPM_DIV_CLK1);
++	pins = g0.ok && gpio13_mclk(&g0);
++	pmg_read(&g1);
++	gpio13_log("after", &g1);
++	LOG("4: DIV_CLK1 (clka 0xb) on: %s; pm8998 gpio13 mode %#x src %#x en %#x%s", rpm ? "ok" : "NOT acked", g1.mode,
++	    g1.src, g1.en, pins ? "" : " (GPIO13 NOT configured)");
++
++	n_expect = 0;
++	n_cdc_err = 0;
++	n_cdc_writes = 0;
++	n_cdc_same = 0;
++	tracking = true;
++	/* once (WH tavil_probe, tavil_codec_probe): the MCLK rate, the defaults */
++	err = cdc_update(R_RPM_CLK_MCLK_CFG, 0x03, 0x01);                       /* 9.6 MHz */
++	err = err != 0 ? err : cdc_table(tavil_defaults, NELEM(tavil_defaults));
++	/* the codec's clock (WH __tavil_cdc_mclk_enable: SVS vote, master bias, MCLK; ANA_CLK_TOP is Tasha's) */
++	err = err != 0 ? err : cdc_update(R_PSTATE_CTL_0, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x80, 0x80);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x40, 0x40);
++	taimen_mic_msleep(1);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x40, 0x00);
++	err = err != 0 ? err : cdc_update(R_ANA_BIAS, 0x20, 0x00);
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x80, 0x80);
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x30, 0x00);     /* no divider at 9.6 MHz */
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x02, 0x00);
++	err = err != 0 ? err : cdc_update(R_CLK_SYS_MCLK_PRG, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_FS_CNT_CONTROL, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_MCLK_CONTROL, 0x01, 0x01);
++	err = err != 0 ? err : cdc_update(R_RPM_CLK_GATE, 0x03, 0x00);
++	delay(10);
++	LOG("4: clock: ANA_BIAS %#x MCLK_PRG %#x MCLK_CONTROL %#x%s", cdc_get(R_ANA_BIAS), cdc_get(R_CLK_SYS_MCLK_PRG),
++	    cdc_get(R_MCLK_CONTROL), err != 0 ? " (an access FAILED)" : "");
++	/* CPR with the MCLK on (WH tavil_update_cpr_defaults, v1.1 only) */
++	if (v11) {
++		err = err != 0 ? err : cdc_write(R_CPR_SVS2_MIN_CX_VDD, 0x2C);
++		err = err != 0 ? err : cdc_update(R_RPM_CLK_GATE, 0x10, 0x00);
++		for (i = 0; i < NELEM(tavil_cpr) && err == 0; i++) {
++			err = cdc_write32(R_CPR_WR_DATA_0, tavil_cpr[i][0]);
++			err = err != 0 ? err : cdc_write32(R_CPR_WR_ADDR_0, tavil_cpr[i][1]);
++			ncpr += err == 0;
++		}
++	}
++	/* WH tavil_codec_init_reg and tavil_handle_pdata: MIC BIAS 1.8 V, DMIC clock drive 2 mA, MAD rate */
++	err = err != 0 ? err : cdc_table(tavil_common, NELEM(tavil_common));
++	if (v11) {
++		err = err != 0 ? err : cdc_table(tavil_1_1, NELEM(tavil_1_1));
++	}
++	err = err != 0 ? err : cdc_update(R_MICB1, 0x3F, 0x10);
++	err = err != 0 ? err : cdc_update(R_MICB2, 0x3F, 0x10);
++	err = err != 0 ? err : cdc_update(R_MICB3, 0x3F, 0x10);
++	err = err != 0 ? err : cdc_update(R_MICB4, 0x3F, 0x10);
++	err = err != 0 ? err : cdc_update(R_PAD_DRVCTL_0, 0x0C, 0x00);
++	err = err != 0 ? err : cdc_update(R_DMIC0_CTL, 0x0E, 5u << 1);         /* /16: 600 kHz */
++	err = err != 0 ? err : cdc_update(R_DMIC0_CTL + 1, 0x0E, 5u << 1);
++	err = err != 0 ? err : cdc_update(R_DMIC0_CTL + 2, 0x0E, 5u << 1);
++	LOG("4: defaults %u+%u+%u, CPR %u: %s (%u writes, %u already set)", NELEM(tavil_defaults), NELEM(tavil_common),
++	    v11 ? NELEM(tavil_1_1) : 0u, ncpr, err == 0 ? "ok" : "FAILED", n_cdc_writes, n_cdc_same);
++
++	/* the TX path, muted (the mixer path dmic1 and handset-mic; WH tavil_dec_enum_put, the DMIC and DEC7
++	 * widgets, hw_params at 48 kHz) */
++	err = err != 0 ? err : cdc_update(R_ADC_MUX3_CFG1, 0x0C, 0x00);          /* ADC MUX7 = DMIC */
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CFG0, 0x80, 0x80);          /* ... and DEC7's DMIC select */
++	err = err != 0 ? err : cdc_update(R_ADC_MUX7_CFG0, 0x38, (uint8_t)((dmic + 1) << 3));
++	err = err != 0 ? err : cdc_update(R_IF_ROUTER_TX_MUX_CFG1, 0xC0, 0x80);  /* CDC_IF TX7 MUX = DEC7 */
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CTL, 0x0F, 0x04);           /* 48 kHz */
++	err = err != 0 ? err : cdc_update(micb, 0xC0, 0x40);                     /* MIC BIAS on */
++	taimen_mic_msleep(1);
++	err = err != 0 ? err : cdc_update(dctl, 0x0E, 2u << 1);                  /* /4: 2.4 MHz */
++	err = err != 0 ? err : cdc_update(dctl, 0x01, 0x01);                     /* the DMIC clock */
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CTL, 0x10, 0x10);           /* mute */
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CTL, 0x20, 0x20);           /* DEC7 clock */
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_CFG0, 0x60, 2u << 5);       /* HPF 150 Hz */
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_SEC2, 0x02, 0x02);
++	taimen_mic_msleep(1);
++	err = err != 0 ? err : cdc_update(R_TX7_PATH_SEC2, 0x02, 0x00);
++	err = err != 0 ? err : cdc_write(R_TX7_VOL_CTL, vol);
++	tracking = false;
++	LOG("4: TX7: DMIC%d -> DEC7 -> TX7, MICB%u %#x, DMIC%u_CTL %#x, TX7 CTL %#x CFG0 %#x VOL %#x%s", dmic, micb_n,
++	    cdc_get(micb), (unsigned)dmic / 2, cdc_get(dctl), cdc_get(R_TX7_PATH_CTL), cdc_get(R_TX7_PATH_CFG0),
++	    cdc_get(R_TX7_VOL_CTL), err != 0 ? " (an access FAILED)" : "");
++	if (err != 0) {
++		LOG("4: register %#06x FAILED (%d), %u failures: the rest of the sequence was skipped", first_bad_reg,
++		    first_bad_err, n_cdc_err);
++	}
++	for (i = 0; i < n_expect; i++) {
++		uint8_t v = 0xEE;
++		int e = cdc_read_hw(expect[i].reg, &v, 1);
++		if (e != 0 || (v & expect[i].mask) != expect[i].val) {
++			if (bad++ < 16) {
++				LOG("4: %#06x read %#x%s, written %#x under mask %#x", expect[i].reg, v, e != 0 ? " (FAILED)" : "",
++				    expect[i].val, expect[i].mask);
++			}
++		}
++	}
++	if (err == 0 && bad == 0) {
++		LOG("4: M4 %u registers read back as written", n_expect);
++	} else {
++		LOG("4: M4 NOT reached: %u of %u registers did not read back as written", bad, n_expect);
++	}
++
++	/* down (WH: the DEC7 and DMIC widgets, MIC BIAS, MCLK and master bias off, the SVS vote, the ext clock) */
++	(void)cdc_update(R_TX7_PATH_CTL, 0x10, 0x10);
++	(void)cdc_update(R_TX7_PATH_CTL, 0x20, 0x00);
++	(void)cdc_update(dctl, 0x01, 0x00);
++	(void)cdc_update(dctl, 0x0E, 5u << 1);
++	(void)cdc_update(micb, 0xC0, 0x00);
++	(void)cdc_update(R_CLK_SYS_MCLK_PRG, 0x81, 0x00);
++	(void)cdc_update(R_ANA_BIAS, 0xA0, 0x00);
++	(void)cdc_update(R_PSTATE_CTL_0, 0x01, 0x00);
++	off = sweet_rpm_kv_both("clka div_clk1 off", RPM_CLKA, RPM_DIV_CLK1, RPM_SWEN, 0);
++	LOG("4: down: TX7 CTL %#x, DMIC%u_CTL %#x, MICB%u %#x, MCLK_PRG %#x, ANA_BIAS %#x, PSTATE %#x; DIV_CLK1 off: %s",
++	    cdc_get(R_TX7_PATH_CTL), (unsigned)dmic / 2, cdc_get(dctl), micb_n, cdc_get(micb), cdc_get(R_CLK_SYS_MCLK_PRG),
++	    cdc_get(R_ANA_BIAS), cdc_get(R_PSTATE_CTL_0), off ? "ok" : "NOT acked");
++	return err == 0 && bad == 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 6a6fb7d..f36b316 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -54,6 +54,10 @@
+  *   0xcf and 0xce) and for the absent WCD9335 as a negative control.
+  * 3 (0348): codec registers as value elements (REQUEST_VALUE / CHANGE_VALUE, page register 0x00):
+  *   the chip id 01 00 08 01 (WCD9340 v1.1), wcd934x_bringup read back, an interface register.
++ * 4 (0349): the codec's MCLK (RPM DIV_CLK1 out of PM8998 GPIO13 func2, 9.6 MHz), its register
++ *   defaults, CPR and clock, then the TX path DMICn -> DEC7 -> SLIM TX7, muted (taimenmicdmic=n,
++ *   default 0; taimenmicgain=dB, default +4); every register written is read back, then all of
++ *   it goes down again and DIV_CLK1 off. Nothing is recorded yet.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -89,6 +93,7 @@ bool taimen_slim_up(taimen_slim_idle_t idle);
+ void taimen_wcd_census(void);
+ bool taimen_wcd_m2(void);
+ bool taimen_wcd_m3(void);
++bool taimen_wcd_m4(void);
+ }
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+@@ -2806,9 +2811,15 @@ mic_stages(void)
+ 		MLOG("3: M3 NOT reached; the microphone stages end here");
+ 		return;
+ 	}
+-	if (mic_level > 3) {
+-		MLOG("taimenmic=%d: stages 4 and up are not built yet", mic_level);
++	if (mic_level < 4) {
++		return;
++	}
++	MLOG("t=%u.%03u stage 4", T);
++	if (!taimen_wcd_m4()) {
++		MLOG("4: M4 NOT reached (the codec's clock and TX path are down again)");
++		return;
+ 	}
++	MLOG("t=%u.%03u M4 done%s", T, mic_level > 4 ? "; stages 5 and up are not built yet" : "");
+ }
+ 
+ /* ---------------------------------------------------------------- the thread */
