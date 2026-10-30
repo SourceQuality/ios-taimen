@@ -1,0 +1,408 @@
+diff --git a/bsd/dev/taimen_slim.c b/bsd/dev/taimen_slim.c
+index 8acd9a7..ba8589e 100644
+--- a/bsd/dev/taimen_slim.c
++++ b/bsd/dev/taimen_slim.c
+@@ -33,6 +33,9 @@ typedef void (*taimen_slim_idle_t)(void);
+ bool taimen_slim_up(taimen_slim_idle_t idle);
+ bool taimen_slim_ready(void);
+ int taimen_slim_addr_query(const uint8_t ea[6], unsigned tries, uint8_t *la, unsigned *used);
++int taimen_slim_read(uint8_t la, uint16_t elem, uint8_t *buf, unsigned n);
++int taimen_slim_write(uint8_t la, uint16_t elem, const uint8_t *buf, unsigned n);
++void taimen_slim_counts(unsigned *reads, unsigned *writes, unsigned *nacks, unsigned *timeouts);
+ void taimen_mic_msleep(unsigned ms);
+ uint64_t taimen_mic_now_ms(void);
+ 
+@@ -97,7 +100,7 @@ static unsigned got_rl;
+ static bool cap_seen;
+ static uint8_t cap_buf[40];
+ static unsigned cap_rl;
+-static unsigned n_nacks, n_timeouts, n_rx, n_stray, n_ieve, n_txerr, tx_timeouts_row;
++static unsigned n_reads, n_writes, n_nacks, n_timeouts, n_rx, n_stray, n_ieve, n_txerr, tx_timeouts_row;
+ static int mic_sleep_chan;
+ 
+ void
+@@ -317,6 +320,21 @@ tid_new(void)
+ 	return next_tid++;
+ }
+ 
++/* WH slim_slicesize: 1, 2, 3, 4, 6, 8, 12 or 16 bytes */
++static bool
++slice_code(unsigned n, uint16_t *code)
++{
++	static const uint8_t sizes[8] = {1, 2, 3, 4, 6, 8, 12, 16};
++	uint16_t i;
++	for (i = 0; i < 8; i++) {
++		if (sizes[i] == n) {
++			*code = i;
++			return true;
++		}
++	}
++	return false;
++}
++
+ bool
+ taimen_slim_ready(void)
+ {
+@@ -468,4 +486,84 @@ taimen_slim_addr_query(const uint8_t ea[6], unsigned tries, uint8_t *la, unsigne
+ 	*used = i;
+ 	return err;
+ }
++
++/* REQUEST_VALUE: n bytes of value elements from elem on the device at la, the REPLY_VALUE's data. */
++int
++taimen_slim_read(uint8_t la, uint16_t elem, uint8_t *buf, unsigned n)
++{
++	uint8_t m[8];
++	uint16_t ec = 0;
++	unsigned i;
++	int err = EINVAL;
++
++	if (!slice_code(n, &ec) || elem > 0xFFF) {
++		return EINVAL;
++	}
++	ec = (uint16_t)(ec | 0x8u | (unsigned)(elem << 4));
++	for (i = 0; i < RW_TRIES; i++) {
++		uint8_t tid = tid_new();
++		unsigned rl = hdr(m, MT_CORE, MC_REQUEST_VALUE, la, 3);
++		m[3] = tid;
++		m[4] = (uint8_t)ec;
++		m[5] = (uint8_t)(ec >> 8);
++		err = xfer(m, rl, (int)MC_REPLY_VALUE, tid, VALUE_WAIT_MS);
++		if (err == 0 && got_rl == 4 + n) {
++			memcpy(buf, got_buf + 4, n);
++			n_reads++;
++			return 0;
++		}
++		if (err == 0) {
++			LOG("slim: REPLY_VALUE of %#x@%#x: RL %u for %u bytes", elem, la, got_rl, n);
++			err = EBADMSG;
++		}
++		if (slim_dead || err == ENODEV) {
++			break;
++		}
++		taimen_mic_msleep(5);
++	}
++	return err;
++}
++
++/* CHANGE_VALUE: n bytes to the value elements from elem on the device at la; done when sent. */
++int
++taimen_slim_write(uint8_t la, uint16_t elem, const uint8_t *buf, unsigned n)
++{
++	uint8_t m[24];
++	uint16_t ec = 0;
++	unsigned i, rl;
++	int err = EINVAL;
++
++	if (!slice_code(n, &ec) || elem > 0xFFF) {
++		return EINVAL;
++	}
++	ec = (uint16_t)(ec | 0x8u | (unsigned)(elem << 4));
++	for (i = 0; i < RW_TRIES; i++) {
++		rl = hdr(m, MT_CORE, MC_CHANGE_VALUE, la, 2 + n);
++		m[3] = (uint8_t)ec;
++		m[4] = (uint8_t)(ec >> 8);
++		memcpy(m + 5, buf, n);
++		err = xfer(m, rl, -1, 0, 0);
++		if (err == 0) {
++			n_writes++;
++			return 0;
++		}
++		if (slim_dead || err == ENODEV) {
++			break;
++		}
++		taimen_mic_msleep(5);
++	}
++	return err;
++}
++
++void
++taimen_slim_counts(unsigned *reads, unsigned *writes, unsigned *nacks, unsigned *timeouts)
++{
++	*reads = n_reads;
++	*writes = n_writes;
++	*nacks = n_nacks;
++	*timeouts = n_timeouts;
++	if (n_stray != 0 || n_ieve != 0) {
++		LOG("slim: %u messages received, %u not waited for; IE/VE change seen %u times", n_rx, n_stray, n_ieve);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/bsd/dev/taimen_wcd934x.c b/bsd/dev/taimen_wcd934x.c
+index 85fa9ca..b0d10be 100644
+--- a/bsd/dev/taimen_wcd934x.c
++++ b/bsd/dev/taimen_wcd934x.c
+@@ -10,6 +10,8 @@
+  *   M2 (taimenmic>=2)      gpio64 low 20 ms, high 20 ms (taimenmicrst=0: no low pulse if it is
+  *                          already high); ADDR_QUERY for the generic and interface devices and the
+  *                          absent WCD9335 (a negative control)
++ *   M3 (taimenmic>=3)      chip id 01 00 08 01, wcd934x_bringup, an interface register written and
++ *                          read back
+  * Call from the audio thread, after taimen_slim_up.
+  */
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+@@ -23,9 +25,13 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ extern int taimen_slim_addr_query(const uint8_t ea[6], unsigned tries, uint8_t *la, unsigned *used);
++extern int taimen_slim_read(uint8_t la, uint16_t elem, uint8_t *buf, unsigned n);
++extern int taimen_slim_write(uint8_t la, uint16_t elem, const uint8_t *buf, unsigned n);
++extern void taimen_slim_counts(unsigned *reads, unsigned *writes, unsigned *nacks, unsigned *timeouts);
+ extern void taimen_mic_msleep(unsigned ms);
+ void taimen_wcd_census(void);
+ bool taimen_wcd_m2(void);
++bool taimen_wcd_m3(void);
+ 
+ #define LOG(fmt, ...)           printf("TAIMEN MIC: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -38,6 +44,7 @@ bool taimen_wcd_m2(void);
+ #define MCLK_PPID               0x0CCu          /* PM8998 GPIO 13, SPMI 0xCC00 (live.dts gpio@cc00) */
+ 
+ #define LA_NONE                 0xFFu
++#define ELEM_BASE               0x800u          /* WH WCD9XXX_REGISTER_START_OFFSET */
+ 
+ static vm_offset_t rst_pin;
+ static uint8_t la_gen = LA_NONE, la_ifd = LA_NONE;
+@@ -162,4 +169,202 @@ taimen_wcd_m2(void)
+ 	LOG("2: M2 the WCD9340 is on the bus: generic %#x, interface %#x", la_gen, la_ifd);
+ 	return true;
+ }
++
++/* ---- codec registers (WH wcd9xxx_page_write, wcd9xxx_slim_read_device / write_device) ---- */
++
++#define SHADOW_N                160u
++
++static int cur_page = -1;
++static struct { uint16_t reg; uint8_t val; } shadow[SHADOW_N];
++static unsigned n_shadow;
++static unsigned n_cdc_writes, n_cdc_err;
++static uint16_t first_bad_reg;
++static int first_bad_err;
++static uint8_t chip_id[4];
++
++static int
++shadow_find(uint16_t reg)
++{
++	unsigned i;
++	for (i = 0; i < n_shadow; i++) {
++		if (shadow[i].reg == reg) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static void
++shadow_set(uint16_t reg, uint8_t v)
++{
++	int i = shadow_find(reg);
++	if (i >= 0) {
++		shadow[i].val = v;
++	} else if (n_shadow < SHADOW_N) {
++		shadow[n_shadow].reg = reg;
++		shadow[n_shadow].val = v;
++		n_shadow++;
++	}
++}
++
++static void
++cdc_failed(uint16_t reg, int err)
++{
++	if (n_cdc_err++ == 0) {
++		first_bad_reg = reg;
++		first_bad_err = err;
++	}
++}
++
++static int
++cdc_page(uint16_t reg)
++{
++	uint8_t pg = (uint8_t)(reg >> 8);
++	int err;
++	if (cur_page == (int)pg) {
++		return 0;
++	}
++	err = taimen_slim_write(la_gen, ELEM_BASE, &pg, 1);
++	cur_page = err == 0 ? (int)pg : -1;
++	return err;
++}
++
++/* n bytes from reg on (same page), from the codec */
++static int
++cdc_read_hw(uint16_t reg, uint8_t *buf, unsigned n)
++{
++	int err = cdc_page(reg);
++	if (err == 0) {
++		err = taimen_slim_read(la_gen, (uint16_t)(ELEM_BASE + (reg & 0xFFu)), buf, n);
++	}
++	if (err != 0) {
++		cdc_failed(reg, err);
++	}
++	return err;
++}
++
++static int
++cdc_write_n(uint16_t reg, const uint8_t *buf, unsigned n)
++{
++	int err = cdc_page(reg);
++	if (err == 0) {
++		err = taimen_slim_write(la_gen, (uint16_t)(ELEM_BASE + (reg & 0xFFu)), buf, n);
++	}
++	if (err != 0) {
++		cdc_failed(reg, err);
++	}
++	return err;
++}
++
++static int
++cdc_write(uint16_t reg, uint8_t v)
++{
++	int err = cdc_write_n(reg, &v, 1);
++	if (err == 0) {
++		n_cdc_writes++;
++		shadow_set(reg, v);
++	}
++	return err;
++}
++
++static uint8_t
++cdc_get(uint16_t reg)           /* a fresh read for the log (0xEE when it fails) */
++{
++	uint8_t v = 0xEE;
++	(void)cdc_read_hw(reg, &v, 1);
++	return v;
++}
++
++static int
++ifd_write(uint16_t reg, uint8_t v)
++{
++	return taimen_slim_write(la_ifd, (uint16_t)(ELEM_BASE + reg), &v, 1);
++}
++
++static int
++ifd_read(uint16_t reg, uint8_t *v)
++{
++	return taimen_slim_read(la_ifd, (uint16_t)(ELEM_BASE + reg), v, 1);
++}
++
++/* ---- M3: chip id, bring-up, the interface device ---- */
++
++#define R_CHIP_ID0              0x0021u         /* CHIP_TIER_CTRL_CHIP_ID_BYTE0..3 */
++#define R_RPM_CLK_GATE          0x0002u
++#define R_RPM_CLK_MCLK_CFG      0x0003u
++#define R_RPM_RST_CTL           0x0009u
++#define R_RPM_PWR_CDC_DIG_HM    0x0011u
++#define R_SIDO_VOUT_A_STARTUP   0x071Bu
++#define R_SIDO_VOUT_D_STARTUP   0x071Cu
++#define IFD_TX_OR_UR_CFG_7      0x01F7u         /* SB_PGD_PORT_TX_OR_UR_CFG(7): Tavil auto-recovery */
++
++static bool
++chip_is_tavil(void)
++{
++	return chip_id[2] == 0x08 && chip_id[3] == 0x01;        /* major 0x0108 */
++}
++
++bool
++taimen_wcd_m3(void)
++{
++	uint8_t v = 0xEE, rst, hm;
++	unsigned reads, writes, nacks, timeouts;
++	int err, e2;
++	bool before;
++
++	if (la_gen == LA_NONE || la_ifd == LA_NONE) {
++		LOG("3: no logical addresses (M2)");
++		return false;
++	}
++	cur_page = -1;
++	n_cdc_err = 0;
++	memset(chip_id, 0xEE, sizeof(chip_id));
++	err = cdc_read_hw(R_CHIP_ID0, chip_id, 4);
++	before = err == 0 && chip_is_tavil();
++	LOG("3: chip id (before the bring-up) %02x %02x %02x %02x%s", chip_id[0], chip_id[1], chip_id[2], chip_id[3],
++	    err != 0 ? " (READ FAILED)" : "");
++	if (err != 0) {
++		LOG("3: REQUEST_VALUE got no REPLY_VALUE (%d): element-code encoding or the LA", err);
++		return false;
++	}
++	/* WH wcd934x_bringup (wcd9xxx_device_init runs it before the chip id read) */
++	err = cdc_write(R_RPM_RST_CTL, 0x01);
++	err = err != 0 ? err : cdc_write(R_SIDO_VOUT_A_STARTUP, 0x19);
++	err = err != 0 ? err : cdc_write(R_SIDO_VOUT_D_STARTUP, 0x15);
++	taimen_mic_msleep(1);
++	err = err != 0 ? err : cdc_write(R_RPM_PWR_CDC_DIG_HM, 0x05);
++	err = err != 0 ? err : cdc_write(R_RPM_PWR_CDC_DIG_HM, 0x07);
++	err = err != 0 ? err : cdc_write(R_RPM_RST_CTL, 0x03);
++	err = err != 0 ? err : cdc_write(R_RPM_RST_CTL, 0x07);
++	err = err != 0 ? err : cdc_write(R_RPM_PWR_CDC_DIG_HM, 0x03);
++	rst = cdc_get(R_RPM_RST_CTL);
++	hm = cdc_get(R_RPM_PWR_CDC_DIG_HM);
++	LOG("3: bring-up%s read back: RST_CTL %#x DIG_HM_CTL %#x", err != 0 ? " FAILED," : "", rst, hm);
++	if (!before) {
++		e2 = cdc_read_hw(R_CHIP_ID0, chip_id, 4);
++		LOG("3: chip id after the bring-up %02x %02x %02x %02x%s", chip_id[0], chip_id[1], chip_id[2], chip_id[3],
++		    e2 != 0 ? " (READ FAILED)" : "");
++	}
++	if (chip_is_tavil()) {
++		LOG("3: chip id %02x %02x %02x %02x: WCD9340 v1.%u", chip_id[0], chip_id[1], chip_id[2], chip_id[3],
++		    chip_id[0] == 0x01 && chip_id[1] == 0x00 ? 1u : 0u);
++	} else {
++		LOG("3: chip id %02x %02x %02x %02x is NOT a WCD934x (major 0x0108): wrong LA or page", chip_id[0],
++		    chip_id[1], chip_id[2], chip_id[3]);
++	}
++	e2 = ifd_write(IFD_TX_OR_UR_CFG_7, 0x02);
++	if (e2 == 0) {
++		e2 = ifd_read(IFD_TX_OR_UR_CFG_7, &v);
++	}
++	LOG("3: interface %#x wrote 0x02 read %#x%s", ELEM_BASE + IFD_TX_OR_UR_CFG_7, v, e2 != 0 ? " (FAILED)" : "");
++	taimen_slim_counts(&reads, &writes, &nacks, &timeouts);
++	if (err != 0 || !chip_is_tavil()) {
++		LOG("3: M3 NOT reached: %u reads, %u writes, %u NACKs, %u timeouts", reads, writes, nacks, timeouts);
++		return false;
++	}
++	/* the milestone is the chip id; a read-back mismatch is logged and M4 still runs */
++	LOG("3: M3 %u reads, %u writes, %u NACKs, %u timeouts%s", reads, writes, nacks, timeouts,
++	    e2 != 0 || v != 0x02 || rst != 0x07 || hm != 0x03 ? " (a read-back above is NOT as written)" : "");
++	return true;
++}
+ #endif /* ARM64_BOARD_CONFIG_TAIMEN */
+diff --git a/iokit/Kernel/arm/TaimenAudio.cpp b/iokit/Kernel/arm/TaimenAudio.cpp
+index 6351c19..6a6fb7d 100755
+--- a/iokit/Kernel/arm/TaimenAudio.cpp
++++ b/iokit/Kernel/arm/TaimenAudio.cpp
+@@ -52,6 +52,8 @@
+  * 2 (0347): the codec's reset (TLMM gpio64 low 20 ms, high 20 ms; taimenmicrst=0: no low pulse
+  *   if it is already high), then ADDR_QUERY for its generic and interface devices (Android: LA
+  *   0xcf and 0xce) and for the absent WCD9335 as a negative control.
++ * 3 (0348): codec registers as value elements (REQUEST_VALUE / CHANGE_VALUE, page register 0x00):
++ *   the chip id 01 00 08 01 (WCD9340 v1.1), wcd934x_bringup read back, an interface register.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -86,6 +88,7 @@ typedef void (*taimen_slim_idle_t)(void);
+ bool taimen_slim_up(taimen_slim_idle_t idle);
+ void taimen_wcd_census(void);
+ bool taimen_wcd_m2(void);
++bool taimen_wcd_m3(void);
+ }
+ 
+ #define LOG(fmt, ...)           IOLog("TAIMEN AUDIO: " fmt "\n", ##__VA_ARGS__)
+@@ -2795,8 +2798,16 @@ mic_stages(void)
+ 		MLOG("2: M2 NOT reached; the microphone stages end here");
+ 		return;
+ 	}
+-	if (mic_level > 2) {
+-		MLOG("taimenmic=%d: stages 3 and up are not built yet", mic_level);
++	if (mic_level < 3) {
++		return;
++	}
++	MLOG("t=%u.%03u stage 3", T);
++	if (!taimen_wcd_m3()) {
++		MLOG("3: M3 NOT reached; the microphone stages end here");
++		return;
++	}
++	if (mic_level > 3) {
++		MLOG("taimenmic=%d: stages 4 and up are not built yet", mic_level);
+ 	}
+ }
+ 
