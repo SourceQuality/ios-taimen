@@ -1,0 +1,38 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 0e8d457..89a077c 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -672,10 +672,24 @@ submitStats(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t ring_wait, uint64_t
+ 	start = n = cache = ring = wait = pages = dirty = 0;
+ }
+ 
++/*
++ * 0368: taimensurfflush=1 cleans every listed surface buffer whole at each submit, whatever its seed says (a
++ * diagnostic, costly). Boots 235-236: Maps's place-card photos, 256x256 '420f' tiles, kept magenta and green blocks
++ * along their tops through scrolls: perhaps a writer that leaves the seed alone, so its lines never reach memory.
++ */
++static int gSurfFlushAll = -1;
++
+ /* Lock held. in: struct sweet_gpu_submit, ibs, handles. */
+ IOReturn
+ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ {
++	if (gSurfFlushAll < 0) {
++		int on = 0;
++		gSurfFlushAll = PE_parse_boot_argn("taimensurfflush", &on, sizeof(on)) && on != 0;
++		if (gSurfFlushAll) {
++			printf("SWEET GPU: every surface buffer cleaned at every submit (taimensurfflush)\n");
++		}
++	}
+ 	struct sweet_gpu_submit h;
+ 	if (len < sizeof(h)) {
+ 		return kIOReturnBadArgument;
+@@ -711,7 +725,7 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 			 * CPU writers lock them; the seed moves at each write unlock.
+ 			 */
+ 			uint32_t seed = sweet_surface_seed_value(b->surface);
+-			if (seed != b->seed) {
++			if (seed != b->seed || gSurfFlushAll) {
+ 				for (uint32_t p = 0; p < b->npages; p++) {
+ 					flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
+ 				}
