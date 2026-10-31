@@ -549,6 +549,7 @@ static void notified(void *context,uint64_t value) {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
+ NSMutableDictionary *_userDictionary;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -841,6 +842,11 @@ static void scheduled(void *context);
 - (void)dealloc {nmb_command_buffer_release(_handle);}
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
+// MTLCommandBuffer SPI: a dictionary that lives as long as the command buffer. MPS keeps its temporary textures' bookkeeping
+// there (MPSAutoTexture); PridePosterExtension died on it, unrecognized, in boot 248 (uncaught exception, SIGABRT).
+- (NSMutableDictionary *)userDictionary {
+ @synchronized(self){if(!_userDictionary)_userDictionary=[NSMutableDictionary dictionary];return _userDictionary;}
+}
 // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
 // the command buffer.
 - (uint64_t)protectionOptions {return 0;}
