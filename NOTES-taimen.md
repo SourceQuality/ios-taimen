@@ -1632,3 +1632,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   in every photo. surfpng.py's rendering of the dump matches the screen; the 448x600 photo is clean. mediaserverd's
   decoder buffers carry IOSurfacePlaneBase (region start) and IOSurfacePlaneExtendedPixels* = 71 (luma) / 35 (chroma)
   with 768-byte rows, already aligned. 0370: a creator that gives any plane offset or size keeps its row bytes.
+- 2026-10-31 **boot 239 (r182 = +0370: planes their creator placed keep its row bytes): the place-card photos are
+  clean**, the Cheese School and the others along the strip. Maps's 450x600 '420f' surfaces now report 464-byte rows
+  (as asked; sweetgl copies them, as the GPU can't sample 464 in place), the 448x600 ones 448. No copy errors, no GPU
+  hang; crashes only driverkitd and CacheDeleteExtension.
