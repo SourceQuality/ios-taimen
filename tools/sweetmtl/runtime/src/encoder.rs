@@ -498,6 +498,8 @@ pub struct RenderCommandEncoder {
     depth_bias: [f32; 3],
     /// setDepthClipMode: MTLDepthClipModeClamp (Gallium depth_clamp) instead of Metal's default clip
     depth_clamp: bool,
+    /// the pass descriptor's visibilityResultBuffer
+    visibility: Option<Buffer>,
 }
 
 fn attachment(texture: &Texture, level: u64, slice: u64, depth_plane: u64, load: LoadAction, clear: [f64; 4],
@@ -732,6 +734,7 @@ impl CommandBuffer {
             blend_color: [0.0; 4],
             depth_bias: [0.0; 3],
             depth_clamp: false,
+            visibility: pass.visibility_result_buffer.clone(),
         })
     }
 }
@@ -837,11 +840,31 @@ impl RenderCommandEncoder {
             Err(not_yet(format!("line width {width}")))
         }
     }
-    pub fn set_visibility_result_mode(&mut self, mode: VisibilityResultMode, _offset: u64) -> Result<(), Error> {
-        match mode {
-            VisibilityResultMode::Disabled => Ok(()),
-            _ => Err(not_yet("visibility results (occlusion queries)")),
-        }
+    /// Occlusion queries into the pass's visibility result buffer (the shim's sg_ctx_visibility): the
+    /// words are written when the command buffer completes. VectorKit's Look Around uses them (boot 240:
+    /// its command buffers were refused and its round overview map stayed black).
+    pub fn set_visibility_result_mode(&mut self, mode: VisibilityResultMode, offset: u64) -> Result<(), Error> {
+        let raw = match mode {
+            VisibilityResultMode::Disabled => 0,
+            VisibilityResultMode::Boolean => 1,
+            VisibilityResultMode::Counting => 2,
+        };
+        let buffer = match (&self.visibility, raw) {
+            (_, 0) => None,
+            (None, _) => return Err(invalid("a visibility result mode without a visibility result buffer")),
+            (Some(b), _) => {
+                if offset % 8 != 0 || offset.checked_add(8).map_or(true, |end| end > b.length()) {
+                    return Err(invalid(format!("visibility result offset {offset} (buffer of {})", b.length())));
+                }
+                if !self.core.used.contains(&b.0.id) {
+                    self.core.used.push(b.0.id);
+                    no_copy_buffer(b, &mut self.core.no_copy);
+                }
+                Some(b.0.clone())
+            }
+        };
+        self.core.cmds.push(Cmd::Visibility { buffer, offset, mode: raw });
+        Ok(())
     }
     pub fn set_blend_color(&mut self, red: f32, green: f32, blue: f32, alpha: f32) {
         self.blend_color = [red, green, blue, alpha];

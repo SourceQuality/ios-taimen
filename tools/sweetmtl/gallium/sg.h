@@ -386,6 +386,12 @@ bool sg_ctx_sync_host(struct sg_device *dev, struct sg_buffer *buf, void *host, 
                       bool to_host);
 void sg_ctx_memory_barrier(struct sg_device *dev);
 
+/* Metal's setVisibilityResultMode:offset: inside a pass: from here on the samples that pass the
+ * depth and stencil tests are counted for the 64-bit word at `offset` of `buf` (mode 1 Boolean,
+ * 2 Counting), or no longer (0). The pass's end stops counting. Each word is written once the
+ * flush's fence signaled (sg_fence_resolve): the sum of the counts aimed at it. */
+bool sg_ctx_visibility(struct sg_device *dev, struct sg_buffer *buf, uint64_t offset, uint32_t mode);
+
 /* Submits what was replayed; the fence signals when the GPU finished it. */
 struct sg_fence *sg_ctx_flush(struct sg_device *dev);
 
@@ -394,6 +400,9 @@ struct sg_fence *sg_ctx_flush(struct sg_device *dev);
 /* 1 signaled, 0 timed out, -1 error. */
 int sg_fence_wait(struct sg_device *dev, struct sg_fence *fence, uint64_t timeout_ns);
 void sg_fence_free(struct sg_device *dev, struct sg_fence *fence);
+/* After the fence signaled: writes its visibility results into their buffers (takes the device
+ * lock; the buffers must still exist). Nothing to do: true at once. */
+bool sg_fence_resolve(struct sg_device *dev, struct sg_fence *fence);
 
 #ifdef __cplusplus
 }

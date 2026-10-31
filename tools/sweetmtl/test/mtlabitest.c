@@ -412,6 +412,9 @@ static void indexed_and_depth(NmbLibrary *lib)
 	for (int winding = WIND_CCW; winding >= WIND_CW; winding--) {
 		NmbTexture *rt = texture(PF_RGBA8, 16, 16, 1, TU_RT | TU_READ, SM_SHARED),
 		           *depth = texture(PF_D32F, 16, 16, 1, TU_RT, SM_PRIVATE);
+		/* visibility results: the draw counted into word 1; words 0 and 2 are never aimed at */
+		const uint64_t vis_init[3] = {0x5a5a5a5a5a5a5a5aull, 0x5a5a5a5a5a5a5a5aull, 0x5a5a5a5a5a5a5a5aull};
+		NmbBuffer *vis = nmb_buffer_new(dev, sizeof(vis_init), SM_SHARED, vis_init);
 		NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
 		struct NmbRenderPassDescriptor rp;
 		memset(&rp, 0, sizeof(rp));
@@ -423,6 +426,7 @@ static void indexed_and_depth(NmbLibrary *lib)
 		rp.depth.texture = depth;
 		rp.depth.load = LOAD_CLEAR;
 		rp.depth.clear[0] = 1.0;
+		rp.visibility = vis;
 		NmbEncoder *e = rt && depth ? nmb_render_encoder_new(cb, &rp) : NULL;
 		double vp[6] = {0, 0, 16, 16, 0, 1};
 		uint64_t sc[4] = {2, 2, 12, 12};
@@ -431,8 +435,9 @@ static void indexed_and_depth(NmbLibrary *lib)
 		if (!e || !nmb_render_set_pipeline(e, p) || !nmb_render_set_depth_stencil(e, dss) ||
 		    !nmb_render_set_viewport(e, vp) || !nmb_render_set_scissor(e, sc) ||
 		    !nmb_render_set_raster(e, CULL_BACK, (uint64_t)winding, 0) || !nmb_encoder_set_buffer(e, 1, pb, 0, 0) ||
-		    !nmb_encoder_set_buffer(e, 1, cbuf, 0, 1) ||
-		    !nmb_render_draw_indexed(e, PRIM_TRIANGLE, 6, IDX_U16, ib, 0, 1, 0, 0)) {
+		    !nmb_encoder_set_buffer(e, 1, cbuf, 0, 1) || !nmb_render_set_visibility_mode(e, 2, 8) ||
+		    !nmb_render_draw_indexed(e, PRIM_TRIANGLE, 6, IDX_U16, ib, 0, 1, 0, 0) ||
+		    !nmb_render_set_visibility_mode(e, 0, 0)) {
 			refused(what);
 			if (e)
 				nmb_encoder_discard(e);
@@ -448,7 +453,19 @@ static void indexed_and_depth(NmbLibrary *lib)
 			char detail[64];
 			snprintf(detail, sizeof(detail), "%d of 256 texels off", bad);
 			gpu_result(what, bad, detail);
+			/* the 12x12 scissor's samples passed (drawn), or none (culled) */
+			const uint64_t *words = vis ? nmb_buffer_contents(vis) : NULL;
+			uint64_t want = winding == WIND_CW ? 144 : 0;
+			char vdetail[96];
+			snprintf(vdetail, sizeof(vdetail), "%llu samples counted (%llu expected), words around it %s",
+			         words ? (unsigned long long)words[1] : 0ull, (unsigned long long)want,
+			         words && words[0] == vis_init[0] && words[2] == vis_init[2] ? "kept" : "changed");
+			gpu_result(winding == WIND_CW ? "visibility result, counting: the drawn quad"
+			                              : "visibility result, counting: the culled quad",
+			           !words || words[1] != want || words[0] != vis_init[0] || words[2] != vis_init[2], vdetail);
 		}
+		if (vis)
+			nmb_buffer_release(vis);
 		nmb_command_buffer_release(cb);
 		if (rt)
 			nmb_texture_release(rt);

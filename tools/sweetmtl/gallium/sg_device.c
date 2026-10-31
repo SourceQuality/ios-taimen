@@ -309,6 +309,7 @@ struct sg_fence *
 sg_ctx_flush(struct sg_device *dev)
 {
    struct pipe_fence_handle *fence = NULL;
+   sg_vis_drop(dev); /* flushes come between passes: one still counting was left by a failure */
    dev->pipe->flush(dev->pipe, &fence, 0);
    dev->stats.flushes++;
    if (!fence) {
@@ -317,7 +318,54 @@ sg_ctx_flush(struct sg_device *dev)
    }
    struct sg_fence *f = calloc(1, sizeof(*f));
    f->fence = fence;
+   /* the visibility queries ended so far are this submission's */
+   f->vis = dev->vis_done;
+   f->vis_count = dev->vis_count;
+   dev->vis_done = NULL;
+   dev->vis_count = dev->vis_cap = 0;
    return f;
+}
+
+bool
+sg_fence_resolve(struct sg_device *dev, struct sg_fence *fence)
+{
+   if (!fence || !fence->vis_count)
+      return true;
+   bool ok = true;
+   simple_mtx_lock(&dev->lock);
+   for (unsigned i = 0; i < fence->vis_count; i++) {
+      struct sg_vis *v = &fence->vis[i];
+      if (!v->query)
+         continue;
+      /* every query aimed at this word, summed; each then done */
+      uint64_t sum = 0;
+      for (unsigned j = i; j < fence->vis_count; j++) {
+         struct sg_vis *w = &fence->vis[j];
+         if (!w->query || w->buf != v->buf || w->offset != v->offset)
+            continue;
+         union pipe_query_result r;
+         memset(&r, 0, sizeof(r));
+         if (dev->pipe->get_query_result(dev->pipe, w->query, true, &r))
+            sum += r.u64;
+         else
+            ok = false;
+         if (w != v) {
+            dev->pipe->destroy_query(dev->pipe, w->query);
+            w->query = NULL;
+         }
+      }
+      dev->pipe->destroy_query(dev->pipe, v->query);
+      v->query = NULL;
+      if (v->buf->map)
+         memcpy((uint8_t *)v->buf->map + v->offset, &sum, sizeof(sum));
+   }
+   simple_mtx_unlock(&dev->lock);
+   free(fence->vis);
+   fence->vis = NULL;
+   fence->vis_count = 0;
+   if (!ok)
+      sg_set_error("a visibility result could not be read");
+   return ok;
 }
 
 int
@@ -335,5 +383,15 @@ sg_fence_free(struct sg_device *dev, struct sg_fence *fence)
    if (!fence)
       return;
    dev->screen->fence_reference(dev->screen, &fence->fence, NULL);
+   if (fence->vis_count) {
+      /* never resolved (the GPU timed out): the queries go unread */
+      simple_mtx_lock(&dev->lock);
+      for (unsigned i = 0; i < fence->vis_count; i++) {
+         if (fence->vis[i].query)
+            dev->pipe->destroy_query(dev->pipe, fence->vis[i].query);
+      }
+      simple_mtx_unlock(&dev->lock);
+   }
+   free(fence->vis);
    free(fence);
 }

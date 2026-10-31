@@ -94,6 +94,8 @@ pub(crate) struct ResolveCmd {
 pub(crate) enum Cmd {
     Dispatch { binds: Vec<Bind>, regions: Vec<DispatchRegion>, shared: u32 },
     BeginPass(Box<PassCmd>),
+    /// `setVisibilityResultMode:offset:` (0 disabled, 1 boolean, 2 counting) into the pass's visibility buffer
+    Visibility { buffer: Option<Arc<BufferInner>>, offset: u64, mode: u32 },
     Draw(Box<DrawCmd>),
     EndPass,
     Resolve(Box<ResolveCmd>),
@@ -202,6 +204,12 @@ fn replay(lock: &GpuLock, cmd: &Cmd) -> Result<(), String> {
                 };
                 if !ffi::sg_ctx_draw(sg, &draw) {
                     return Err(fail("draw"));
+                }
+            }
+            Cmd::Visibility { buffer, offset, mode } => {
+                let buf = buffer.as_ref().map_or(std::ptr::null_mut(), |b| b.sg.sg);
+                if !ffi::sg_ctx_visibility(sg, buf, *offset, *mode) {
+                    return Err(fail("visibility result mode"));
                 }
             }
             Cmd::EndPass => ffi::sg_ctx_end_pass(sg),
@@ -314,6 +322,11 @@ fn completion_thread(gpu: Arc<Gpu>, rx: Receiver<CompletionJob>) {
                         break;
                     }
                 }
+            }
+            // its visibility results into their buffers before anyone is told it completed (the
+            // buffers live on in the command buffer's commands until its Complete below)
+            if !timed_out && !ffi::sg_fence_resolve(gpu.sg, job.fence.0) {
+                crate::device::trace(format_args!("visibility results: {}", ffi::last_error()));
             }
             ffi::sg_fence_free(gpu.sg, job.fence.0);
         }

@@ -216,6 +216,7 @@ sg_ctx_begin_pass(struct sg_device *dev, const struct sg_pass *pass)
    if (zs && !fill_surface(&fb.zsbuf, zs))
       return false;
    cso_set_framebuffer(dev->cso, &fb);
+   sg_vis_drop(dev);
    dev->in_pass = true;
 
    for (int i = 0; i < 8; i++) {
@@ -246,9 +247,74 @@ sg_ctx_begin_pass(struct sg_device *dev, const struct sg_pass *pass)
    return true;
 }
 
+/* A query still counting outside a pass was left by a command buffer that failed before its pass
+ * ended: unread, as its buffer may go with that command buffer. */
+void
+sg_vis_drop(struct sg_device *dev)
+{
+   if (!dev->vis.query)
+      return;
+   dev->pipe->end_query(dev->pipe, dev->vis.query);
+   dev->pipe->destroy_query(dev->pipe, dev->vis.query);
+   dev->vis.query = NULL;
+}
+
+/* Ends the counting visibility query, if any, and keeps it for the next flush's fence. */
+static void
+vis_end(struct sg_device *dev)
+{
+   if (!dev->vis.query)
+      return;
+   dev->pipe->end_query(dev->pipe, dev->vis.query);
+   if (dev->vis_count == dev->vis_cap) {
+      unsigned cap = dev->vis_cap ? dev->vis_cap * 2 : 16;
+      struct sg_vis *v = realloc(dev->vis_done, cap * sizeof(*v));
+      if (!v) {
+         dev->pipe->destroy_query(dev->pipe, dev->vis.query);
+         dev->vis.query = NULL;
+         return;
+      }
+      dev->vis_done = v;
+      dev->vis_cap = cap;
+   }
+   dev->vis_done[dev->vis_count++] = dev->vis;
+   dev->vis.query = NULL;
+}
+
+bool
+sg_ctx_visibility(struct sg_device *dev, struct sg_buffer *buf, uint64_t offset, uint32_t mode)
+{
+   if (!dev->in_pass) {
+      sg_set_error("a visibility result mode outside a render pass");
+      return false;
+   }
+   if (mode == 0) {
+      vis_end(dev);
+      return true;
+   }
+   if (!buf || offset % 8 || offset + 8 > buf->size) {
+      sg_set_error("visibility result offset %llu outside its buffer (or unaligned)", (unsigned long long)offset);
+      return false;
+   }
+   /* the same word again: the query running counts on */
+   if (dev->vis.query && dev->vis.buf == buf && dev->vis.offset == offset)
+      return true;
+   vis_end(dev);
+   struct pipe_query *q = dev->pipe->create_query(dev->pipe, PIPE_QUERY_OCCLUSION_COUNTER, 0);
+   if (!q || !dev->pipe->begin_query(dev->pipe, q)) {
+      if (q)
+         dev->pipe->destroy_query(dev->pipe, q);
+      sg_set_error("occlusion query: the driver refused it");
+      return false;
+   }
+   dev->vis = (struct sg_vis){ .query = q, .buf = buf, .offset = offset };
+   return true;
+}
+
 void
 sg_ctx_end_pass(struct sg_device *dev)
 {
+   vis_end(dev);
    dev->in_pass = false;
 }
 

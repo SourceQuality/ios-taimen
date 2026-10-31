@@ -406,10 +406,12 @@ unsafe extern "C" {
     pub fn sg_ctx_sync_host(dev: *mut sg_device, buf: *mut sg_buffer, host: *mut c_void, size: u64, to_host: bool)
                             -> bool;
     pub fn sg_ctx_memory_barrier(dev: *mut sg_device);
+    pub fn sg_ctx_visibility(dev: *mut sg_device, buf: *mut sg_buffer, offset: u64, mode: u32) -> bool;
     pub fn sg_ctx_flush(dev: *mut sg_device) -> *mut sg_fence;
 
     pub fn sg_fence_wait(dev: *mut sg_device, fence: *mut sg_fence, timeout_ns: u64) -> i32;
     pub fn sg_fence_free(dev: *mut sg_device, fence: *mut sg_fence);
+    pub fn sg_fence_resolve(dev: *mut sg_device, fence: *mut sg_fence) -> bool;
 }
 
 /// The shim's per-thread reason for its last failure.

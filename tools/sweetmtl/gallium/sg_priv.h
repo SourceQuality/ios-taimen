@@ -17,6 +17,13 @@
 struct cso_context;
 struct fd_bo;
 
+/* one occlusion query of a pass and the buffer word its samples count into */
+struct sg_vis {
+   struct pipe_query *query;
+   struct sg_buffer *buf;
+   uint64_t offset;
+};
+
 struct sg_device {
    struct pipe_screen *screen;
    struct pipe_context *pipe;
@@ -31,6 +38,11 @@ struct sg_device {
    simple_mtx_t lock;
    struct sg_stats stats;
    bool in_pass;
+   /* Metal visibility results: the occlusion query counting now and where its count goes, and the
+    * ended ones the next sg_ctx_flush hands to its fence (sg_fence_resolve writes them) */
+   struct sg_vis vis;
+   struct sg_vis *vis_done;
+   unsigned vis_count, vis_cap;
    /* Copies of the push blocks: Gallium reads a user constant buffer when a command is
     * emitted, after the runtime's call returned. */
    uint8_t push[3][256];
@@ -69,7 +81,12 @@ struct sg_shader {
 
 struct sg_fence {
    struct pipe_fence_handle *fence;
+   struct sg_vis *vis; /* visibility queries to write out once it signals */
+   unsigned vis_count;
 };
+
+/* sg_replay.c: ends and frees a visibility query left counting outside a pass */
+void sg_vis_drop(struct sg_device *dev);
 
 /* sg_device.c */
 void sg_set_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
