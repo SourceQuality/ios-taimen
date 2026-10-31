@@ -1785,3 +1785,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   20 minutes of Settings, Weather, Safari's video, Voice Memos, Compass and Maps with Look Around: no GPU hang, no
   SMMU fault, eight recordings (520,000-568,000 frames each, 0 skipped, 0 overflows), playback sessions 0 DSP
   underflows, crashes only CacheDeleteExtension and driverkitd, hottest 58.2 C.
+- 2026-10-31 the stalls' RBBM_STATUS, decoded with a5xx.xml (boots 259-266, after HUPCF): every one has UCHE_BUSY and
+  VBIF_BUSY with the CP busy; most SP and HLSQ, often TPL1 (d30123c3: VSC, UCHE, VPC, CCUFCHE, VBIF; ef019fc1:
+  HLSQ, TPL1, SP, UCHE, VPC, RB, RAS, TSE, LRZ, VBIF; e7d88fc1: the whole pipe from VFD to RB). A shader pipe waiting
+  on memory requests that never come back, not a shader loop and not the CP. hw_init_regs already has mainline's
+  A540 deltas (VBIF_GATE_OFF_WRREQ_EN 9, UCHE bank bit, VPC/HLSQ load-kill). Not yet looked at: the GPU's bus
+  bandwidth vote (Linux votes the GPU's path to DDR through the RPM; this kernel votes nothing), and SMMU TLB
+  maintenance as bos are mapped and unmapped while other submits run.
