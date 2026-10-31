@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 3d7b81b..0e8d457 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -97,7 +97,7 @@ flush_if_written(uint64_t pa)
+ extern "C" unsigned long gPhysBase, gPhysSize;
+ #define TAIMEN_HEAP_END 0x17e400000ULL  /* the upper bank's RAM ends at 0x17e4c0000 (Linux /proc/iomem) */
+ static uint64_t gHeapBase;              /* 0: no heap */
+-static uint32_t gHeapPages, gHeapRover;
++static uint32_t gHeapPages;
+ /* 0363: heap pages in use, and the bos that did not fit (wired kernel memory, cache maintenance at every submit) */
+ static uint32_t gHeapUsed, gHeapMissed;
+ static uint64_t gHeapMissedBytes;
+@@ -138,19 +138,29 @@ heap_alloc(uint32_t n)
+ 	}
+ 	int64_t found = -1;
+ 	IOLockLock(gHeapLock);
+-	for (int pass = 0; pass < 2 && found < 0; pass++) {
+-		uint32_t start = pass ? 0 : gHeapRover, end = pass ? gHeapRover : gHeapPages, run = 0;
+-		for (uint32_t p = start; p < end; p++) {
++	/*
++	 * 0365: small bos first fit from the bottom, bos of 1 MB and more last fit from the top, so that small ones do
++	 * not cut up the runs the big ones need. Boot 229 (next fit from a rover): with half the heap free, 207 bos, mostly
++	 * 12 MB, found no free run and went to wired memory.
++	 */
++	uint32_t run = 0;
++	if (n < (1u << 20) / PAGE_SIZE) {
++		for (uint32_t p = 0; p < gHeapPages && found < 0; p++) {
+ 			run = gHeapMap[p] ? 0 : run + 1;
+ 			if (run == n) {
+ 				found = p + 1 - n;
+-				break;
++			}
++		}
++	} else {
++		for (int64_t p = (int64_t)gHeapPages - 1; p >= 0 && found < 0; p--) {
++			run = gHeapMap[p] ? 0 : run + 1;
++			if (run == n) {
++				found = p;
+ 			}
+ 		}
+ 	}
+ 	if (found >= 0) {
+ 		memset(gHeapMap + found, 1, n);
+-		gHeapRover = (uint32_t)found + n < gHeapPages ? (uint32_t)found + n : 0;
+ 		gHeapUsed += n;
+ 	} else {
+ 		gHeapMissed++;
