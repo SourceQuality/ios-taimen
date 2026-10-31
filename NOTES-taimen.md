@@ -1718,3 +1718,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   what it runs. The GPU sees DRAM 2-8 GB identity-mapped (kernel ring, scratch, the payload's microcode), and the
   runaway kernel's addresses were wild enough to fault outside it; writes inside it go unreported. 0374 checksums
   the microcode and the identity L1 entries at service start and compares them after a failed recovery.
+- 2026-10-31 boot 255 (r186 = +0374; the reproducer): after the failed recoveries the CP microcode checksum and the
+  identity L1 entries were unchanged ("intact"), so nothing overwrote them. What the hang leaves is the fault in CB0
+  FSR (0x402), never cleared, with SCTLR.HUPCF off: on SMMUv2 every later transaction of the bank is then
+  terminated too, reads 0. One bad MPS read made all its later reads zeros (the "runaway"), and after any reset
+  the CP's fetches of ring and microcode zeros as well (RPTR 0). Linux's qcom adreno SMMU sets HUPCF "to keep the
+  GPU from hanging". 0375: HUPCF on CB0, and FSR cleared at the start of a recovery.
