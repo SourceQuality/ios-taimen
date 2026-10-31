@@ -1483,3 +1483,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   "Mescal Failed"); the App Store's requests are signed the same way. Faking an iPhone's FairPlay identity is not
   something this port does. usbproxy 957530a sends IPv6 CONNECTs on to the TLS server name over IPv4 (the PC has no
   IPv6 route: 228 of 2026-10-30's 235 failed requests); none came during this boot's steps.
+- 2026-10-30 boot 215 (r173, SweetMetal of 09a1245: sampleRateShading): metal2vulkan now compiles PatternedRibbon and
+  GlowAlpha, and the shim refuses all 32 with "a storage image the layout does not name". The cause: spirv_to_nir
+  makes a SubpassData read a plain image_deref_load, while Mesa 26.3's nir_lower_input_attachments lowers only
+  image_deref_input_attachment_load, which Mesa's Vulkan runtime makes right after spirv_to_nir
+  (vk_nir_lower_input_attachment_loads). The shim calls spirv_to_nir itself, so no framebuffer fetch had ever
+  compiled on the phone, single-sample included; 98c3ab0 adds the conversion. No crash, no GPU hang.
