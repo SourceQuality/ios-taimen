@@ -5,7 +5,8 @@
 
 For IB1 and IB2: the dwords around where the CP stood, decoded as a5xx packets (type 4: register writes, named
 from a5xx.xml; type 7: opcodes from adreno_pm4.xml), from the first offset whose headers chain with valid
-parity; ">>" marks the packet holding the CP's fetch address. Only the last hang's lines are used.
+parity; ">>" marks the packet holding the CP's place (an IB's start plus its size less the dwords left, xnu
+0377; its start where the size is unknown). Only the last hang's lines are used.
 """
 import os
 import re
@@ -71,11 +72,11 @@ def main():
     ops, regs = names(mesa)
     ibs, heads = {}, {}
     for line in open(log, encoding='utf-8', errors='replace'):
-        m = re.search(r'SWEET GPU: hang (IB[12]) at ([0-9a-f]+), (\d+) dwords left', line)
+        m = re.search(r'SWEET GPU: hang (IB[12]) at ([0-9a-f]+), (\d+) dwords left(?: of (\d+))?', line)
         if m:
             if m[1] == 'IB1':
                 ibs, heads = {}, {}
-            heads[m[1]] = (int(m[2], 16), int(m[3]))
+            heads[m[1]] = (int(m[2], 16), int(m[3]), int(m[4]) if m[4] else 0)
             ibs[m[1]] = []
             continue
         m = re.search(r'SWEET GPU: hang (IB[12]) ([0-9a-f]+)([:*]) ((?:[0-9a-f]{8} ?){8})', line)
@@ -84,15 +85,16 @@ def main():
     for ib in ('IB1', 'IB2'):
         if ib not in heads:
             continue
-        base, left = heads[ib]
+        base, left, size = heads[ib]
         rows = ibs.get(ib, [])
-        print(f'== {ib}: CP at {base:#x}, {left} dwords left')
+        at = base + 4 * (size - left) if size >= left else base
+        print(f'== {ib}: starts at {base:#x}, {size or "?"} dwords, {left} left: the CP at {at:#x}')
         if not rows:
             print('   (no dwords)')
             continue
         start_va = rows[0][0]
         words = [w for _, ws in rows for w in ws]
-        cp = (base - start_va) // 4
+        cp = (at - start_va) // 4
         best = max(range(min(64, len(words))), key=lambda s: chain(words, s))
         i = best
         while i < len(words):

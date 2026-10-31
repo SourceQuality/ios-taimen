@@ -1,0 +1,147 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index aff47c8..c7958c2 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1672,6 +1672,11 @@ static struct {
+ 	uint32_t seq;
+ 	int pid;
+ 	char name[20];
++	uint32_t nib;           /* 0377: its first IBs, to place the CP in a hang's IB1 */
++	struct {
++		uint64_t iova;
++		uint32_t dwords;
++	} ib[8];
+ } g_subm[SUBMITTERS];
+ static uint32_t g_fence_seen;           /* fence value at g_fence_when */
+ static uint64_t g_fence_when;
+@@ -2036,39 +2041,94 @@ gva_pa(uint64_t va, uint64_t *pa)
+ 	return true;
+ }
+ 
++static uint32_t
++phys_word(uint64_t va, bool *ok)
++{
++	uint64_t pa;
++	*ok = gva_pa(va, &pa);
++	return *ok ? ml_phys_read_word((vm_offset_t)pa) : 0;
++}
++
++/*
++ * 0377: CP_IB1_BASE and CP_IB2_BASE hold where an IB starts (boot 260: both page-aligned), *_BUFSZ the dwords the CP
++ * has left of it. IB1's size comes from the hung submit's IB list, IB2's from the CP_INDIRECT_BUFFER packet in IB1
++ * that names it; the window is then 64 dwords before the CP's place and 192 after (from the start when a size is
++ * unknown).
++ */
++static uint32_t
++ib2_size(uint64_t ib1, uint32_t ib1_dwords, uint64_t ib2)
++{
++	for (uint32_t i = 0; i < ib1_dwords && i < 16384;) {
++		bool ok;
++		uint32_t h = phys_word(ib1 + 4ull * i, &ok);
++		if (!ok) {
++			break;
++		}
++		uint32_t t = h >> 28, len;
++		if (t == 4) {
++			len = 1 + (h & 0x7f);
++		} else if (t == 7) {
++			len = 1 + (h & 0x7fff);
++			uint32_t op = (h >> 16) & 0x7f;
++			if ((op == 0x3f || op == 0x37) && (h & 0x7fff) >= 3) {
++				bool a, b, c;
++				uint64_t at = phys_word(ib1 + 4ull * (i + 1), &a) | (uint64_t)phys_word(ib1 + 4ull * (i + 2), &b) << 32;
++				uint32_t sz = phys_word(ib1 + 4ull * (i + 3), &c);
++				if (a && b && c && at == ib2) {
++					return sz;
++				}
++			}
++		} else {
++			break;          /* not a packet: lost the thread */
++		}
++		i += len;
++	}
++	return 0;
++}
++
+ static void
+-ib_dump(vm_offset_t gpu)
++ib_dump(vm_offset_t gpu, uint32_t hung)
+ {
+ 	static unsigned dumped;
+ 	if (dumped++ >= 3) {
+ 		return;
+ 	}
+-	static const struct {
++	uint64_t base1 = ((uint64_t)gr(gpu, 0xb20) << 32) | gr(gpu, 0xb1f), base2 = ((uint64_t)gr(gpu, 0xb23) << 32) | gr(gpu, 0xb22);
++	uint32_t left1 = gr(gpu, 0xb21), left2 = gr(gpu, 0xb24), size1 = 0;
++	if (g_subm[hung % SUBMITTERS].seq == hung) {
++		for (uint32_t i = 0; i < g_subm[hung % SUBMITTERS].nib && i < 8; i++) {
++			if (g_subm[hung % SUBMITTERS].ib[i].iova == base1) {
++				size1 = g_subm[hung % SUBMITTERS].ib[i].dwords;
++			}
++		}
++	}
++	uint32_t size2 = base1 != 0 && base2 != 0 && size1 != 0 ? ib2_size(base1, size1, base2) : 0;
++	const struct {
+ 		const char *name;
+-		uint32_t lo, hi, sz;
+-	} ib[2] = { { "IB1", 0xb1f, 0xb20, 0xb21 }, { "IB2", 0xb22, 0xb23, 0xb24 } };
++		uint64_t base;
++		uint32_t left, size;
++	} ib[2] = { { "IB1", base1, left1, size1 }, { "IB2", base2, left2, size2 } };
+ 	for (int i = 0; i < 2; i++) {
+-		uint64_t base = ((uint64_t)gr(gpu, ib[i].hi) << 32) | gr(gpu, ib[i].lo);
+-		uint32_t left = gr(gpu, ib[i].sz);
+-		printf("SWEET GPU: hang %s at %llx, %u dwords left\n", ib[i].name, base, left);
+-		if (base == 0) {
++		printf("SWEET GPU: hang %s at %llx, %u dwords left of %u\n", ib[i].name, ib[i].base, ib[i].left, ib[i].size);
++		if (ib[i].base == 0) {
+ 			continue;
+ 		}
+-		uint64_t from = base - 64 * 4, to = base + 4ull * MIN(left + 8, 192u);
+-		for (uint64_t va = from; va < to; va += 32) {
++		uint32_t pos = ib[i].size >= ib[i].left ? ib[i].size - ib[i].left : 0;
++		uint32_t first = pos > 64 ? (pos - 64) & ~7u : 0;
++		uint32_t last = ib[i].size != 0 ? MIN(ib[i].size, pos + 192) : 256;
++		for (uint32_t d = first; d < last; d += 8) {
++			uint64_t va = ib[i].base + 4ull * d;
+ 			uint32_t w[8];
+ 			bool ok = true;
+ 			for (int j = 0; j < 8 && ok; j++) {
+-				uint64_t pa;
+-				ok = gva_pa(va + 4 * j, &pa);
+-				w[j] = ok ? ml_phys_read_word((vm_offset_t)pa) : 0;
++				w[j] = phys_word(va + 4 * j, &ok);
+ 			}
+ 			if (!ok) {
+ 				printf("SWEET GPU: hang %s %llx: not mapped\n", ib[i].name, va);
+ 				break;
+ 			}
+ 			printf("SWEET GPU: hang %s %llx%s %08x %08x %08x %08x %08x %08x %08x %08x\n", ib[i].name, va,
+-			    va <= base && base < va + 32 ? "*" : ":", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++			    d <= pos && pos < d + 8 ? "*" : ":", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+ 		}
+ 	}
+ }
+@@ -2080,8 +2140,8 @@ gpu_hung(const char *why)
+ 	g_ready = false;
+ 	cp_state(g_gpu, why);
+ 	smmu_faults(g_smmu, why);
+-	ib_dump(g_gpu);
+ 	uint32_t f = fence_now(), first = f + 1;
++	ib_dump(g_gpu, first);
+ 	if (g_subm[first % SUBMITTERS].seq == first) {
+ 		printf("SWEET GPU: hung (%s): fence %u, submitted %u; the first unfinished submit (%u) is %s's [%d]\n", why,
+ 		    f, g_submit_seq, first, g_subm[first % SUBMITTERS].name, g_subm[first % SUBMITTERS].pid);
+@@ -2170,6 +2230,11 @@ sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
+ 		uint32_t seq = ++g_submit_seq;
+ 		g_subm[seq % SUBMITTERS].seq = seq;
+ 		g_subm[seq % SUBMITTERS].pid = proc_selfpid();
++		g_subm[seq % SUBMITTERS].nib = n;
++		for (uint32_t i = 0; i < n && i < 8; i++) {
++			g_subm[seq % SUBMITTERS].ib[i].iova = ib[i].iova;
++			g_subm[seq % SUBMITTERS].ib[i].dwords = ib[i].dwords;
++		}
+ 		proc_selfname(g_subm[seq % SUBMITTERS].name, sizeof(g_subm[0].name));
+ 		emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
+ 		emit((uint32_t)g_fence_pa); emit((uint32_t)(g_fence_pa >> 32)); emit(seq);
