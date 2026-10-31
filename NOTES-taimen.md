@@ -1515,3 +1515,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   FigXPCRemoteClientCreate -> xpc_connection_send_message_with_reply_sync), so the home button and every other
   SpringBoard action wait with it. Only mediaserverd hosts capture here; it keeps serving audio, so its capture
   side takes the message and never answers. Next: sample mediaserverd (sweetsample=SpringBoard,mediaserverd).
+- 2026-10-30 boot 220 (sweetsample=SpringBoard,mediaserverd every 20 s): SpringBoard's main thread stuck again on the
+  capture source; every mediaserverd thread idle (CoreAudio workers, CoreMedia's USB message thread, MediaToolbox's
+  cache, scheduler and enqueue threads, dispatch workers): nothing serves com.apple.coremedia.capturesource, whose
+  port launchd holds for mediaserverd.
+- 2026-10-30 **boot 221 (mkrootfix d: mediaserverd without its four capture Mach services): the home button leaves
+  Voice Memos after a recording, and FaceTime draws** (its Apple ID sign-in screen, black since boot 141). Twice:
+  record 10 s, home, Compass through Spotlight (227 deg SW), home. A capture client's connection now fails at once
+  and sees no cameras.
