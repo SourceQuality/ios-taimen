@@ -1675,3 +1675,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   in front with its live content, Maps's snapshot behind, the home screen blurred underneath; a slow swipe up to the
   middle (1.5 s) opens it too. CA snapshots in general are fine, so the poster gallery's black card is PosterBoard's
   own. trustd's 37-68% CPU is boot-time only (~80 s); idle afterwards is 6-10% (kernel_task and backboardd).
+- 2026-10-31 boot 248 (r183; clients-m4e, PridePosterExtension teed with sweetexc): why the Pride poster aborts.
+  Metal Performance Shaders' MPSAutoTexture destructor asks the command buffer for -userDictionary (MTLCommandBuffer
+  SPI); NBCommandBuffer had none: "unrecognized selector", uncaught NSInvalidArgumentException, SIGABRT (bt: MPSCore
+  MPSAutoTexture::~MPSAutoTexture <- MPSImage <- PridePoster <- MetalKit's draw). Before it, newHeapWithDescriptor
+  was refused (MTLHeap not yet; MPS carried on without one). The relaunch also had its particle pipeline refused:
+  2 samples, which the profile did not list. 1f99719: userDictionary, and 2x in the profile (a5xx takes 1, 2, 4).
