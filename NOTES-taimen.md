@@ -1681,3 +1681,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   MPSAutoTexture::~MPSAutoTexture <- MPSImage <- PridePoster <- MetalKit's draw). Before it, newHeapWithDescriptor
   was refused (MTLHeap not yet; MPS carried on without one). The relaunch also had its particle pipeline refused:
   2 samples, which the profile did not list. 1f99719: userDictionary, and 2x in the profile (a5xx takes 1, 2, 4).
+- 2026-10-31 boots 249-250 (r183; SweetMetal 1f99719, then 92674ac with heaps; clients-m4e): PridePosterExtension no
+  longer throws on -userDictionary and its 2x particle pipeline compiles, but it dies of SIGSEGV at 0x18, the same
+  unslid pc in both boots, heap or no heap. Symbolicated: the iPhone X shared cache's pieces are the HFS+ hard-link
+  targets already extracted in research/dsc-x/iOSRoot/[HFS+ Private Data] (7-Zip extracts the com.apple.dyld names as
+  empty links), and tools/sweetgl/dsc-sym.py takes that directory. The crash is MPSCore's
+  MPSAutoCache::MPSAutoCache(cmdbuf, texture) reading through a nil MPSCommandBufferImageCache; disassembled (selector
+  stubs named through their selrefs), -[MPSCommandBufferImageCache initWithCommandBuffer:] returns nil unless the
+  command buffer conformsToProtocol: MTLCommandBuffer (and MPSDevice::GetMPSDevice knows the device). Only the device
+  and textures adopted protocols. e86dfce: every frontend class adopts its public Metal protocol. The gallery itself
+  has two pages, Collections (drawn in 249, black in 250) and Add New; the Pride poster lives in the picker behind +.
