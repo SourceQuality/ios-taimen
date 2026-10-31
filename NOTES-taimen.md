@@ -1736,3 +1736,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   userDictionary, 2x, storage image variants; the default clients-m4d): a regression soak, four rounds of Maps,
   Look Around by its binoculars, full screen, Done. Every round drew (Aquatic Park's Bay Trail full screen); no GPU
   hang or slow wait, no SMMU fault, no Metal refusal, crashes only CacheDeleteExtension and driverkitd.
+- 2026-10-31 boot 258 (r187; clients-m4e; the wallpaper picker up): no poster extension has a surface alive while
+  the picker shows; only PosterBoard's widget images (174x174, 981x108, 429x174). The previews are stored snapshot
+  images made earlier while an extension ran, so catching a black one in the act needs the moment it is taken.
+  Parked again (third time) with that.
