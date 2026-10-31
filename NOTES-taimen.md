@@ -1496,3 +1496,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   cc85dee takes sampleRateShading out of the profile again (the 32 pipelines are refused, as in boots 214-215) and
   keeps the subpass-load conversion. Open: which part hangs (per-sample shading, the txf_ms of the attachment being
   drawn, or a5xx flushing a 4x GMEM batch at every texture barrier); it wants a test of its own.
+- 2026-10-30 boot 217 (r173, SweetMetal-55cfaf85 = cc85dee, sweetgl b1c81af): a 15-minute soak meant for the day's
+  stack. After round 1's recording the home swipe did not leave Voice Memos (as in boot 207), so every later round
+  recorded again (New Recordings 13-18: up in 29-30 ms, 0 errors, 0 overflows) and never reached Compass or Maps.
+  Safari's video kept playing in Picture in Picture over everything. No GPU hang, no crash but driverkitd's, hottest
+  66.3 C. Boot 218 repeats it with the home button (key home) in the rounds.
