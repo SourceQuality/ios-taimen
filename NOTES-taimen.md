@@ -1732,3 +1732,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   snapshot problem, parked). HUPCF likely matters beyond MPS: any slightly out-of-bounds fetch used to zero every
   later read of the bank until the next submit cleared FSR; the GPU stalls as Look Around opened (boots 226, 233)
   are candidates. 0372-0374 stay as recovery depth and diagnostics.
+- 2026-10-31 boot 257 (r187 = +0375; SweetMetal 1a97e8f with today's occlusion queries, heaps, protocols,
+  userDictionary, 2x, storage image variants; the default clients-m4d): a regression soak, four rounds of Maps,
+  Look Around by its binoculars, full screen, Done. Every round drew (Aquatic Park's Bay Trail full screen); no GPU
+  hang or slow wait, no SMMU fault, no Metal refusal, crashes only CacheDeleteExtension and driverkitd.
