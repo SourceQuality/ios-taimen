@@ -1544,3 +1544,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   lines on every street. No Metal refusal at all, no GPU hang, no panic, hottest 55.6 C; crashes: driverkitd and
   CacheDeleteExtension (extension check-in timeout). The phone keeps boot 223's /private/var/sweetmtl/env
   (FD_MESA_DEBUG=sysmem, the same as the new default).
+- 2026-10-30 boot 225 (the boot 224 blob, hand-driven): the second home screen page. Open and draw: Stocks (its
+  welcome, "Stocks Unavailable": its data service), Find My (asks for location, then People: Sign In), Home (welcome
+  and two notification prompts), Books (Welcome to Apple Books), iTunes Store (welcome, a notification prompt),
+  Watch ("Good Evening", Start Pairing), Translate, Files (Shared: No Shared Files), Shortcuts (All Shortcuts),
+  Freeform, Tips (Collections). Fitness and Contacts not reached (a prompt took the tap). App permission prompts,
+  location and notifications alike, keep the home gesture and button until answered. With boot 210-211's first
+  page, every stock app on the home screen opens; what remains are sign-ins and Apple services. Look Around's round
+  overview map (a 168x168 drawable, one IOSurface of 114688 bytes imported once) stays black: parked.
