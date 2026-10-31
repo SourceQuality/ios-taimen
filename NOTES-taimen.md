@@ -1708,3 +1708,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   the soft reset cannot finish power-cycles the GX domain (as Linux's adreno_recover). Open: which MPS buffer is
   addressed 10 MB past its end (a size or layout MPS computes differently from ours). clients-m4e stays a test
   setting; the default (m4d) gives PridePoster no Metal device.
+- 2026-10-31 boot 253 (r184 = +0372; the boot 252 reproducer): the same faults (0x41a680, and up to 10 MB past a
+  16 KB mapping) and hang in PridePosterExtension's submit. The soft reset failed as before; the GX power cycle ran
+  (clock stopped, GDSC off then on, gfx3d and rbbm branches on) and the re-init failed identically (RPTR 0,
+  RBBM_STATUS c00003c1, TRUST 1): what holds on is outside GX. a5xx_pm_suspend drains and resets the VBIF before a
+  collapse (XIN halt, RBBM_BLOCK_SW_RESET_CMD 0x003c0000 on A530/A540): 0373 does so before both resets.
