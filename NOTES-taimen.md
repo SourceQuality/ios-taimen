@@ -1582,3 +1582,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   multi-range physical descriptor worked (it zeroed them); the client's (createMappingInTask) faults. 0364 withdrawn
   (583b4eb). 0365 instead keeps big bos (1 MB and up, last fit from the top) away from small ones (first fit from the
   bottom).
+- 2026-10-31 **boot 231 (r177 = +0365: big heap bos last fit from the top, small ones first fit from the bottom):** in
+  the same four soak rounds as boot 229, misses fell from 207 bos (2.9 GB) to 86 (1.5 GB), cache maintenance at submit
+  from 0.3-2.5 s to 0.2-0.8 s per 10 s, and the heap now fills to 220-227 of 256 MB (what misses now is a full heap).
+  Four recordings, no GPU hang, crashes only driverkitd and CacheDeleteExtension, hottest 60.8 C; Maps, Look Around
+  and Compass draw as before.
