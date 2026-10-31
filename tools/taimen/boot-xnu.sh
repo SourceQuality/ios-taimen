@@ -38,15 +38,15 @@ fi
 # frames/s in the swipe animations). 2.96 GiB of RAM from 0xb1000000 (xnu 0250-0251, 0254, boot 96:
 # the low bank's top runs on into the upper bank); the GPU service at 710 MHz (sweetgpu=8, the CP
 # microcode and zap shader from GPUFW); the A540 copies each frame to the scan buffer
-# (taimengpucopy, E5); Mesa's buffers write-combined from a 256 MB heap above XNU's RAM (xnu 0240,
-# XNU's RAM ends at 0x16e400000; TAIMEN_GPUHEAP=MB sizes the heap, which TAIMEN_MEM must leave room for:
-# 384 wants TAIMEN_MEM=0xb5400000). The dylib comes with the sweetgl ROOTFIX, whatever ROOTFIX says:
+# (taimengpucopy, E5); Mesa's buffers write-combined from a 384 MB heap above XNU's RAM (xnu 0240;
+# boot 232: 256 MB filled under Maps and its misses went to wired memory; XNU's RAM ends at 0x166400000;
+# TAIMEN_GPUHEAP=256 wants TAIMEN_MEM=0xbd400000). The dylib comes with the sweetgl ROOTFIX, whatever ROOTFIX says:
 # without the file backboardd cannot start (DYLD_INSERT_LIBRARIES).
 sweetgl_env=$P/../out/sweetgl/current.env
 if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 	. "$sweetgl_env"
 	TAIMEN_BASE=${TAIMEN_BASE:-0xb1000000}
-	TAIMEN_MEM=${TAIMEN_MEM:-0xbd400000}
+	TAIMEN_MEM=${TAIMEN_MEM:-0xb5400000}
 	GPUFW=${GPUFW:-$P/../research/taimen/firmware}
 	# ROOTFIX_KEEP=1: this ROOTFIX as given (the dylib already on the phone; e.g. --stage-apps --migrate)
 	if [ "${ROOTFIX_KEEP:-0}" = 1 ] && [ -n "${ROOTFIX:-}" ]; then
@@ -71,7 +71,7 @@ if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 		export TAIMEN_ADT_ARGS="${TAIMEN_ADT_ARGS:-} $senv${bb:+,$bb}${rest:+;$rest}"
 		senv=
 	fi
-	args="sweetgpu=8 sweetgpuclk=710 taimengpucopy=1 taimengpuheap=${TAIMEN_GPUHEAP:-256} $senv sweetnull=backboardd ${args}"
+	args="sweetgpu=8 sweetgpuclk=710 taimengpucopy=1 taimengpuheap=${TAIMEN_GPUHEAP:-384} $senv sweetnull=backboardd ${args}"
 	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), RAM ${TAIMEN_BASE:-0x100000000} + $TAIMEN_MEM"
 fi
 # SHIM_WATCH=1: CPU 7 stays in the shim as a watcher (shim/taimen.c WATCH): XNU gets 7 cores, and
