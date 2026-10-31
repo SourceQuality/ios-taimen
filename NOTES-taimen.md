@@ -1777,3 +1777,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   was four a boot, after which the GPU service (and the UI) stayed off until reboot, and a busy user would reach it.
   0379 makes taimengpurecover a rate (four within a minute). The stalls themselves stay open: any submitter, CA's
   quads or Maps's batch, no SMMU fault, the CP at a draw.
+- 2026-10-31 boot 267 (r191 = +0379, recoveries limited per minute; 710 MHz; twelve Look Around rounds): no stall
+  this time (the rate varies: 0-3 per twelve rounds), so the new limit's line went unexercised; the kernel, Maps
+  and Look Around ran clean (crashes only CacheDeleteExtension and driverkitd). The USB proxy's 12-hour run ended
+  at 07:51 and was restarted (out/proxy-day9.log).
