@@ -1713,3 +1713,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (clock stopped, GDSC off then on, gfx3d and rbbm branches on) and the re-init failed identically (RPTR 0,
   RBBM_STATUS c00003c1, TRUST 1): what holds on is outside GX. a5xx_pm_suspend drains and resets the VBIF before a
   collapse (XIN halt, RBBM_BLOCK_SW_RESET_CMD 0x003c0000 on A530/A540): 0373 does so before both resets.
+- 2026-10-31 boot 254 (r185 = +0373; the reproducer): the VBIF said halted and was block-reset, and the soft reset
+  and the GX power cycle failed exactly as before. Three resets of increasing depth, one result: the CP itself or
+  what it runs. The GPU sees DRAM 2-8 GB identity-mapped (kernel ring, scratch, the payload's microcode), and the
+  runaway kernel's addresses were wild enough to fault outside it; writes inside it go unreported. 0374 checksums
+  the microcode and the identity L1 entries at service start and compares them after a failed recovery.
