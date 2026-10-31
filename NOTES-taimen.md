@@ -1664,3 +1664,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (0358's "lock ... after GPU use" lines). 0358's lock did not wait for the GPU: a lock right after backboardd's flush
   invalidated while the GPU still wrote, the CPU fetched zeros and kept them. 0371: the lock waits for the surface's
   last submit first.
+- 2026-10-31 boot 246 (r183 = +0371, the gallery, three visits): all three black this time (visit 1 varies: boot 227
+  was black on all three too). No lock waited over 1 ms for the GPU: PosterBoard's locks of the 1125x2436 snapshot
+  surfaces come after backboardd's GPU work is done, so the race 0371 closes is not what blackens the card. 0371
+  stays (Apple's IOSurfaceLock waits for the GPU; nothing slower, no crash but driverkitd and CacheDeleteExtension).
+  Ruled out for the gallery so far: CPU cache over GPU writes (0358, 0371), Metal refusals, the poster's own render
+  (the clock is black too). Left: the snapshot render itself (backboardd's CA render of the card into the surface,
+  through sweetgl) and what PosterBoard does with it (encode/decode, .atx). Parked.
