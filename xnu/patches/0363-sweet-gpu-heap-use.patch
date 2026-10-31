@@ -1,0 +1,54 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 535dd50..3d7b81b 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -98,6 +98,9 @@ extern "C" unsigned long gPhysBase, gPhysSize;
+ #define TAIMEN_HEAP_END 0x17e400000ULL  /* the upper bank's RAM ends at 0x17e4c0000 (Linux /proc/iomem) */
+ static uint64_t gHeapBase;              /* 0: no heap */
+ static uint32_t gHeapPages, gHeapRover;
++/* 0363: heap pages in use, and the bos that did not fit (wired kernel memory, cache maintenance at every submit) */
++static uint32_t gHeapUsed, gHeapMissed;
++static uint64_t gHeapMissedBytes;
+ static uint8_t *gHeapMap;               /* a byte per page, 1: used */
+ static IOLock *gHeapLock;
+ 
+@@ -148,6 +151,14 @@ heap_alloc(uint32_t n)
+ 	if (found >= 0) {
+ 		memset(gHeapMap + found, 1, n);
+ 		gHeapRover = (uint32_t)found + n < gHeapPages ? (uint32_t)found + n : 0;
++		gHeapUsed += n;
++	} else {
++		gHeapMissed++;
++		gHeapMissedBytes += (uint64_t)n * PAGE_SIZE;
++		if (gHeapMissed <= 5) {
++			printf("SWEET GPU: heap: no run of %u pages (%u of %u in use), bo from wired memory (%u so far)\n", n,
++			    gHeapUsed, gHeapPages, gHeapMissed);
++		}
+ 	}
+ 	IOLockUnlock(gHeapLock);
+ 	return found;
+@@ -158,6 +169,7 @@ heap_free(uint32_t first, uint32_t n)
+ {
+ 	IOLockLock(gHeapLock);
+ 	memset(gHeapMap + first, 0, n);
++	gHeapUsed -= n;
+ 	IOLockUnlock(gHeapLock);
+ }
+ #endif
+@@ -637,8 +649,16 @@ submitStats(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t ring_wait, uint64_t
+ 	absolutetime_to_nanoseconds(cache, &a);
+ 	absolutetime_to_nanoseconds(ring, &b);
+ 	absolutetime_to_nanoseconds(wait, &c);
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++	/* 0363: how full the write-combined heap is, and how many bos missed it since boot */
++	printf("SWEET GPU: %llu submits in %llu ms: cache %llu ms (%llu pages checked, %llu flushed), ring %llu ms "
++	    "(%llu ms waiting for room); heap %u of %u MB used, %u bos (%llu MB) missed it\n", n, span / 1000000,
++	    a / 1000000, pages, dirty, b / 1000000, c / 1000000, (uint32_t)((uint64_t)gHeapUsed * PAGE_SIZE >> 20),
++	    (uint32_t)((uint64_t)gHeapPages * PAGE_SIZE >> 20), gHeapMissed, gHeapMissedBytes >> 20);
++#else
+ 	printf("SWEET GPU: %llu submits in %llu ms: cache %llu ms (%llu pages checked, %llu flushed), ring %llu ms "
+ 	    "(%llu ms waiting for room)\n", n, span / 1000000, a / 1000000, pages, dirty, b / 1000000, c / 1000000);
++#endif
+ 	start = n = cache = ring = wait = pages = dirty = 0;
+ }
+ 
