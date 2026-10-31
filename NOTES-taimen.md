@@ -1571,3 +1571,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   2-3 (byte-identical to boot 201's black card). CollectionsPoster does take Metal devices (two processes, no
   refusal); PridePosterExtension, given one, aborts (SIGABRT, four times), so the clients file stays as it was
   (clients-m4d). Still parked: PosterBoard's later visits.
+- 2026-10-30 boot 229 (r175 = +0362 calls wait out a recovery, +0363 the GPU heap's use; boot 224's blob): four soak
+  rounds, clean (no GPU hang, so 0362 not exercised; 4 recordings; hottest 51.4 C). The heap: 89-127 of 256 MB in
+  use, yet 207 bos (2.9 GB over the boot, mostly 12 MB = 768 pages) missed it for want of a free run of that length,
+  and went to wired memory with cache maintenance at every submit (0.3-2.5 s of every 10 s). 0364 gives such a bo
+  scattered heap pages, mapped for the client as a list of physical ranges.
