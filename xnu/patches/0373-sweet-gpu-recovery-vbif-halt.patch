@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 7ee305c..c849080 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -159,6 +159,9 @@ void sweet_gpu_init(void);
+ #define R_RBBM_STATUS           0x04f5
+ #define R_RBBM_SW_RESET_CMD     0x0043  /* a5xx (0x37 is a6xx) */
+ #define R_VBIF_RR_QOS_ARB       0x3049
++#define R_VBIF_XIN_HALT_CTRL0   0x3080
++#define R_VBIF_XIN_HALT_CTRL1   0x3081
++#define R_RBBM_BLOCK_SW_RESET_CMD 0x0045
+ #define R_SECVID_TRUST_CNTL     0xf400
+ #define R_SECVID_TSB_BASE       0xf800
+ #define R_SECVID_TSB_SIZE       0xf802
+@@ -1837,6 +1840,29 @@ taimen_gx_cycle(void)
+ }
+ #endif
+ 
++/*
++ * 0373: the VBIF drained and reset before the GPU is, as a5xx_pm_suspend does before a power collapse: its four
++ * XIN ports halted until they say so, released, then the VBIF bits of RBBM_BLOCK_SW_RESET_CMD pulsed (A530/A540,
++ * "to avoid issue with FIFO entries"). Boots 252-253: after an MPS kernel's terminated SMMU faults neither the soft
++ * reset nor a GX power cycle got the CP to read its ring again (RPTR 0, RBBM busy): the VBIF, which neither resets,
++ * held the stuck requests. True when the ports said halted.
++ */
++static bool
++vbif_halt_reset(vm_offset_t gpu)
++{
++	gw(gpu, R_VBIF_XIN_HALT_CTRL0, 0xf);
++	uint64_t deadline;
++	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
++	bool halted = false;
++	while (!(halted = (gr(gpu, R_VBIF_XIN_HALT_CTRL1) & 0xf) == 0xf) && mach_absolute_time() < deadline) {
++	}
++	gw(gpu, R_VBIF_XIN_HALT_CTRL0, 0);
++	gw(gpu, R_RBBM_BLOCK_SW_RESET_CMD, 0x003c0000);
++	(void)gr(gpu, R_RBBM_BLOCK_SW_RESET_CMD);
++	gw(gpu, R_RBBM_BLOCK_SW_RESET_CMD, 0);
++	return halted;
++}
++
+ /* VM lock held, g_ready false. */
+ static bool
+ gpu_recover(const char *why)
+@@ -1853,6 +1879,7 @@ gpu_recover(const char *why)
+ 	uint64_t t0 = mach_absolute_time();
+ 	vm_offset_t gpu = g_gpu;
+ 	bool hard = false;
++	bool vbif = vbif_halt_reset(gpu);
+ again: __attribute__((unused));        /* 0372: the GX power cycle comes back here (taimen) */
+ 	if (!hard) {
+ 		gw(gpu, R_RBBM_SW_RESET_CMD, 1);
+@@ -1899,12 +1926,13 @@ again: __attribute__((unused));        /* 0372: the GX power cycle comes back he
+ 	}
+ 	if (!(cp && landed && secure_left)) {
+ 		cp_state(gpu, "recovery failed:");
+-		printf("SWEET GPU: recovery %u%s FAILED (%s): RPTR after reset %u, RBBM_STATUS %08x; ring %s, marker %08x, "
+-		    "zap resume %lld/%llx, secure mode %s\n", g_recoveries, hard ? " (GX power cycle)" : "", why, rptr, st,
+-		    cp ? "read" : "NOT read", mark[0], r, r1, secure_left ? "left" : "NOT left");
++		printf("SWEET GPU: recovery %u%s FAILED (%s): VBIF %s; RPTR after reset %u, RBBM_STATUS %08x; ring %s, "
++		    "marker %08x, zap resume %lld/%llx, secure mode %s\n", g_recoveries, hard ? " (GX power cycle)" : "", why,
++		    vbif ? "halted" : "NOT halted", rptr, st, cp ? "read" : "NOT read", mark[0], r, r1,
++		    secure_left ? "left" : "NOT left");
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+-		/* 0372: what the soft reset left running, a power cycle stops */
+-		if (!hard && taimen_gx_cycle()) {
++		/* 0372: what the soft reset left running, a power cycle stops; 0373: VBIF drained first */
++		if (!hard && ((vbif = vbif_halt_reset(gpu)), taimen_gx_cycle())) {
+ 			hard = true;
+ 			goto again;
+ 		}
+@@ -1926,9 +1954,9 @@ again: __attribute__((unused));        /* 0372: the GX power cycle comes back he
+ 	g_fence_when = 0;
+ 	smmu_report();
+ 	g_ready = true;
+-	printf("SWEET GPU: recovered (%s) in %llu ms: %s (RPTR %u, RBBM_STATUS %08x), CP restarted, zap resumed, "
++	printf("SWEET GPU: recovered (%s) in %llu ms: VBIF %s, %s (RPTR %u, RBBM_STATUS %08x), CP restarted, zap resumed, "
+ 	    "secure mode left, fences done up to %u (recovery %u of %d)\n", why, usecs(mach_absolute_time() - t0) / 1000,
+-	    hard ? "GX power cycle" : "soft reset", rptr, st, g_submit_seq, g_recoveries, max);
++	    vbif ? "halted" : "NOT halted", hard ? "GX power cycle" : "soft reset", rptr, st, g_submit_seq, g_recoveries, max);
+ 	return true;
+ }
+ 
