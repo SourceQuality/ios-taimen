@@ -1699,3 +1699,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   picker (Featured, Weather & Astronomy, Unity, Pride, Emoji, Collections, Color): every preview black but for their
   text (date, weather complications) and one grey Pride card, like the gallery's black card: the poster previews are
   the same broken snapshot path.
+- 2026-10-31 **boot 252 (r183; SweetMetal 1a97e8f; clients-m4e): PridePosterExtension runs, and hangs the GPU for
+  good.** No more exceptions; its MPS work then read unmapped GPU memory (SMMU translation faults, terminated: at
+  0x41a680, a near-zero base, and at 0x2225afd00 / 0x2225bba80, 10 MB past a 16 KB mapping at 0x221bb0000) and its
+  submit never finished. The hang check fired ("first unfinished submit is PridePosterExtensio's"), but the
+  recovery's RBBM_SW_RESET left RBBM busy and the CP never read the ring: "GPU service off until reboot";
+  backboardd crashed, AegirPoster and CollectionsPoster crash-looped (22-23 each) without a GPU. 0372: a recovery
+  the soft reset cannot finish power-cycles the GX domain (as Linux's adreno_recover). Open: which MPS buffer is
+  addressed 10 MB past its end (a size or layout MPS computes differently from ours). clients-m4e stays a test
+  setting; the default (m4d) gives PridePoster no Metal device.
