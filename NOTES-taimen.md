@@ -1623,3 +1623,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   surface mediaserverd makes (bpr 768, Y at 0xd5c0, CbCr at 0xaba00, plane sizes that count padding rows above
   and below): the HEIC decoder's padded output, which Maps then copies into its own. 0369 lets the PC list live
   surfaces and fetch one's bytes over the control port, to see whether the bad chroma is in memory.
+- 2026-10-31 **boot 238 (r181 = +0369: `phonectl.py surfs` / `surf ID` list and fetch surfaces): the photo damage is
+  in memory, and it is the kernel's.** The card's photos were live as Maps-made '420f' surfaces: 448x600 (Griffith
+  Observatory, rows of 448) and two 450x600 (the Cheese School), whose creator asked for 464-byte rows and put CbCr
+  at 464 x 600 = 0x43f80. The kernel rounds row bytes up to 64 (the Adreno pitch) and kept the creator's offsets:
+  at 512, luma rows 544-599 overlap chroma rows 0-56, and the writer (which takes rows from the getters) put luma
+  there. Bytes 450-511 of each luma row are padding nobody writes: the strip of right colour (luma columns 66-128)
+  in every photo. surfpng.py's rendering of the dump matches the screen; the 448x600 photo is clean. mediaserverd's
+  decoder buffers carry IOSurfacePlaneBase (region start) and IOSurfacePlaneExtendedPixels* = 71 (luma) / 35 (chroma)
+  with 768-byte rows, already aligned. 0370: a creator that gives any plane offset or size keeps its row bytes.
