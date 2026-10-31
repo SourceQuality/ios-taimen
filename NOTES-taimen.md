@@ -1489,3 +1489,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   image_deref_input_attachment_load, which Mesa's Vulkan runtime makes right after spirv_to_nir
   (vk_nir_lower_input_attachment_loads). The shim calls spirv_to_nir itself, so no framebuffer fetch had ever
   compiled on the phone, single-sample included; 98c3ab0 adds the conversion. No crash, no GPU hang.
+- 2026-10-30 **boot 216 (r173, SweetMetal of 98c3ab0: sampleRateShading + subpass loads): the multisampled framebuffer
+  fetch hangs the a540.** PatternedRibbon and GlowAlpha compiled (no refusal left), and as Maps drew its first frame the
+  GPU hung: fence stuck 2 s, RBBM_STATUS ef019fc1, CP at RPTR 3776 of WPTR 4006 in Maps's submit. The recovery took
+  3 ms, but a buffer allocation during the hang failed and VectorKit aborted ("received null buffer from Metal").
+  cc85dee takes sampleRateShading out of the profile again (the 32 pipelines are refused, as in boots 214-215) and
+  keeps the subpass-load conversion. Open: which part hangs (per-sample shading, the txf_ms of the attachment being
+  drawn, or a5xx flushing a 4x GMEM batch at every texture barrier); it wants a test of its own.
