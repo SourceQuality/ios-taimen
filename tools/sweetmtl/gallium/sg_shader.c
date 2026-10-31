@@ -133,6 +133,50 @@ ssbo_to_ubo(nir_shader *nir, const struct sg_shader_desc *d, const char **error)
    return true;
 }
 
+/* ---- subpass reads to input attachment loads ---- */
+
+/*
+ * spirv_to_nir makes an OpImageRead of SubpassData an image_deref_load of a SUBPASS(_MS) image;
+ * nir_lower_input_attachments takes only image_deref_input_attachment_load, which Mesa's Vulkan
+ * runtime makes right after spirv_to_nir (vk_nir_lower_input_attachment_loads, vulkan/runtime/vk_nir.c,
+ * MIT). The shim calls spirv_to_nir itself, so it does the same here, for color attachments (Metal's
+ * framebuffer fetch reads no depth or stencil): the attachment's index (InputAttachmentIndex) in
+ * base, an array's element in the index source. Boot 215: VectorKit's multisampled PatternedRibbon and
+ * GlowAlpha pipelines were refused for "a storage image the layout does not name".
+ */
+static bool
+lower_subpass_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   (void)data;
+   if (intr->intrinsic != nir_intrinsic_image_deref_load)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   const enum glsl_sampler_dim dim = glsl_get_sampler_dim(deref->type);
+   if (dim != GLSL_SAMPLER_DIM_SUBPASS && dim != GLSL_SAMPLER_DIM_SUBPASS_MS)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_variable *var;
+   nir_def *index;
+   unsigned range = 1;
+   if (deref->deref_type == nir_deref_type_array) {
+      nir_deref_instr *parent = nir_deref_instr_parent(deref);
+      var = parent->var;
+      index = deref->arr.index.ssa;
+      range = glsl_array_size(parent->type);
+   } else {
+      var = deref->var;
+      index = nir_imm_int(b, 0);
+   }
+   nir_def *load = nir_image_deref_input_attachment_load(
+      b, intr->def.num_components, intr->def.bit_size, intr->src[0].ssa,
+      nir_trim_vector(b, intr->src[1].ssa, 2), intr->src[2].ssa, index,
+      .image_dim = nir_intrinsic_image_dim(intr), .image_array = nir_intrinsic_image_array(intr),
+      .access = nir_intrinsic_access(intr), .dest_type = nir_intrinsic_dest_type(intr),
+      .base = var->data.index, .range = range);
+   nir_def_replace(&intr->def, load);
+   return true;
+}
+
 /* ---- descriptors to Gallium slots ---- */
 
 static bool
@@ -529,6 +573,7 @@ translate(struct sg_device *dev, const struct sg_shader_desc *d, struct sg_shade
    const nir_opt_access_options ao = {.is_vulkan = true};
    NIR_PASS(_, nir, nir_opt_access, &ao);
    if (stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_subpass_load, nir_metadata_control_flow, NULL);
       const nir_input_attachment_options ia = {0};
       NIR_PASS(_, nir, nir_lower_input_attachments, &ia);
       const nir_lower_sysvals_to_varyings_options sv = {.point_coord = true};
