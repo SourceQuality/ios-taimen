@@ -687,6 +687,19 @@ impl CommandBuffer {
         if size.is_none() {
             return Err(not_yet("render passes without attachments"));
         }
+        // SWEETMTL_TRACE: which passes run, to tell the one a GPU stall came in (boots 226, 233: Look Around opening)
+        if crate::device::trace_enabled() {
+            let colors: Vec<String> = pass.color_attachments.iter().enumerate().filter_map(|(i, a)| {
+                a.texture.as_ref().map(|t| {
+                    let resolve = a.resolve_texture.as_ref()
+                        .map_or(String::new(), |r| format!(" -> {}x{}", r.0.desc.width, r.0.desc.height));
+                    format!("color {i} {:?} {}x{} x{} {:?}/{:?}{resolve}", t.pixel_format(), t.0.desc.width,
+                            t.0.desc.height, t.sample_count(), a.load_action, a.store_action)
+                })
+            }).collect();
+            crate::device::trace(format_args!("render pass {width}x{height}, {samples} samples: {}{}{}", colors.join(", "),
+                                              if has_depth { ", depth" } else { "" }, if has_stencil { ", stencil" } else { "" }));
+        }
         let layers = pass.render_target_array_length.max(1) as u32;
         sg.width = width;
         sg.height = height;
