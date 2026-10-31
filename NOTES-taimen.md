@@ -1748,3 +1748,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   format bit only), RPTR 144 of WPTR 306, RBBM_STATUS d30123c3; **recovered in 3 ms** (VBIF halted, soft reset), no
   app touched. So HUPCF was not that stall's cause; what backboardd's composite does as Look Around opens is still
   open (an IB dump at hang time would show it).
+- 2026-10-31 boot 260 (r188 = +0376, hang IB dump; eight Look Around rounds): the stall again, backboardd's submit,
+  recovered in 3 ms, but the dump printed nothing: CP_IB1_BASE 2ac6fc000 and CP_IB2_BASE 2805cc000 are page-aligned,
+  the IBs' starts (235 and 768 dwords left), not the CP's place, and the window began in the guard page before
+  them. 0377 records each submit's IBs, takes IB2's size from the IB1 packet naming it, and dumps around start +
+  size - left.
