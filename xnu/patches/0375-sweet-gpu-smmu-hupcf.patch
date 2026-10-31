@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ee6f36b..6df0ede 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -479,8 +479,14 @@ smmu_identity(vm_offset_t smmu, unsigned si)
+ 	 * to the GPU (reads 0, writes dropped). Texture/vertex fetch reads a
+ 	 * little past buffer ends; with CFRE that hung the GPU (0154a/c).
+ 	 * Faults are still recorded in FSR/FAR: sweet_gpu_submit logs them.
++	 * 0375: and HUPCF (bit 8), as Linux's qcom adreno SMMU sets it "to keep
++	 * the GPU from hanging": without it, while a fault sits in FSR every
++	 * later transaction of the bank is terminated too. Boots 252-255: one
++	 * bad read of an MPS kernel, then every read of its shader and, after
++	 * the reset, of the CP's own ring and microcode returned 0; neither a
++	 * soft reset nor a GX power cycle brought the CP back.
+ 	 */
+-	SWR(cb, 0x0, (1u << 2) | (1u << 1) | 1u);
++	SWR(cb, 0x0, (1u << 8) | (1u << 2) | (1u << 1) | 1u);
+ 	SWR(smmu, 0x800 + 4 * si, 1u << 31);    /* SMRsi: stream 0 (gfx3d_user), mask 0 */
+ 	SWR(smmu, 0xc00 + 4 * si, 0);            /* S2CRsi: translate, context bank 0 */
+ 	SWR(smmu, 0x68, 0);                      /* TLBIALLNSNH */
+@@ -1911,6 +1917,10 @@ gpu_recover(const char *why)
+ 	g_recoveries++;
+ 	uint64_t t0 = mach_absolute_time();
+ 	vm_offset_t gpu = g_gpu;
++	/* 0375: a fault left in CB0 FSR cleared first (write-1-to-clear), whatever HUPCF says */
++	if (g_smmu != 0) {
++		wr(g_smmu + 0x8000, 0x58, rd(g_smmu + 0x8000, 0x58));
++	}
+ 	bool hard = false;
+ 	bool vbif = vbif_halt_reset(gpu);
+ again: __attribute__((unused));        /* 0372: the GX power cycle comes back here (taimen) */
