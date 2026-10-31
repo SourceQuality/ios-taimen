@@ -1781,3 +1781,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   this time (the rate varies: 0-3 per twelve rounds), so the new limit's line went unexercised; the kernel, Maps
   and Look Around ran clean (crashes only CacheDeleteExtension and driverkitd). The USB proxy's 12-hour run ended
   at 07:51 and was restarted (out/proxy-day9.log).
+- 2026-10-31 **boot 268 (r191 = 0370-0379; SweetMetal 1a97e8f; clients-m4d): the eight-round soak is clean.** About
+  20 minutes of Settings, Weather, Safari's video, Voice Memos, Compass and Maps with Look Around: no GPU hang, no
+  SMMU fault, eight recordings (520,000-568,000 frames each, 0 skipped, 0 overflows), playback sessions 0 DSP
+  underflows, crashes only CacheDeleteExtension and driverkitd, hottest 58.2 C.
