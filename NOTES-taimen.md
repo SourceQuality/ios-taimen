@@ -1592,3 +1592,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   flush; heap peaks 309 of 384 MB; wired 43,000-46,000 pages instead of 50,000-57,000, compressed the same ~40,000.
   The new defaults (aa114b1). Two GPU hangs again (Maps's submit, then backboardd's), and no app died: 0362 let Maps
   and backboardd wait out the recoveries (boot 226: Maps crashed after the second). Four recordings, hottest 58.5 C.
+- 2026-10-31 boot 233 (r178 = +0366, taimengpustuck=10000; the 384 MB heap default): six soak rounds, six recordings,
+  no app crash. One real GPU stall: Maps's submit as Look Around opened stood still past 10 s (RPTR = WPTR 3902, the
+  ring read to its end, RBBM_STATUS ef019fc1 busy); recovered. One slow submit at Maps's launch finished after 2.1 s
+  (boot 232's "hang" at the launch was likely such a submit, cut short at 2 s). Boot 226's Look Around stall came
+  right after the 168x168 overview-map surface was imported: that small map (black every time) is the suspect.
+  0366's slow log also counted idle time between waits; 0367 times each wait instead. The default stays 2 s.
