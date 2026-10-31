@@ -1636,3 +1636,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   clean**, the Cheese School and the others along the strip. Maps's 450x600 '420f' surfaces now report 464-byte rows
   (as asked; sweetgl copies them, as the GPU can't sample 464 in place), the 448x600 ones 448. No copy errors, no GPU
   hang; crashes only driverkitd and CacheDeleteExtension.
+- 2026-10-31 boot 240 (r182; clients-m4f, MapKit's SnapshotService a SweetMetal client): tapping Look Around's
+  thumbnail on Ghirardelli Square's card opens it full screen; the round overview map (top right, under Done) is
+  still black, and the snapshot service never ran: Maps draws that map itself. The log says why: as Look Around
+  opened, SweetMetal refused Maps's command buffers, "setVisibilityResultMode: visibility results (occlusion
+  queries)", not yet. d34f2b6 implements them (Gallium occlusion counters, the words written when the fence
+  signals; softpipe counts 144 samples for mtlabitest's 12x12 quad, 0 when culled). The expand button at (112,244)
+  toggles back to the half-screen preview.
