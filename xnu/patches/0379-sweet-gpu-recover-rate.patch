@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 0981fce..a54c0f9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1911,14 +1911,29 @@ vbif_halt_reset(vm_offset_t gpu)
+ static bool
+ gpu_recover(const char *why)
+ {
++	/*
++	 * 0379: taimengpurecover is a rate, recoveries within a minute (default 4), not a count for the boot: a
++	 * recovery takes 3 ms now, and boots 263-266 had a stall every 4-8 Look Around opens (any submitter, no fault,
++	 * at 596 MHz as at 710), which a busy user would run through four of; the GPU service, and with it the UI,
++	 * then went off until reboot. The limit still ends a loop of hangs.
++	 */
+ 	int max = 4;
+ 	(void)PE_parse_boot_argn("taimengpurecover", &max, sizeof(max));
+-	if (g_gpu == 0 || g_pm4 == 0 || max <= 0 || g_recoveries >= (unsigned)max) {
+-		if (max > 0 && g_recoveries >= (unsigned)max) {
+-			printf("SWEET GPU: no recovery: %u done already (taimengpurecover=%d)\n", g_recoveries, max);
++	static uint64_t when[16];
++	uint64_t now = mach_absolute_time(), minute;
++	nanoseconds_to_absolutetime(60ull * NSEC_PER_SEC, &minute);
++	unsigned recent = 0;
++	for (unsigned i = 0; i < 16; i++) {
++		recent += when[i] != 0 && now - when[i] < minute;
++	}
++	if (g_gpu == 0 || g_pm4 == 0 || max <= 0 || recent >= (unsigned)MIN(max, 16)) {
++		if (max > 0 && recent >= (unsigned)MIN(max, 16)) {
++			printf("SWEET GPU: no recovery: %u in the last minute (taimengpurecover=%d a minute), %u in all\n",
++			    recent, max, g_recoveries);
+ 		}
+ 		return false;
+ 	}
++	when[g_recoveries % 16] = now;
+ 	g_recoveries++;
+ 	uint64_t t0 = mach_absolute_time();
+ 	vm_offset_t gpu = g_gpu;
+@@ -2006,8 +2021,9 @@ again: __attribute__((unused));        /* 0372: the GX power cycle comes back he
+ 	smmu_report();
+ 	g_ready = true;
+ 	printf("SWEET GPU: recovered (%s) in %llu ms: VBIF %s, %s (RPTR %u, RBBM_STATUS %08x), CP restarted, zap resumed, "
+-	    "secure mode left, fences done up to %u (recovery %u of %d)\n", why, usecs(mach_absolute_time() - t0) / 1000,
+-	    vbif ? "halted" : "NOT halted", hard ? "GX power cycle" : "soft reset", rptr, st, g_submit_seq, g_recoveries, max);
++	    "secure mode left, fences done up to %u (recovery %u; %u in the last minute, %d allowed)\n", why,
++	    usecs(mach_absolute_time() - t0) / 1000, vbif ? "halted" : "NOT halted", hard ? "GX power cycle" : "soft reset",
++	    rptr, st, g_submit_seq, g_recoveries, recent + 1, max);
+ 	return true;
+ }
+ 
