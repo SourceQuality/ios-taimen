@@ -1792,3 +1792,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   A540 deltas (VBIF_GATE_OFF_WRREQ_EN 9, UCHE bank bit, VPC/HLSQ load-kill). Also ruled out: DDR bandwidth (ROOT=1
   boots vote bimc to 1804 MHz, taimenddr), and SMMU TLB maintenance (map and unmap flush it under the VM lock, and a
   bo is freed only after its last submit). Still open.
+- 2026-10-31 boots 269-270 (r191; TAIMEN_GPUCOPY=0: the present copy on the CPU, so the kernel submits no per-frame
+  GPU work; 12 + 24 Look Around rounds): none in 269, two in 270 (Maps's submit, RBBM_STATUS ef019fc1; backboardd's,
+  d30103c3), each recovered in 3 ms, the second line reading "recovery 2; 1 in the last minute, 4 allowed" (0379).
+  2 in 36 rounds against 9 in 80 with the GPU copy: the kernel's copy is not the cause (at most it adds load).
+  boot-xnu.sh takes TAIMEN_GPUCOPY (1 as before). The stall stays open, with the GPU copy, the clock, DDR, TLB
+  maintenance, SMMU faults and the A540 init registers ruled out.
