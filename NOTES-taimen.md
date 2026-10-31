@@ -1566,3 +1566,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   and Look Around, then held; the compressor held ~42,000 pages from then on. Kernel cache maintenance at submit
   took up to 2 s of a 10 s window around Look Around ("cache 1994 ms"). Open: what in Look Around's open and close
   hangs the GPU, and its black overview map.
+- 2026-10-30 boots 227-228 (the poster gallery, three visits): 227 (r173, the boot 224 blob) black on all three; 228
+  (r174 = +0362, every poster extension a SweetMetal client) the default blue Collections poster on visit 1, black on
+  2-3 (byte-identical to boot 201's black card). CollectionsPoster does take Metal devices (two processes, no
+  refusal); PridePosterExtension, given one, aborts (SIGABRT, four times), so the clients file stays as it was
+  (clients-m4d). Still parked: PosterBoard's later visits.
