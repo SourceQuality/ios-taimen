@@ -1501,3 +1501,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   recorded again (New Recordings 13-18: up in 29-30 ms, 0 errors, 0 overflows) and never reached Compass or Maps.
   Safari's video kept playing in Picture in Picture over everything. No GPU hang, no crash but driverkitd's, hottest
   66.3 C. Boot 218 repeats it with the home button (key home) in the rounds.
+- 2026-10-30 boot 218 (boot 217's stack and blob, the home button in the rounds): stuck in Voice Memos the same way.
+  The home button reached the system (SWEET HID key 0x40 down/up, 1 client) after the recording had stopped
+  cleanly, and nothing switched; the Spotlight search for Compass never launched it. Boot 206's soak (sweetgl
+  b1defb6) left Voice Memos six times; boots 207, 217 and 218, the ones with sweetgl's CA_DISABLE_DETACHED=1, never
+  did. Six recordings, no GPU hang, no crash but driverkitd's, hottest 73.4 C with the video playing in Picture in
+  Picture throughout (59.6 swaps/s).
