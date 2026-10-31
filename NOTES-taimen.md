@@ -1576,3 +1576,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   use, yet 207 bos (2.9 GB over the boot, mostly 12 MB = 768 pages) missed it for want of a free run of that length,
   and went to wired memory with cache maintenance at every submit (0.3-2.5 s of every 10 s). 0364 gives such a bo
   scattered heap pages, mapped for the client as a list of physical ranges.
+- 2026-10-31 boot 230 (r176 = +0364: a bo takes scattered heap pages when no run fits): cache maintenance at submit
+  fell from 0.3-2.5 s to 1-57 ms per 10 s (38 scattered bos, 32 still missed when the heap was short), but backboardd
+  died 11 times with SIGBUS inside 12 MB IOKit mappings (the scattered bos) and Maps twice. The kernel's mapping of the
+  multi-range physical descriptor worked (it zeroed them); the client's (createMappingInTask) faults. 0364 withdrawn
+  (583b4eb). 0365 instead keeps big bos (1 MB and up, last fit from the top) away from small ones (first fit from the
+  bottom).
