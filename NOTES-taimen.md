@@ -1474,3 +1474,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   swipe turns the view. The attachment refusals are gone; what is left is 32 render pipelines that read the
   framebuffer in a multisampled pass (storage form: SampleRateShading, and the runtime's "attachments read as storage
   images"), and Look Around's round overview map stays a black disc.
+- 2026-10-30 boot 214 (r173, SweetMetal-c5b8212e = 9d830cc: refusals name their pipeline): the 32 refusals are
+  VectorKit's PatternedRibbon (25 variants) and GlowAlpha (7), 4x multisampled into BGRA8Unorm_sRGB, both reading
+  the framebuffer. metal2vulkan's input-attachment form reads a multisampled attachment per sample at SampleId,
+  which needs sampleRateShading; freedreno runs a5xx fragment shaders per sample, so the profile claims it now
+  (09a1245, host-check FAIL lines 0). **Weather and the App Store are out of reach**: WeatherKit's request token
+  needs a Mescal signature, and FairPlay finds no hardware info on this phone (AMSFairPlayGetHardwareInfo -42184,
+  "Mescal Failed"); the App Store's requests are signed the same way. Faking an iPhone's FairPlay identity is not
+  something this port does. usbproxy 957530a sends IPv6 CONNECTs on to the TLS server name over IPv4 (the PC has no
+  IPv6 route: 228 of 2026-10-30's 235 failed requests); none came during this boot's steps.
