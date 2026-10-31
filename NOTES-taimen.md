@@ -1556,3 +1556,13 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   FD_MESA_DEBUG=sysmem,nofp16, and tools/sweetgl/mesa.patch (in SweetMetal's Mesa too) gives a5xx an fd5_texture_barrier
   that, rendering to memory, cleans the CCU and invalidates UCHE inside the batch instead of flushing it. SweetMetal's
   clients now render the way the compositor always has.
+- 2026-10-30 **boot 226 (boot 224's stack): a 35-minute soak, 15 rounds.** 15 recordings (0 errors, 0 overflows), no
+  Metal refusal, hottest 60.2 C. Two GPU hangs, each recovered in 3 ms: Maps's submit as Look Around opened (right
+  after its 168x168 overview-map surface and a 4.6 MB one were imported), and later backboardd's as Look Around
+  closed (the Done tap); both RBBM_STATUS e?019fc?, SMMU CB0 FSR 0x400, as in boot 216. After the second, Maps's
+  buffer allocation was refused during the recovery ("bo new 32768 failed: e00002d8", kIOReturnNotReady), its fence
+  waits failed, and Mesa crashed on the missing buffer (SIGSEGV at 0x1c in SweetMetal's image); 0362 makes calls
+  wait out a recovery. Memory: wired rose from ~20,000-28,000 to ~50,000-57,000 pages (16 KB) with Maps's relaunch
+  and Look Around, then held; the compressor held ~42,000 pages from then on. Kernel cache maintenance at submit
+  took up to 2 s of a 10 s window around Look Around ("cache 1994 ms"). Open: what in Look Around's open and close
+  hangs the GPU, and its black overview map.
