@@ -1771,3 +1771,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   ordinary compositing. With boot 263's kernel-submit stall too, the stalls hit any submitter, with no fault, under
   the heaviest load: the 710 MHz corner (open-loop 1024 mV) is the next suspect. boot-xnu.sh takes TAIMEN_GPUCLK
   (400, 600 or 710; 710 as before); boot 265 runs twelve rounds at 600 (596 MHz).
+- 2026-10-31 boots 265-266 (r190, TAIMEN_GPUCLK=600: the 596 MHz corner; twelve Look Around rounds each): none in
+  265, three in 266 (backboardd twice, Maps once; each recovered in 3 ms). At 710 MHz boots 259-264 had seven in
+  about 48 rounds: the same rate, so the clock is not the cause. But boot 266 reported "recovery 3 of 4": the budget
+  was four a boot, after which the GPU service (and the UI) stayed off until reboot, and a busy user would reach it.
+  0379 makes taimengpurecover a rate (four within a minute). The stalls themselves stay open: any submitter, CA's
+  quads or Maps's batch, no SMMU fault, the CP at a draw.
