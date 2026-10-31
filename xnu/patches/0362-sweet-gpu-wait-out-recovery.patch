@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index d25f95a..87aab4d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1521,10 +1521,22 @@ static vm_offset_t g_gpu, g_scratch_va;
+ static uint64_t g_scratch, g_ksample4;
+ static uint32_t g_seq = 0x10000;
+ 
++/*
++ * 0362: g_ready is false for the few milliseconds a recovery takes, and the recovery runs under the VM lock
++ * (gpu_hung, gpu_recover). A call that finds it false waits for the lock and looks again, so it fails only when the
++ * service is off, not because it came in during a recovery. Boot 226: Maps's buffer allocation was refused during
++ * one (kIOReturnNotReady), and Mesa crashed on the missing buffer; boot 216's VectorKit aborted on "null buffer".
++ */
+ bool
+ sweet_gpu_ready(void)
+ {
+-	return g_ready;
++	if (g_ready) {
++		return true;
++	}
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	bool ready = g_ready;
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	return ready;
+ }
+ 
+ static uint32_t rb_free(void);
+@@ -1533,7 +1545,7 @@ static void gpu_hung(const char *why);
+ int
+ sweet_gpu_quad(const struct sweet_gpu_quad *q)
+ {
+-	if (!g_ready) {
++	if (!sweet_gpu_ready()) {
+ 		return ENXIO;
+ 	}
+ 	static const uint32_t fmt_bpp[3] = {4, 1, 2}, fmt_code[3] = {TFMT5_8_8_8_8_UNORM, TFMT5_8_UNORM, TFMT5_8_8_UNORM};
+@@ -1910,7 +1922,7 @@ uint64_t sweet_gpu_ring_wait;
+ int
+ sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
+ {
+-	if (!g_ready || g_fence_va == 0) {
++	if (!sweet_gpu_ready() || g_fence_va == 0) {
+ 		return ENXIO;
+ 	}
+ 	if (n == 0 || n > SWEET_GPU_MAX_IBS) {
+@@ -1977,7 +1989,7 @@ sweet_gpu_wait(uint32_t seqno, uint32_t timeout_ms)
+ 		if ((int32_t)(f - seqno) >= 0) {
+ 			return 0;
+ 		}
+-		if (!g_ready) {
++		if (!sweet_gpu_ready()) {       /* a recovery writes the hung submits' fences as done */
+ 			return ENXIO;
+ 		}
+ 		uint64_t now = mach_absolute_time();
