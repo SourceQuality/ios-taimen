@@ -29,7 +29,7 @@ boot chain. The Pixel 1 history is kept in this repository; the taimen work star
 | Audio | Both TAS2557 speaker amplifiers play through the ADSP. The microphones reach iOS through the WCD9340 codec over SLIMbus, with the ADSP as bus manager: Voice Memos records and plays back ([docs/taimen-mic-plan.md](docs/taimen-mic-plan.md)). |
 | Sensors | Accelerometer, gyroscope, magnetometer, barometer, ambient light and proximity, read from the SLPI sensor hub over QMI. The screen rotates, the Compass app points the right way, and CoreMotion gets device motion from a fusion in the kernel ([docs/taimen-compass-notes.md](docs/taimen-compass-notes.md)). |
 | Network | USB only: a CDC-NCM gadget to the PC, where `tools/taimen/usbproxy.py` (no admin rights needed) is iOS's HTTP proxy to the internet. Safari, video playback and Maps' search go through it. |
-| Apps | On the first home screen page everything opens except FaceTime, which stays black. Weather and the App Store open but get no data: their requests need a FairPlay (Mescal) signature, and FairPlay finds no Apple hardware identity on this phone. |
+| Apps | Everything on the first home screen page opens and draws; FaceTime stops at its Apple ID sign-in. Weather and the App Store open but get no data: their requests need a FairPlay (Mescal) signature, and FairPlay finds no Apple hardware identity on this phone. |
 | Not working | Wi-Fi (the WCN3990 firmware loads on the modem, which never reports it ready; parked), Bluetooth, cameras, cellular, GPS. Location Services are on but have no position source. |
 
 Everything measured so far is in [NOTES-taimen.md](NOTES-taimen.md); the address-by-address map from the Pixel 1 code to
