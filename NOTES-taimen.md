@@ -1789,6 +1789,6 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   VBIF_BUSY with the CP busy; most SP and HLSQ, often TPL1 (d30123c3: VSC, UCHE, VPC, CCUFCHE, VBIF; ef019fc1:
   HLSQ, TPL1, SP, UCHE, VPC, RB, RAS, TSE, LRZ, VBIF; e7d88fc1: the whole pipe from VFD to RB). A shader pipe waiting
   on memory requests that never come back, not a shader loop and not the CP. hw_init_regs already has mainline's
-  A540 deltas (VBIF_GATE_OFF_WRREQ_EN 9, UCHE bank bit, VPC/HLSQ load-kill). Not yet looked at: the GPU's bus
-  bandwidth vote (Linux votes the GPU's path to DDR through the RPM; this kernel votes nothing), and SMMU TLB
-  maintenance as bos are mapped and unmapped while other submits run.
+  A540 deltas (VBIF_GATE_OFF_WRREQ_EN 9, UCHE bank bit, VPC/HLSQ load-kill). Also ruled out: DDR bandwidth (ROOT=1
+  boots vote bimc to 1804 MHz, taimenddr), and SMMU TLB maintenance (map and unmap flush it under the VM lock, and a
+  bo is freed only after its last submit). Still open.
