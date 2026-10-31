@@ -1507,3 +1507,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   b1defb6) left Voice Memos six times; boots 207, 217 and 218, the ones with sweetgl's CA_DISABLE_DETACHED=1, never
   did. Six recordings, no GPU hang, no crash but driverkitd's, hottest 73.4 C with the video playing in Picture in
   Picture throughout (59.6 swaps/s).
+- 2026-10-30 **boot 219 (boot 217's stack, backboardd with CA_DISABLE_DETACHED=0): Voice Memos holds on anyway**, so
+  CA detaching is not it. Correction to boot 206: its soak got stuck the same way (its round 3 and 6 "compass"
+  shots are Voice Memos), so no soak since the microphone came has left Voice Memos after a recording. The cause is
+  in SpringBoard: after the recording, its main thread waits forever in a synchronous XPC call to the capture
+  server (AVFCapture -> CMCapture FigCaptureSourceRemoteCopyCaptureSources -> csr_ensureClientEstablished ->
+  FigXPCRemoteClientCreate -> xpc_connection_send_message_with_reply_sync), so the home button and every other
+  SpringBoard action wait with it. Only mediaserverd hosts capture here; it keeps serving audio, so its capture
+  side takes the message and never answers. Next: sample mediaserverd (sweetsample=SpringBoard,mediaserverd).
