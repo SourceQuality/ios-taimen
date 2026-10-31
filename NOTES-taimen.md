@@ -1758,3 +1758,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   pm4dump.py's header parity): IB1 is a freedreno batch's start (CP_SET_RENDER_MODE, UCHE invalidate, the sysmem
   restore of RB/GRAS/SP state, LRZ flush, CP_SKIP_IB2_ENABLE_GLOBAL, RB_CCU_CNTL, a 900x900 window), IB2 the
   render pass (a clear to ffedf5f9, then shader setup and CP_LOAD_STATE). 0378 takes IB1's size from the ring.
+- 2026-10-31 boots 262-263 (r190 = +0378; 8 and 12 Look Around rounds): none in 262; three in 263, each recovered in
+  3 ms: once a kernel submit (the display's own GPU work, nothing of userland unfinished), once Maps's (both IBs
+  fully consumed: the CP past their ends), once backboardd's, the CP 464 of 777 dwords into IB2: a run of textured
+  six-index quads (CP_DRAW_INDX_OFFSET, index buffer 2553a7xxx, texture state through e40a/e40e before each), CA
+  compositing layers; the CP's count includes what it prefetched, so the stuck draw is the marked one or the one
+  before. No SMMU fault in any. The stall is real, recovers in 3 ms after the 2 s stuck check, and is not tied to one
+  process: the next suspect is what the composite samples as Look Around opens (formats, IOSurfaces).
