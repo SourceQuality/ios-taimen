@@ -1538,3 +1538,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   about 9-10 frames/s against about 15 in boot 215 (different views, dark map). 30815c9 makes FD_MESA_DEBUG=sysmem
   the SweetMetal clients' default (backboardd and SpringBoard stay on GMEM through sweetgl) and claims
   sampleRateShading again.
+- 2026-10-30 **boot 224 (r173, SweetMetal of 30815c9: sampleRateShading, clients rendered to memory; mkrootfix
+  b1da1b4): the soak runs through with Maps drawing everything it asks for.** Six rounds of Settings, Weather,
+  Safari's video, Voice Memos (recordings 41-46), Compass and Look Around, whose map now carries the blue coverage
+  lines on every street. No Metal refusal at all, no GPU hang, no panic, hottest 55.6 C; crashes: driverkitd and
+  CacheDeleteExtension (extension check-in timeout). The phone keeps boot 223's /private/var/sweetmtl/env
+  (FD_MESA_DEBUG=sysmem, the same as the new default).
