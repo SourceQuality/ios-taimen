@@ -1724,3 +1724,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   terminated too, reads 0. One bad MPS read made all its later reads zeros (the "runaway"), and after any reset
   the CP's fetches of ring and microcode zeros as well (RPTR 0). Linux's qcom adreno SMMU sets HUPCF "to keep the
   GPU from hanging". 0375: HUPCF on CB0, and FSR cleared at the start of a recovery.
+- 2026-10-31 **boot 256 (r187 = +0375, SMMU HUPCF; the reproducer): no GPU hang.** SCTLR 0x107. PridePosterExtension's
+  MPS work made only its three reads at 0x41a680 (a near-zero base, each terminated alone); the reads "10 MB past a
+  16 KB mapping" of boots 252-255 are gone: they were computed from the zeros every read returned once the first
+  fault sat in FSR. No recovery needed, backboardd fine, no poster crash loop (one jetsam kill of PridePoster, ns 1
+  code 7: its memory limit, MPS temporaries each a buffer of their own). The picker's previews stay black (the
+  snapshot problem, parked). HUPCF likely matters beyond MPS: any slightly out-of-bounds fetch used to zero every
+  later read of the bank until the next submit cleared FSR; the GPU stalls as Look Around opened (boots 226, 233)
+  are candidates. 0372-0374 stay as recovery depth and diagnostics.
