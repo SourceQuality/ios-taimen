@@ -1656,3 +1656,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Park beach draws well; the circle under Done is opaque black (0,0,0), 132 px (44 pt), and no surface of that size
   exists in any process: not a CAMetalLayer of its own, so most likely MapKit's compass (a material disc with its
   needle and N) or a layer CA draws itself. Parked; nothing refused, no GPU hang, no crash but the usual two.
+- 2026-10-31 boot 245 (r182; the poster gallery, two visits, surfaces listed and fetched while each showed): visit 1
+  drawn (177 KB), visit 2 black (54 KB) as ever, and the black is the **whole card**: PosterBoard's clock and date
+  are gone too, only the card's outline is left. No surface of poster size exists on either visit (PosterBoard's are
+  174x174, 429x174 and 981x108 widget images, identical on both; AegirPoster has none): visit 1 shows the live scene,
+  later visits a snapshot image. Those snapshots are the 1125x2436 surfaces backboardd renders and PosterBoard locks
+  (0358's "lock ... after GPU use" lines). 0358's lock did not wait for the GPU: a lock right after backboardd's flush
+  invalidated while the GPU still wrote, the CPU fetched zeros and kept them. 0371: the lock waits for the surface's
+  last submit first.
