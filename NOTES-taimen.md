@@ -1753,3 +1753,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   the IBs' starts (235 and 768 dwords left), not the CP's place, and the window began in the guard page before
   them. 0377 records each submit's IBs, takes IB2's size from the IB1 packet naming it, and dumps around start +
   size - left.
+- 2026-10-31 boot 261 (r189 = +0377): the stall in Maps's submit this time (recovered, 3 ms); IB1 24b578000 was not
+  among the hung submit's first eight IBs, so the CP's place stayed unknown. Decoded from the starts (after fixing
+  pm4dump.py's header parity): IB1 is a freedreno batch's start (CP_SET_RENDER_MODE, UCHE invalidate, the sysmem
+  restore of RB/GRAS/SP state, LRZ flush, CP_SKIP_IB2_ENABLE_GLOBAL, RB_CCU_CNTL, a 900x900 window), IB2 the
+  render pass (a clear to ffedf5f9, then shader setup and CP_LOAD_STATE). 0378 takes IB1's size from the ring.
