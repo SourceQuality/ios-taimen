@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 6df0ede..aff47c8 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2006,6 +2006,73 @@ again: __attribute__((unused));        /* 0372: the GX power cycle comes back he
+ 	return true;
+ }
+ 
++/*
++ * 0376: a hang's command stream, for the PC to decode (tools/taimen/pm4dump.py): where IB1 and IB2 stand (the
++ * CP's fetch address and the dwords it has left) and the dwords around it, 64 before and 192 after. A GPU VA in
++ * the window is looked up in the mappings; below it the identity map holds (VA = PA). Boot 259: backboardd's
++ * submit stood still mid-ring as Look Around opened, with no SMMU fault to say why. VM lock held.
++ */
++extern unsigned int ml_phys_read_word(vm_offset_t paddr);
++
++static bool
++gva_pa(uint64_t va, uint64_t *pa)
++{
++	if (va < GVA_BASE) {
++		*pa = va;
++		return va >= 0x80000000ull;
++	}
++	if (g_maps == NULL || g_owner == NULL || va - GVA_BASE >= (uint64_t)GVA_PAGES * PAGE_SIZE) {
++		return false;
++	}
++	uint32_t m = g_owner[(va - GVA_BASE) / PAGE_SIZE];
++	if (m == 0 || m == VM_GUARD || va < g_maps[m].va) {
++		return false;
++	}
++	uint64_t k = (va - g_maps[m].va) / PAGE_SIZE;
++	if (k >= g_maps[m].npages) {
++		return false;
++	}
++	*pa = g_maps[m].pa[k] + (va & PAGE_MASK);
++	return true;
++}
++
++static void
++ib_dump(vm_offset_t gpu)
++{
++	static unsigned dumped;
++	if (dumped++ >= 3) {
++		return;
++	}
++	static const struct {
++		const char *name;
++		uint32_t lo, hi, sz;
++	} ib[2] = { { "IB1", 0xb1f, 0xb20, 0xb21 }, { "IB2", 0xb22, 0xb23, 0xb24 } };
++	for (int i = 0; i < 2; i++) {
++		uint64_t base = ((uint64_t)gr(gpu, ib[i].hi) << 32) | gr(gpu, ib[i].lo);
++		uint32_t left = gr(gpu, ib[i].sz);
++		printf("SWEET GPU: hang %s at %llx, %u dwords left\n", ib[i].name, base, left);
++		if (base == 0) {
++			continue;
++		}
++		uint64_t from = base - 64 * 4, to = base + 4ull * MIN(left + 8, 192u);
++		for (uint64_t va = from; va < to; va += 32) {
++			uint32_t w[8];
++			bool ok = true;
++			for (int j = 0; j < 8 && ok; j++) {
++				uint64_t pa;
++				ok = gva_pa(va + 4 * j, &pa);
++				w[j] = ok ? ml_phys_read_word((vm_offset_t)pa) : 0;
++			}
++			if (!ok) {
++				printf("SWEET GPU: hang %s %llx: not mapped\n", ib[i].name, va);
++				break;
++			}
++			printf("SWEET GPU: hang %s %llx%s %08x %08x %08x %08x %08x %08x %08x %08x\n", ib[i].name, va,
++			    va <= base && base < va + 32 ? "*" : ":", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		}
++	}
++}
++
+ /* VM lock held: declare the GPU hung, then recover it if we can. */
+ static void
+ gpu_hung(const char *why)
+@@ -2013,6 +2080,7 @@ gpu_hung(const char *why)
+ 	g_ready = false;
+ 	cp_state(g_gpu, why);
+ 	smmu_faults(g_smmu, why);
++	ib_dump(g_gpu);
+ 	uint32_t f = fence_now(), first = f + 1;
+ 	if (g_subm[first % SUBMITTERS].seq == first) {
+ 		printf("SWEET GPU: hung (%s): fence %u, submitted %u; the first unfinished submit (%u) is %s's [%d]\n", why,
