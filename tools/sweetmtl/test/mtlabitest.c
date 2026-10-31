@@ -1083,15 +1083,52 @@ static void sync_objects(NmbLibrary *lib)
 	nmb_queue_release(q2);
 }
 
+/* Heaps: each resource is its own allocation, counted while it lives (runtime resource.rs). An automatic heap of 1 MiB:
+ * a 64 KiB buffer and a 64x64 RGBA8 texture raise its used size, dropping them lowers it again; a placement heap takes a
+ * buffer at an offset inside it and refuses one past its end. */
+static void heaps(void)
+{
+	const char *what = "heaps (automatic: sizes of live resources; placement: offsets)";
+	NmbHeap *h = nmb_heap_new(dev, 0, 1 << 20, 0), *ph = nmb_heap_new(dev, 1, 1 << 20, 0);
+	if (!h || !ph) {
+		refused(what);
+		if (h)
+			nmb_heap_release(h);
+		if (ph)
+			nmb_heap_release(ph);
+		return;
+	}
+	char detail[160];
+	uint64_t size = nmb_heap_size(h), used0 = nmb_heap_used_size(h);
+	NmbBuffer *b = nmb_heap_new_buffer(h, 65536, SM_SHARED, UINT64_MAX);
+	struct NmbTextureDescriptor td = {TT_2D, PF_RGBA8, 64, 64, 1, 1, 1, 1, TU_READ, SM_PRIVATE};
+	NmbTexture *t = nmb_heap_new_texture(h, &td, UINT64_MAX);
+	uint64_t used2 = nmb_heap_used_size(h), avail = nmb_heap_max_available_size(h, 4096);
+	if (b)
+		memset(nmb_buffer_contents(b), 0x5a, 65536);
+	if (b)
+		nmb_buffer_release(b);
+	uint64_t used1 = nmb_heap_used_size(h);
+	if (t)
+		nmb_texture_release(t);
+	uint64_t used_end = nmb_heap_used_size(h);
+	NmbBuffer *in = nmb_heap_new_buffer(ph, 4096, SM_SHARED, 65536), *past = nmb_heap_new_buffer(ph, 8192, SM_SHARED, (1 << 20) - 4096);
+	bool ok = b && t && size == 1 << 20 && used0 == 0 && used2 >= 65536 + 64 * 64 * 4 && avail == size - used2 &&
+	          used1 == used2 - 65536 && used_end == 0 && in && !past;
+	snprintf(detail, sizeof(detail), "size %llu, used %llu -> %llu (buffer and texture) -> %llu -> %llu, available %llu; placed %s, past the end %s",
+	         (unsigned long long)size, (unsigned long long)used0, (unsigned long long)used2, (unsigned long long)used1,
+	         (unsigned long long)used_end, (unsigned long long)avail, in ? "made" : "refused", past ? "made" : "refused");
+	line(ok ? "ok" : "FAIL", what, detail);
+	if (in)
+		nmb_buffer_release(in);
+	if (past)
+		nmb_buffer_release(past);
+	nmb_heap_release(h);
+	nmb_heap_release(ph);
+}
+
 static void not_yet_paths(void)
 {
-	NmbHeap *h = nmb_heap_new(dev, 0, 1 << 20, 0);
-	if (h) {
-		line("FAIL", "heaps", "made a heap (expected not yet)");
-		nmb_heap_release(h);
-	} else {
-		refused("heaps");
-	}
 	NmbBinaryArchive *a = nmb_binary_archive_new(dev, NULL);
 	if (a && !nmb_binary_archive_serialize(a, "/tmp/sweetmtl-archive"))
 		refused("binary archive serialize");
@@ -1135,6 +1172,7 @@ int main(int argc, char **argv)
 	srgb_variant(lib);
 	vertex_attributes();
 	sync_objects(lib);
+	heaps();
 	not_yet_paths();
 	nmb_library_release(lib);
 	nmb_queue_release(queue);

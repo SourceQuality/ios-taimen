@@ -5,7 +5,7 @@
 // Every result comes from the runtime and the GPU: a refused call returns nil/NO with the runtime's reason, an encoder call the runtime
 // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
 // reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
-// Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
+// Shared events work within this process (no cross-process handle yet). Not yet implemented here: argument buffers, indirect commands, drawables/presentation.
 //
 // taimen (tools/sweetmtl, docs/taimen-metal-plan.md 4.3): flame's file (ref/ios-flame phone/metal2, UniXNU's frontend patched for iOS 16)
 // over sweetmtl's bridge, whose runtime drives Mesa Gallium freedreno on the Adreno 540 through SweetGPU. Changes from flame's:
@@ -1408,6 +1408,20 @@ static char sweetMemoryOwnerKey;
  NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions);
  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+}
+// What a resource takes in a heap. The runtime's heaps give each resource memory of its own and only count it (resource.rs), so
+// these are upper bounds that keep a heap sized from them big enough: pages for a buffer; for a texture 16 bytes a texel (the
+// widest format), every level, slice and sample.
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+ (void)options;return (MTLSizeAndAlign){.size=(MAX(length,(NSUInteger)1)+4095)&~(NSUInteger)4095,.align=4096};
+}
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
+ NSUInteger bytes=0,depth=d.textureType==MTLTextureType3D?d.depth:1;
+ for(NSUInteger l=0;l<MAX(d.mipmapLevelCount,(NSUInteger)1);l++)
+  bytes+=MAX(d.width>>l,(NSUInteger)1)*MAX(d.height>>l,(NSUInteger)1)*MAX(depth>>l,(NSUInteger)1)*16;
+ NSUInteger cube=d.textureType==MTLTextureTypeCube||d.textureType==MTLTextureTypeCubeArray?6:1;
+ bytes*=MAX(d.arrayLength,(NSUInteger)1)*cube*MAX(d.sampleCount,(NSUInteger)1);
+ return (MTLSizeAndAlign){.size=(bytes+65535)&~(NSUInteger)65535,.align=65536};
 }
 - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
  NBResourceGroup *group=[NBResourceGroup new];

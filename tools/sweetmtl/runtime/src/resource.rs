@@ -721,44 +721,132 @@ impl HeapDescriptor {
     }
 }
 
-/// `MTLHeap`: not yet (every constructor refuses, so no heap object exists).
-pub struct Heap(());
+/// `MTLHeap`. Each resource made from a heap is an allocation of its own: nothing is sub-allocated,
+/// so a placement heap's offsets are checked but place nothing, and resources never alias. The heap
+/// is the size it was asked for and counts what its live resources take; Metal Performance Shaders
+/// keep their temporary images in heaps (PridePosterExtension, boot 249: given no heap, MPSImage
+/// read through a null pointer). Going past the size is allowed (logged once): the memory is the
+/// resources' own, and a refusal would only fail the caller.
+#[derive(Clone)]
+pub struct Heap(Arc<HeapInner>);
 
-const HEAPS: &str = "heaps (MTLHeap)";
+pub(crate) struct HeapInner {
+    device: Device,
+    desc: HeapDescriptor,
+    /// the heap's resources and their sizes, while they live
+    live: Mutex<Vec<(HeapResource, u64)>>,
+}
+
+enum HeapResource {
+    Buffer(std::sync::Weak<BufferInner>),
+    Texture(std::sync::Weak<TextureInner>),
+}
+
+impl HeapResource {
+    fn alive(&self) -> bool {
+        match self {
+            HeapResource::Buffer(w) => w.strong_count() > 0,
+            HeapResource::Texture(w) => w.strong_count() > 0,
+        }
+    }
+}
+
+/// What a heap resource is counted as: whole pages.
+const HEAP_ALIGN: u64 = 4096;
 
 impl Device {
-    pub fn new_heap(&self, _descriptor: &HeapDescriptor) -> Result<Heap, Error> {
-        Err(not_yet(HEAPS))
+    pub fn new_heap(&self, descriptor: &HeapDescriptor) -> Result<Heap, Error> {
+        if descriptor.heap_type == HeapType::Sparse {
+            return Err(not_yet("sparse heaps"));
+        }
+        if descriptor.size == 0 {
+            return Err(invalid("a heap of no size"));
+        }
+        Ok(Heap(Arc::new(HeapInner { device: self.clone(), desc: *descriptor, live: Mutex::new(Vec::new()) })))
     }
 }
 
 impl Heap {
     pub fn size(&self) -> u64 {
-        0
+        self.0.desc.size
     }
     pub fn used_size(&self) -> u64 {
-        0
+        let mut live = self.0.live.lock().unwrap_or_else(|p| p.into_inner());
+        live.retain(|(r, _)| r.alive());
+        live.iter().map(|(_, n)| n).sum()
     }
     pub fn current_allocated_size(&self) -> u64 {
-        0
+        self.0.desc.size
     }
-    pub fn max_available_size(&self, _alignment: u64) -> Result<u64, Error> {
-        Err(not_yet(HEAPS))
+    pub fn max_available_size(&self, alignment: u64) -> Result<u64, Error> {
+        if alignment != 0 && !alignment.is_power_of_two() {
+            return Err(invalid(format!("heap alignment {alignment}")));
+        }
+        let free = self.size().saturating_sub(self.used_size());
+        Ok(free & !(alignment.max(1) - 1))
     }
-    pub fn set_purgeable_state(&self, _state: PurgeableState) -> Result<PurgeableState, Error> {
-        Err(not_yet(HEAPS))
+    pub fn set_purgeable_state(&self, state: PurgeableState) -> Result<PurgeableState, Error> {
+        purgeable(state)
     }
-    pub fn new_buffer(&self, _length: u64, _options: ResourceOptions) -> Result<Buffer, Error> {
-        Err(not_yet(HEAPS))
+    fn keep(&self, resource: HeapResource, bytes: u64) {
+        static OVER: std::sync::Once = std::sync::Once::new();
+        let mut live = self.0.live.lock().unwrap_or_else(|p| p.into_inner());
+        live.retain(|(r, _)| r.alive());
+        let used: u64 = live.iter().map(|(_, n)| n).sum();
+        if used + bytes > self.0.desc.size {
+            OVER.call_once(|| {
+                crate::device::trace(format_args!("heap of {} bytes holds {} (allowed: each resource has its own memory)",
+                                                  self.0.desc.size, used + bytes))
+            });
+        }
+        live.push((resource, bytes));
     }
-    pub fn new_buffer_at_offset(&self, _length: u64, _options: ResourceOptions, _offset: u64) -> Result<Buffer, Error> {
-        Err(not_yet(HEAPS))
+    fn placed(&self, offset: u64, bytes: u64) -> Result<(), Error> {
+        if self.0.desc.heap_type != HeapType::Placement {
+            return Err(invalid("an offset into an automatic heap"));
+        }
+        if offset.checked_add(bytes).is_none_or(|end| end > self.0.desc.size) {
+            return Err(invalid(format!("{bytes} bytes at offset {offset} of a heap of {}", self.0.desc.size)));
+        }
+        Ok(())
     }
-    pub fn new_texture(&self, _descriptor: &TextureDescriptor) -> Result<Texture, Error> {
-        Err(not_yet(HEAPS))
+    pub fn new_buffer(&self, length: u64, options: ResourceOptions) -> Result<Buffer, Error> {
+        let buffer = self.0.device.new_buffer(length, options)?;
+        self.keep(HeapResource::Buffer(Arc::downgrade(&buffer.0)), length.max(1).div_ceil(HEAP_ALIGN) * HEAP_ALIGN);
+        Ok(buffer)
     }
-    pub fn new_texture_at_offset(&self, _descriptor: &TextureDescriptor, _offset: u64) -> Result<Texture, Error> {
-        Err(not_yet(HEAPS))
+    pub fn new_buffer_at_offset(&self, length: u64, options: ResourceOptions, offset: u64) -> Result<Buffer, Error> {
+        self.placed(offset, length)?;
+        self.new_buffer(length, options)
+    }
+    pub fn new_texture(&self, descriptor: &TextureDescriptor) -> Result<Texture, Error> {
+        let texture = self.0.device.new_texture(descriptor)?;
+        let bytes = texture.footprint().div_ceil(HEAP_ALIGN) * HEAP_ALIGN;
+        self.keep(HeapResource::Texture(Arc::downgrade(&texture.0)), bytes);
+        Ok(texture)
+    }
+    pub fn new_texture_at_offset(&self, descriptor: &TextureDescriptor, offset: u64) -> Result<Texture, Error> {
+        self.placed(offset, 1)?;
+        self.new_texture(descriptor)
+    }
+}
+
+impl Texture {
+    /// Bytes of the texture's image: every level's rows at the shim's pitch, every slice and sample.
+    pub(crate) fn footprint(&self) -> u64 {
+        let d = &self.0.desc;
+        let view = whole_view(d);
+        let mut bytes = 0u64;
+        for level in 0..d.mipmap_level_count.max(1) as u32 {
+            // SAFETY: a live texture of the shim; a level it has.
+            let pitch = unsafe { ffi::sg_texture_pitch(self.0.image.sg, level) } as u64;
+            // no pitch from the shim (softpipe): 16 bytes a texel, the widest format
+            let pitch = if pitch != 0 { pitch } else { (d.width >> level).max(1) * 16 };
+            let rows = (d.height >> level).max(1);
+            let depth = if d.texture_type == TextureType::Type3D { (d.depth >> level).max(1) } else { 1 };
+            bytes += pitch * rows * depth;
+        }
+        bytes * (view.slices.1 as u64).max(1) * d.sample_count.max(1)
     }
 }
 
