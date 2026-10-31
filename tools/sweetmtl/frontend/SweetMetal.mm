@@ -204,10 +204,11 @@ static void cache_dir(char *cache, size_t size)
 			return;
 		}
 		read_env();
-		/* freedreno renders a client's passes to memory, not through GMEM tiles (the env file can say otherwise). A
-		 * framebuffer fetch puts a texture barrier before its draw, and a5xx's fd_texture_barrier flushes the whole
-		 * batch: in GMEM every such draw restored and resolved the pass's attachments, and Maps's 4x passes of
-		 * PatternedRibbon and GlowAlpha draws ran past the GPU hang check (boot 216). In memory they draw (boot 223). */
+		/* freedreno renders a client's passes to memory, not through GMEM tiles, as sweetgl has backboardd do (the env
+		 * file can say otherwise). A framebuffer fetch puts a texture barrier before its draw. In GMEM the barrier
+		 * flushes the whole batch, so every such draw restored and resolved the pass's attachments, and Maps's 4x
+		 * passes of PatternedRibbon and GlowAlpha draws ran past the GPU hang check (boot 216). In memory
+		 * tools/sweetgl/mesa.patch's fd5_texture_barrier cleans and invalidates inside the batch (boot 223). */
 		setenv("FD_MESA_DEBUG", "sysmem", 0);
 		/* Metal validation failures abort by default; frameworks with Apple-GPU-only kernels (MPS) report one on any other device. */
 		void (*set)(unsigned, unsigned) = (void (*)(unsigned, unsigned))dlsym(RTLD_DEFAULT, "MTLFailureTypeSetErrorModeType");

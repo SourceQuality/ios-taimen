@@ -1552,3 +1552,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   location and notifications alike, keep the home gesture and button until answered. With boot 210-211's first
   page, every stock app on the home screen opens; what remains are sign-ins and Apple services. Look Around's round
   overview map (a 168x168 drawable, one IOSurface of 114688 bytes imported once) stays black: parked.
+- 2026-10-30 Correction to 30815c9 and boot 223: backboardd does not keep GMEM. sweetgl has always set
+  FD_MESA_DEBUG=sysmem,nofp16, and tools/sweetgl/mesa.patch (in SweetMetal's Mesa too) gives a5xx an fd5_texture_barrier
+  that, rendering to memory, cleans the CCU and invalidates UCHE inside the batch instead of flushing it. SweetMetal's
+  clients now render the way the compositor always has.
