@@ -1,0 +1,93 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 72ca03d..d344859 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -709,10 +709,6 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 		if (b == NULL) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		if (b->surface != NULL) {
+-			/* 0358: the next CPU lock of the surface cleans and invalidates it (SweetSurface trapLock) */
+-			OSIncrementAtomic((volatile SInt32 *)&b->surface->gpuUse);
+-		}
+ 		/*
+ 		 * CPU-cached: its CPU writes to memory, no stale lines over GPU
+ 		 * writes. Only pages written since the last submit: flushing every
+@@ -755,6 +751,15 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 		struct sweet_gpu_bo *b = bo(handles[i]);
+ 		b->last_seq = seq;
+ 		b->used = true;
++		if (b->surface != NULL) {
++			/*
++			 * 0358: the next CPU lock of the surface cleans and invalidates it; 0371: after waiting
++			 * for this submit (SweetSurface trapLock). The seqno is stored before the count moves,
++			 * so a lock that sees the count also sees the seqno.
++			 */
++			__atomic_store_n(&b->surface->gpuSeq, seq, __ATOMIC_RELEASE);
++			__atomic_fetch_add(&b->surface->gpuUse, 1, __ATOMIC_RELEASE);
++		}
+ 	}
+ 	*seqOut = seq;
+ 	return kIOReturnSuccess;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index cdf1a8c..68be6e9 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1104,6 +1104,33 @@ extern "C" boolean_t pmap_valid_page(ppnum_t pn);
+  * gallery drew once and then showed black cards: PosterBoard encodes its snapshot ("Creating
+  * snapshot from IOSurface") from the surface AegirPoster's Metal rendering wrote.
+  */
++/*
++ * 0371: the lock first waits for the last GPU submit that listed the surface, as IOSurfaceLock waits
++ * for the GPU on Apple's. Invalidating while that submit still ran let the CPU fetch the old bytes
++ * and keep them over what the GPU wrote next: the poster gallery's card was drawn on the first visit
++ * (the live scene) and black on every later one (the whole card, its clock too: PosterBoard's
++ * snapshot, which backboardd renders into a surface and PosterBoard locks and reads at once).
++ */
++extern "C" int sweet_gpu_wait(uint32_t seqno, uint32_t timeout_ms);
++
++static void
++sweet_surface_gpu_done(SweetSurface *s)
++{
++	static unsigned logged;
++	uint32_t seq = __atomic_load_n(&s->gpuSeq, __ATOMIC_ACQUIRE);
++	uint64_t t0 = mach_absolute_time();
++	int e = sweet_gpu_wait(seq, 2000);
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	if ((e != 0 || ns > 1000000) && logged < 16) {
++		logged++;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET SURF: %s's lock of surface %u (%ux%u) waited %llu ms for GPU submit %u%s\n", name, s->id,
++		    s->width, s->height, ns / 1000000, seq, e != 0 ? " and gave up" : "");
++	}
++}
++
+ static void
+ sweet_surface_invalidate(SweetSurface *s)
+ {
+@@ -1146,9 +1173,10 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+-	uint32_t use = s->gpuUse;
++	uint32_t use = __atomic_load_n(&s->gpuUse, __ATOMIC_ACQUIRE);
+ 	if (use != s->gpuUseSeen) {
+ 		s->gpuUseSeen = use;
++		sweet_surface_gpu_done(s);
+ 		sweet_surface_invalidate(s);
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index bc2a3d0..038b917 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -43,6 +43,7 @@ public:
+ 	bool                      readOnly;     /* ...from a read-only mapping: mapped read-only */
+ 	volatile uint32_t         gpuUse;       /* 0358: GPU submits that listed it (SweetGPU) */
+ 	uint32_t                  gpuUseSeen;   /* ...as of the last CPU lock's cache maintenance */
++	volatile uint32_t         gpuSeq;       /* 0371: the GPU seqno of the last submit that listed it */
+ 	char                      creator[20];  /* 0369: the process that made it ("kernel": the panel) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
