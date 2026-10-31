@@ -1765,3 +1765,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   compositing layers; the CP's count includes what it prefetched, so the stuck draw is the marked one or the one
   before. No SMMU fault in any. The stall is real, recovers in 3 ms after the 2 s stuck check, and is not tied to one
   process: the next suspect is what the composite samples as Look Around opens (formats, IOSurfaces).
+- 2026-10-31 boot 264 (r190; SWEETGL_TRACE=1 in backboardd; eight rounds): one stall (backboardd, IB2 at 688 of
+  1410 dwords, recovered in 3 ms). Just before it backboardd made CA's offscreen render targets (1127x1138,
+  1127x1139, 942x1170, 1125x132: blur/material passes) and sampled Maps's 1125x2436 drawables (surfaces 350, 353):
+  ordinary compositing. With boot 263's kernel-submit stall too, the stalls hit any submitter, with no fault, under
+  the heaviest load: the 710 MHz corner (open-loop 1024 mV) is the next suspect. boot-xnu.sh takes TAIMEN_GPUCLK
+  (400, 600 or 710; 710 as before); boot 265 runs twelve rounds at 600 (596 MHz).
