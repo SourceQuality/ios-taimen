@@ -1587,3 +1587,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   from 0.3-2.5 s to 0.2-0.8 s per 10 s, and the heap now fills to 220-227 of 256 MB (what misses now is a full heap).
   Four recordings, no GPU hang, crashes only driverkitd and CacheDeleteExtension, hottest 60.8 C; Maps, Look Around
   and Compass draw as before.
+- 2026-10-31 **boot 232 (r177, TAIMEN_GPUHEAP=384, TAIMEN_MEM=0xb5400000): the bigger GPU heap.** Against boot 231
+  (256 MB): 36 bos (839 MB) missed instead of 86 (1.5 GB); most windows 4-12 ms of cache maintenance, nothing to
+  flush; heap peaks 309 of 384 MB; wired 43,000-46,000 pages instead of 50,000-57,000, compressed the same ~40,000.
+  The new defaults (aa114b1). Two GPU hangs again (Maps's submit, then backboardd's), and no app died: 0362 let Maps
+  and backboardd wait out the recoveries (boot 226: Maps crashed after the second). Four recordings, hottest 58.5 C.
