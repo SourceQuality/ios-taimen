@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index fbac5d1..cdf1a8c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -345,6 +345,19 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		if (planes->getCount() > SWEET_SURFACE_MAX_PLANES) {
+ 			return kIOReturnBadArgument;
+ 		}
++		/*
++		 * 0370: a creator that placed its planes itself (an offset or a size for any plane) keeps
++		 * its row bytes. Rounding them up under its offsets made the planes overlap: Maps's
++		 * 450x600 '420f' photos ask for 464-byte rows with CbCr at 464 x 600; at 512 the last 56
++		 * luma rows were written over the first 56 chroma rows (boots 235-238, magenta and green
++		 * along the photos' tops). sweetgl copies planes whose rows the GPU can't sample.
++		 */
++		bool placed = false;
++		for (unsigned int i = 0; i < planes->getCount(); i++) {
++			OSDictionary *pd = OSDynamicCast(OSDictionary, planes->getObject(i));
++			placed |= pd != NULL && (pd->getObject("IOSurfacePlaneOffset") != NULL ||
++			    pd->getObject("IOSurfacePlaneSize") != NULL);
++		}
+ 		for (unsigned int i = 0; i < planes->getCount(); i++) {
+ 			OSDictionary *pd = OSDynamicCast(OSDictionary, planes->getObject(i));
+ 			struct sweet_surface_plane *p = &s->planes[i];
+@@ -360,8 +373,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
+ 				return kIOReturnBadArgument;
+ 			}
+-			p->bytesPerRow = sweet_rows(sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow", 0),
+-			    p->width, p->elementWidth, p->bytesPerElement, props->getCount());
++			uint32_t asked = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow", 0);
++			p->bytesPerRow = placed && asked != 0 ? asked :
++			    sweet_rows(asked, p->width, p->elementWidth, p->bytesPerElement, props->getCount());
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
