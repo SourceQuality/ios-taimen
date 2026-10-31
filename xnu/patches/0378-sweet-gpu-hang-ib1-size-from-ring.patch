@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c7958c2..0981fce 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2102,7 +2102,23 @@ ib_dump(vm_offset_t gpu, uint32_t hung)
+ 			}
+ 		}
+ 	}
+-	uint32_t size2 = base1 != 0 && base2 != 0 && size1 != 0 ? ib2_size(base1, size1, base2) : 0;
++	/*
++	 * 0378: else from the ring, where every IB went in as a CP_INDIRECT_BUFFER_PFE with its size: the last such
++	 * packet naming IB1 before the CP's read pointer (boot 261: Maps's hung IB1 was not among the first unfinished
++	 * submit's first eight IBs)
++	 */
++	if (size1 == 0 && base1 != 0 && rb != NULL) {
++		uint32_t rptr = gr(gpu, R_CP_RB_RPTR) & (RB_DWORDS - 1);
++		for (uint32_t k = 1; k <= RB_DWORDS && size1 == 0; k++) {
++			uint32_t i = (rptr - k) & (RB_DWORDS - 1);
++			if ((rb[i] >> 28) == 7 && ((rb[i] >> 16) & 0x7f) == 0x3f && (rb[i] & 0x7fff) == 3 &&
++			    (rb[(i + 1) & (RB_DWORDS - 1)] | (uint64_t)rb[(i + 2) & (RB_DWORDS - 1)] << 32) == base1) {
++				size1 = rb[(i + 3) & (RB_DWORDS - 1)];
++			}
++		}
++	}
++	/* IB2's size from the IB1 packet naming it: IB1 scanned to its size, or its first 4096 dwords */
++	uint32_t size2 = base1 != 0 && base2 != 0 ? ib2_size(base1, size1 != 0 ? size1 : 4096, base2) : 0;
+ 	const struct {
+ 		const char *name;
+ 		uint64_t base;

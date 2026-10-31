@@ -14,14 +14,9 @@ import sys
 
 
 def parity(v):
-    v ^= v >> 4
-    v ^= v >> 8
-    v ^= v >> 12
-    v ^= v >> 16
-    v ^= v >> 20
-    v ^= v >> 24
-    v ^= v >> 28
-    return (0x9669 >> (v & 0xf)) & 1
+    """Mesa's pm4_odd_parity_bit: the bit that makes the value's ones odd (its nibbles XORed, then a table)."""
+    x = v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)
+    return (0x9669 >> (x & 0xf)) & 1
 
 
 def names(mesa):
