@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 87aab4d..d7358cd 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1666,6 +1666,12 @@ static struct {
+ } g_subm[SUBMITTERS];
+ static uint32_t g_fence_seen;           /* fence value at g_fence_when */
+ static uint64_t g_fence_when;
++/*
++ * 0366: how long the fence may stand still before the GPU counts as hung (taimengpustuck=MS, default 2000). Boots
++ * 226 and 232: hangs as Maps launched and as Look Around opened and closed, the GPU busy (RBBM_STATUS ef019fc1),
++ * so perhaps a long submit rather than a stuck one. A fence that moves again after more than a second is logged.
++ */
++static uint32_t g_stuck_ms = 2000;
+ static int g_max_mhz = 300;
+ 
+ #define CP_INDIRECT_BUFFER_PFE  0x3f
+@@ -1995,10 +2001,16 @@ sweet_gpu_wait(uint32_t seqno, uint32_t timeout_ms)
+ 		uint64_t now = mach_absolute_time();
+ 		lck_mtx_lock(&sweet_gpu_vm_lock);
+ 		if (f != g_fence_seen || g_fence_when == 0) {
++			static unsigned slow_logged;
++			if (g_fence_when != 0 && usecs(now - g_fence_when) > 1000000 && slow_logged < 20) {
++				slow_logged++;
++				printf("SWEET GPU: slow: fence %u -> %u after %llu ms without progress\n", g_fence_seen, f,
++				    usecs(now - g_fence_when) / 1000);
++			}
+ 			g_fence_seen = f;
+ 			g_fence_when = now;
+-		} else if (g_ready && f != g_submit_seq && usecs(now - g_fence_when) > 2000000) {
+-			gpu_hung("wait: fence stuck 2 s");
++		} else if (g_ready && f != g_submit_seq && usecs(now - g_fence_when) > (uint64_t)g_stuck_ms * 1000) {
++			gpu_hung("wait: fence stuck");
+ 		}
+ 		lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 		if (now > deadline) {
+@@ -2858,6 +2870,10 @@ sweet_gpu_init(void)
+ 	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++	if (PE_parse_boot_argn("taimengpustuck", &g_stuck_ms, sizeof(g_stuck_ms))) {
++		g_stuck_ms = g_stuck_ms < 500 ? 500 : g_stuck_ms;
++		printf("SWEET GPU: a fence still for %u ms counts as a hang (taimengpustuck)\n", g_stuck_ms);
++	}
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 	if (on > TAIMEN_GPU_MAX_LEVEL) {
+ 		printf("SWEET GPU: sweetgpu=%d capped at %d on taimen\n", on,
