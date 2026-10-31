@@ -1700,6 +1700,21 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
   NBINFO(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
+ // Metal Performance Shaders ask conformsToProtocol: before they use an object: MPSCommandBufferImageCache's initWithCommandBuffer:
+ // returns nil for a command buffer that does not conform to MTLCommandBuffer, and MPSAutoCache then reads through the nil
+ // (PridePosterExtension, boot 250: SIGSEGV at 0x18). Each class adopts the public protocol it implements; as for the device,
+ // conformance only answers conformsToProtocol:, the methods are still looked up one by one.
+ {const struct {Class cls;const char *name;} adopt[]={
+   {[NBBuffer class],"MTLBuffer"},{[NBTexture class],"MTLTexture"},{[NBLibrary class],"MTLLibrary"},{[NBFunction class],"MTLFunction"},
+   {[NBComputePipeline class],"MTLComputePipelineState"},{[NBRenderPipeline class],"MTLRenderPipelineState"},
+   {[NBSampler class],"MTLSamplerState"},{[NBDepthStencil class],"MTLDepthStencilState"},{[NBEvent class],"MTLEvent"},
+   {[NBSharedEvent class],"MTLSharedEvent"},{[NBFence class],"MTLFence"},{[NBQueue class],"MTLCommandQueue"},
+   {[NBCommandBuffer class],"MTLCommandBuffer"},{[NBComputeEncoder class],"MTLComputeCommandEncoder"},
+   {[NBRenderEncoder class],"MTLRenderCommandEncoder"},{[NBBlitEncoder class],"MTLBlitCommandEncoder"},{[NBHeap class],"MTLHeap"},
+   {[NBBinaryArchive class],"MTLBinaryArchive"}};
+  unsigned adopted=0;
+  for(const auto &a:adopt)if(Protocol *p=objc_getProtocol(a.name)){class_addProtocol(a.cls,p);adopted++;}
+  NBINFO(@"native-metal: %u of %zu Metal protocols adopted",adopted,sizeof adopt/sizeof adopt[0]);}
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;
