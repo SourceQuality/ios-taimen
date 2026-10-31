@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index d7358cd..ebdd69e 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1669,7 +1669,8 @@ static uint64_t g_fence_when;
+ /*
+  * 0366: how long the fence may stand still before the GPU counts as hung (taimengpustuck=MS, default 2000). Boots
+  * 226 and 232: hangs as Maps launched and as Look Around opened and closed, the GPU busy (RBBM_STATUS ef019fc1),
+- * so perhaps a long submit rather than a stuck one. A fence that moves again after more than a second is logged.
++ * so perhaps a long submit rather than a stuck one. 0367: a wait that blocks more than a second is logged with
++ * its submitter (0366 logged the fence's standstill between waits, idle time included).
+  */
+ static uint32_t g_stuck_ms = 2000;
+ static int g_max_mhz = 300;
+@@ -1990,9 +1991,18 @@ sweet_gpu_wait(uint32_t seqno, uint32_t timeout_ms)
+ 	uint64_t deadline, spin_until;
+ 	clock_interval_to_deadline(timeout_ms, NSEC_PER_MSEC, &deadline);
+ 	clock_interval_to_deadline(2, NSEC_PER_MSEC, &spin_until);
++	uint64_t t0 = mach_absolute_time();
+ 	for (;;) {
+ 		uint32_t f = fence_now();
+ 		if ((int32_t)(f - seqno) >= 0) {
++			static unsigned slow_logged;
++			uint64_t waited = usecs(mach_absolute_time() - t0);
++			if (waited > 1000000 && slow_logged < 20) {
++				slow_logged++;
++				printf("SWEET GPU: slow: a wait for fence %u (%s's submit) blocked %llu ms\n", seqno,
++				    g_subm[seqno % SUBMITTERS].seq == seqno ? g_subm[seqno % SUBMITTERS].name : "an earlier",
++				    waited / 1000);
++			}
+ 			return 0;
+ 		}
+ 		if (!sweet_gpu_ready()) {       /* a recovery writes the hung submits' fences as done */
+@@ -2001,12 +2011,6 @@ sweet_gpu_wait(uint32_t seqno, uint32_t timeout_ms)
+ 		uint64_t now = mach_absolute_time();
+ 		lck_mtx_lock(&sweet_gpu_vm_lock);
+ 		if (f != g_fence_seen || g_fence_when == 0) {
+-			static unsigned slow_logged;
+-			if (g_fence_when != 0 && usecs(now - g_fence_when) > 1000000 && slow_logged < 20) {
+-				slow_logged++;
+-				printf("SWEET GPU: slow: fence %u -> %u after %llu ms without progress\n", g_fence_seen, f,
+-				    usecs(now - g_fence_when) / 1000);
+-			}
+ 			g_fence_seen = f;
+ 			g_fence_when = now;
+ 		} else if (g_ready && f != g_submit_seq && usecs(now - g_fence_when) > (uint64_t)g_stuck_ms * 1000) {
