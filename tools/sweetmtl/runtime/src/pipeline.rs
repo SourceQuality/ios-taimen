@@ -21,6 +21,7 @@ use metal2vulkan::pipeline::{
     ComputePipeline, ComputePipelineDescriptor, PipelineLayout, RenderPipeline, RenderPipelineDescriptor, Stage,
     StageSource,
 };
+use metal2vulkan::pipeline::StorageImageClass;
 use metal2vulkan::vk;
 use metal2vulkan::Budget;
 use std::ffi::CString;
@@ -418,9 +419,19 @@ impl Plans {
 /// - `cross_class`: a texture read in its own numeric class;
 /// - `storage_view_slots`: read-only buffers kept as storage views;
 /// - `dropped_vertex_layer`: the vertex function's `Layer` output left out (a pass of one layer);
-/// - `emulated_simdgroups`: a kernel's simdgroups emulated in its own threadgroup memory.
+/// - `emulated_simdgroups`: a kernel's simdgroups emulated in its own threadgroup memory;
+/// - `storage_images` whose choice only changes the function's code: the bound format itself (no
+///   alias view, no RGBX twin), written as it is (`Identity`) or rounded to `half` as Metal stores
+///   it by the shader (`HalfTowardZero`, `HalfQuietNan`); the plan's view of the bound texture is
+///   bound as any storage image. Metal Performance Shaders' kernels write half-float images so
+///   (PridePosterExtension, boot 251).
 fn without_supported(key: &VariantKey) -> VariantKey {
     let mut rest = key.clone();
+    rest.storage_images.retain(|_, c| {
+        !(c.alias.is_none()
+            && !c.x_channel
+            && matches!(c.class, StorageImageClass::Identity | StorageImageClass::HalfTowardZero | StorageImageClass::HalfQuietNan))
+    });
     rest.srgb_textures.clear();
     rest.address_maps.clear();
     rest.cross_class.clear();

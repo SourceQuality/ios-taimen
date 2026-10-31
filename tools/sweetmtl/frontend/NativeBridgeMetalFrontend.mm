@@ -131,6 +131,9 @@ static void waitForResource(id resource);
 - (uint64_t)protectionOptions {return 0;} \
 - (id<MTLHeap>)heap {return _parentHeap;} \
 - (BOOL)isAliasable {return NO;} \
+/* each heap resource has memory of its own (runtime heaps): nothing to give back; MPS marks its temporary images */ \
+/* aliasable (PridePosterExtension, boot 251: -makeAliasable unrecognized, an uncaught exception) */ \
+- (void)makeAliasable {} \
 - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
 - (void)waitUntilComplete {waitForResource(self);}
 @interface NBBuffer : NBObject
