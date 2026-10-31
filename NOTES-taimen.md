@@ -1603,3 +1603,10 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   148x108 and 37x27 single-sample passes; 900x900 sRGB twice at the launch. None is Look Around's round overview map:
   MapKit draws snapshots in com.apple.MapKit.SnapshotService (seen exec'd in boot 226), which is not a SweetMetal
   client and gets no Metal device; boot 235 lists it (clients-m4f).
+- 2026-10-31 boot 235 (r179; clients-m4f with com.apple.MapKit.SnapshotService): the scripted taps missed Look Around
+  (the map had moved to Fisherman's Wharf; the first tap picked Ghirardelli Square), and the SnapshotService never
+  ran, so nothing learned about the overview map. New: Ghirardelli Square's place-card photos have blocks of
+  magenta and green along their tops, with the picture's edges in them: chroma read from luma. The photos arrive
+  as 45 256x256 '420f' IOSurfaces (Y 256x256 at 0, CbCr 128x128 at 0x10000), probably composited by CA in
+  backboardd (sweetgl binds each plane as a texture; freedreno honours the plane offset; SweetMetal refuses planar
+  surfaces and was never asked). Boot 236 checks whether the bad tiles heal (coherency) or stay (layout).
