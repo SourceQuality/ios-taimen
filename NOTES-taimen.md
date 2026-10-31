@@ -1529,3 +1529,12 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   29-30 ms, 0 errors, 0 overflows; speaker sessions 0 DSP underflows, 0 dropped; no GPU hang, no panic, hottest
   68.9 C. Crashes: driverkitd, CacheDeleteExtension and CollectionsPoster once each. Maps' 32 framebuffer-fetch
   pipelines refused as expected.
+- 2026-10-30 **boot 223 (boot 216's SweetMetal: sampleRateShading + subpass loads; env file FD_MESA_DEBUG=sysmem): the
+  multisampled framebuffer fetch draws.** No GPU hang, no refusal, no Maps crash. freedreno's fd_texture_barrier
+  flushes the whole batch, and a framebuffer fetch puts a barrier before its draw: in GMEM each of those draws
+  restored and resolved the pass's 4x attachments (about 90 MB for 1125x2436), and boot 216's frame ran past the
+  2 s hang check. Rendered to memory a barrier is cheap. Maps now shows its ferry routes in the bay and Look Around's
+  blue coverage lines along the streets; Look Around's round overview map is still a black disc. Maps composited
+  about 9-10 frames/s against about 15 in boot 215 (different views, dark map). 30815c9 makes FD_MESA_DEBUG=sysmem
+  the SweetMetal clients' default (backboardd and SpringBoard stay on GMEM through sweetgl) and claims
+  sampleRateShading again.
