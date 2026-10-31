@@ -1523,3 +1523,9 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Voice Memos after a recording, and FaceTime draws** (its Apple ID sign-in screen, black since boot 141). Twice:
   record 10 s, home, Compass through Spotlight (227 deg SW), home. A capture client's connection now fails at once
   and sees no cameras.
+- 2026-10-30 **boot 222 (boot 221's blob: mediaserverd without capture services): the soak runs through.** Six rounds of
+  Settings, Weather, Safari's video (then in Picture in Picture), a 10 s Voice Memos recording, Compass (227-228 deg
+  SW) and Maps' Look Around (Maps in its night style: the phone went to dark mode in the evening). Recordings up in
+  29-30 ms, 0 errors, 0 overflows; speaker sessions 0 DSP underflows, 0 dropped; no GPU hang, no panic, hottest
+  68.9 C. Crashes: driverkitd, CacheDeleteExtension and CollectionsPoster once each. Maps' 32 framebuffer-fetch
+  pipelines refused as expected.
