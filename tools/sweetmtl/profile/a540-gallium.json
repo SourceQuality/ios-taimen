@@ -14,7 +14,8 @@
           "fragmentStoresAndAtomics": true,
           "vertexPipelineStoresAndAtomics": true,
           "shaderStorageImageWriteWithoutFormat": true,
-          "samplerAnisotropy": true
+          "samplerAnisotropy": true,
+          "sampleRateShading": true
         }
       },
       "properties": {
