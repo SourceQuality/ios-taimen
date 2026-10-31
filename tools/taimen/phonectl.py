@@ -6,6 +6,9 @@
     tools/taimen/phonectl.py swipe X1 Y1 X2 Y2 [MS]  (swipec: canvas coordinates)
     tools/taimen/phonectl.py unlock | home           swipe up from the bottom edge
     tools/taimen/phonectl.py shot OUT.png            the 1125 x 2436 canvas iOS last drew
+    tools/taimen/phonectl.py surfs [FMT]             live surfaces (of pixel format FMT, e.g. 420f) (xnu 0369)
+    tools/taimen/phonectl.py surf ID OUT.raw         a surface's bytes; its geometry in OUT.raw.txt
+                                                     (tools/taimen/surfpng.py makes PNGs of them)
     tools/taimen/phonectl.py type TEXT | enter | backspace [N] | tab | escape   (xnu 0307)
     tools/taimen/phonectl.py key power|volup|voldown|home
     tools/taimen/phonectl.py end                     end the boot now, as taimenreboot would (xnu 0331)
@@ -81,6 +84,28 @@ class Phone:
         png(path, w, h, data)
         print(f'{path}: {w}x{h} in {time.time() - t:.1f} s')
 
+    def surfs(self, fmt=''):
+        self.s.sendall(f'surfs {fmt}'.strip().encode() + b'\n')
+        while (r := self.line()) != 'OK':
+            if r.startswith('ERR'):
+                raise RuntimeError(f'surfs: {r}')
+            print(r)
+
+    def surf(self, sid, path):
+        self.s.sendall(f'surf {sid}\n'.encode())
+        r = self.line()
+        if not r.startswith('SURF '):
+            raise RuntimeError(f'surf {sid}: {r}')
+        n, desc = r[5:].split(' ', 1)
+        data = self.exact(int(n))
+        if self.line() != 'OK':
+            raise RuntimeError(f'surf {sid}: no OK after the bytes')
+        with open(path, 'wb') as f:
+            f.write(data)
+        with open(path + '.txt', 'w') as f:
+            f.write(desc + '\n')
+        print(f'{path}: {desc}')
+
 
 SCALE, OFF_X = 2880 / 2436, 55
 
@@ -93,6 +118,10 @@ def run(p, words):
     op = words[0]
     if op == 'shot':
         p.shot(words[1])
+    elif op == 'surfs':
+        p.surfs(words[1] if len(words) > 1 else '')
+    elif op == 'surf':
+        p.surf(words[1], words[2])
     elif op in ('unlock', 'home'):
         p.cmd('swipe 720 2870 720 1300 250')
     elif op == 'sleep':

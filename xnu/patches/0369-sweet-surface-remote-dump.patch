@@ -1,0 +1,261 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 203dc59..cba4740 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1188,6 +1188,10 @@ ud_tcplog_thread(void *arg __unused, wait_result_t wr __unused)
+  *   swipe X1 Y1 X2 Y2 [MS]      16 moves over MS ms (default 250)
+  *   shot                        "SHOT W H" then H rows of W x 4 bytes (BGRA) of the last surface
+  *                               backboardd swapped (the 1125 x 2436 canvas), then "OK"
++ *   surfs [FMT]                 0369: a line per live surface (of pixel format FMT, e.g. 420f): id,
++ *                               creator, geometry, planes; then "OK"
++ *   surf ID                     "SURF LEN <its surfs line>" then LEN bytes from the surface's start
++ *                               (a copy taken first), then "OK"
+  *   type TEXT                   the rest of the line as key presses (0307, US layout; the
+  *                               keyboard service registers on the first one)
+  *   enter | backspace [N] | tab | escape
+@@ -1202,6 +1206,9 @@ extern void sweet_hid_kbd(uint32_t usage, int down);
+ extern int sweet_hid_accel(int mx, int my, int mz);
+ extern bool sweet_fb_grab(uintptr_t *base, uint32_t *w, uint32_t *h, uint32_t *bpr, void **ref);
+ extern void sweet_fb_grab_release(void *ref);
++extern bool sweet_surf_describe(uint32_t id, uint32_t fmt, char *buf, size_t len);
++extern void *sweet_surf_snapshot(uint32_t id, uint32_t *len, char *desc, size_t desclen);
++extern void sweet_surf_snapshot_free(void *copy, uint32_t len);
+ 
+ static int
+ ctl_send(socket_t s, const void *p, size_t n)
+@@ -1382,6 +1389,46 @@ ctl_command(socket_t s, const char *line)
+ 		if (err == 0) {
+ 			ctl_say(s, "OK\n");
+ 		}
++	} else if (strncmp(line, "surfs", 5) == 0) {
++		static char desc[512];
++		uint32_t fmt = 0;
++		if (strlen(line) == 10 && line[5] == ' ') {
++			fmt = (uint32_t)(uint8_t)line[6] << 24 | (uint32_t)(uint8_t)line[7] << 16 |
++			    (uint32_t)(uint8_t)line[8] << 8 | (uint32_t)(uint8_t)line[9];
++		}
++		int err = 0;
++		for (uint32_t id = 1; id < 4096 && err == 0; id++) {
++			if (sweet_surf_describe(id, fmt, desc, sizeof(desc) - 1)) {
++				strlcat(desc, "\n", sizeof(desc));
++				err = ctl_say(s, desc);
++			}
++		}
++		if (err == 0) {
++			ctl_say(s, "OK\n");
++		}
++	} else if (strncmp(line, "surf ", 5) == 0 && n == 1) {
++		static char desc[512];
++		uint32_t len = 0;
++		void *copy = v[0] > 0 ? sweet_surf_snapshot((uint32_t)v[0], &len, desc, sizeof(desc)) : NULL;
++		if (copy == NULL) {
++			ctl_say(s, "ERR no such surface (or no kernel mapping, or over 64 MB)\n");
++			return;
++		}
++		snprintf(reply, sizeof(reply), "SURF %u ", len);
++		int err = ctl_say(s, reply);
++		if (err == 0) {
++			err = ctl_say(s, desc);
++		}
++		if (err == 0) {
++			err = ctl_say(s, "\n");
++		}
++		if (err == 0) {
++			err = ctl_send(s, copy, len);
++		}
++		sweet_surf_snapshot_free(copy, len);
++		if (err == 0) {
++			ctl_say(s, "OK\n");
++		}
+ 	} else if (strncmp(line, "type ", 5) == 0) {
+ 		unsigned bad = 0;
+ 		for (const char *p = line + 5; *p; p++) {
+@@ -1465,7 +1512,7 @@ ctl_command(socket_t s, const char *line)
+ 		sweet_hid_key(k, 0);
+ 		ctl_say(s, "OK\n");
+ 	} else {
+-		ctl_say(s, "ERR commands: tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot | type TEXT | enter | backspace [N] | key NAME | accel X Y Z | orient NAME | end\n");
++		ctl_say(s, "ERR commands: tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot | surfs [FMT] | surf ID | type TEXT | enter | backspace [N] | key NAME | accel X Y Z | orient NAME | end\n");
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index aaf4865..fbac5d1 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -42,6 +42,7 @@ extern "C" void sweet_user_backtrace(const char *tag);   /* osfmk/kern/exception
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+@@ -250,6 +251,7 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	s->elementWidth = s->elementHeight = 1;
+ 	s->pixelFormat = pixelFormat;
+ 	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	strlcpy(s->creator, "kernel", sizeof(s->creator));
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+ 	s->mapCache = kIOMapWriteCombineCache;
+ 	if (s->memory == NULL || !sweet_surface_publish(s)) {
+@@ -383,6 +385,118 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * 0369: planar layouts are logged 8 per process (one global budget of 64 went to WeatherPoster
++ * in boot 237, before Maps made its photos), each with the plane keys the layout above ignores.
++ */
++static bool
++sweet_surf_planar_budget(const char *name)
++{
++	static char names[32][20];
++	static uint8_t counts[32];
++	for (int i = 0; i < 32; i++) {
++		if (names[i][0] == 0) {
++			strlcpy(names[i], name, sizeof(names[i]));
++		}
++		if (strncmp(names[i], name, sizeof(names[i])) == 0) {
++			return counts[i]++ < 8;
++		}
++	}
++	return false;
++}
++
++static void
++sweet_surf_log_unparsed(SweetSurface *s, OSDictionary *props)
++{
++	static const char *const known[] = { "IOSurfacePlaneWidth", "IOSurfacePlaneHeight",
++		                             "IOSurfacePlaneBytesPerElement", "IOSurfacePlaneElementWidth", "IOSurfacePlaneElementHeight",
++		                             "IOSurfacePlaneBytesPerRow", "IOSurfacePlaneOffset", "IOSurfacePlaneSize" };
++	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	for (unsigned int i = 0; planes != NULL && i < planes->getCount(); i++) {
++		OSDictionary *pd = OSDynamicCast(OSDictionary, planes->getObject(i));
++		OSCollectionIterator *it = pd != NULL ? OSCollectionIterator::withCollection(pd) : NULL;
++		OSSymbol *key;
++		while (it != NULL && (key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++			bool seen = false;
++			for (unsigned int k = 0; k < sizeof(known) / sizeof(known[0]); k++) {
++				seen |= key->isEqualTo(known[k]);
++			}
++			if (!seen) {
++				OSNumber *v = OSDynamicCast(OSNumber, pd->getObject(key));
++				IOLog("SWEET SURF: %s id %u plane %u also has %s = %lld%s\n", s->creator, s->id, i,
++				    key->getCStringNoCopy(), v != NULL ? (long long)v->unsigned64BitValue() : 0LL,
++				    v != NULL ? "" : " (not a number)");
++			}
++		}
++		OSSafeReleaseNULL(it);
++	}
++}
++
++/*
++ * 0369: the remote control's view (bsd/dev/sweet_usb.c "surfs" and "surf ID"): one line of
++ * geometry per surface, and a copy of a surface's bytes from its start (offset 0, allocSize).
++ */
++extern "C" bool sweet_surf_describe(uint32_t id, uint32_t fmt, char *buf, size_t len);
++extern "C" void *sweet_surf_snapshot(uint32_t id, uint32_t *len, char *desc, size_t desclen);
++extern "C" void sweet_surf_snapshot_free(void *copy, uint32_t len);
++
++static void
++sweet_surf_line(SweetSurface *s, char *buf, size_t len)
++{
++	char f[5];
++	for (int i = 0; i < 4; i++) {
++		char c = (char)(s->pixelFormat >> (24 - 8 * i));
++		f[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
++	}
++	f[4] = 0;
++	int n = snprintf(buf, len, "%u %s %ux%u fmt %s bpe %u bpr %u offset 0x%x alloc 0x%x planes %u",
++	    s->id, s->creator[0] ? s->creator : "?", s->width, s->height, f, s->bytesPerElement,
++	    s->bytesPerRow, s->offset, s->allocSize, s->planeCount);
++	for (uint32_t i = 0; i < s->planeCount && n > 0 && (size_t)n < len; i++) {
++		const struct sweet_surface_plane *pl = &s->planes[i];
++		n += snprintf(buf + n, len - (size_t)n, " [%ux%u bpe %u bpr %u offset 0x%x size 0x%x]",
++		    pl->width, pl->height, pl->bytesPerElement, pl->bytesPerRow, pl->offset, pl->size);
++	}
++}
++
++/* fmt 0: any pixel format */
++bool
++sweet_surf_describe(uint32_t id, uint32_t fmt, char *buf, size_t len)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	bool ok = s != NULL && (fmt == 0 || s->pixelFormat == fmt);
++	if (ok) {
++		sweet_surf_line(s, buf, len);
++	}
++	OSSafeReleaseNULL(s);
++	return ok;
++}
++
++void *
++sweet_surf_snapshot(uint32_t id, uint32_t *len, char *desc, size_t desclen)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	void *copy = NULL;
++	if (s == NULL) {
++		return NULL;
++	}
++	uintptr_t base = s->kernelAddress();
++	if (base != 0 && s->allocSize > 0 && s->allocSize <= (64u << 20) &&
++	    (copy = IOMallocData(s->allocSize)) != NULL) {
++		memcpy(copy, (const void *)base, s->allocSize);
++		*len = s->allocSize;
++		sweet_surf_line(s, desc, desclen);
++	}
++	s->release();
++	return copy;
++}
++
++void
++sweet_surf_snapshot_free(void *copy, uint32_t len)
++{
++	IOFreeData(copy, len);
++}
++
+ /* Per-client mapping of one surface. */
+ class SweetSurfaceRef : public OSObject {
+ 	OSDeclareDefaultStructors(SweetSurfaceRef);
+@@ -761,6 +875,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++	proc_selfname(s->creator, sizeof(s->creator));
+ 	ret = sweet_surface_layout(s, props);
+ 	OSNumber *address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
+ 	if (ret == kIOReturnSuccess && address != NULL) {
+@@ -828,17 +943,14 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
+-	static unsigned planar_logged;
+-	if (ret == kIOReturnSuccess && s->planeCount > 0 && planar_logged < 64) {
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+-		planar_logged++;
++	if (ret == kIOReturnSuccess && s->planeCount > 0 && sweet_surf_planar_budget(s->creator)) {
+ 		for (uint32_t i = 0; i < s->planeCount; i++) {
+ 			const struct sweet_surface_plane *pl = &s->planes[i];
+ 			IOLog("SWEET SURF: %s id %u fmt 0x%x plane %u: %ux%u bpe %u el %ux%u bpr %u offset 0x%x size 0x%x\n",
+-			    name, s->id, s->pixelFormat, i, pl->width, pl->height, pl->bytesPerElement,
++			    s->creator, s->id, s->pixelFormat, i, pl->width, pl->height, pl->bytesPerElement,
+ 			    pl->elementWidth, pl->elementHeight, pl->bytesPerRow, pl->offset, pl->size);
+ 		}
++		sweet_surf_log_unparsed(s, props);
+ 	}
+ 	/* Who asks for formats CoreAnimation's CPU renderer cannot draw into? */
+ 	static uint32_t odd_logged;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 11ea01d..bc2a3d0 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -43,6 +43,7 @@ public:
+ 	bool                      readOnly;     /* ...from a read-only mapping: mapped read-only */
+ 	volatile uint32_t         gpuUse;       /* 0358: GPU submits that listed it (SweetGPU) */
+ 	uint32_t                  gpuUseSeen;   /* ...as of the last CPU lock's cache maintenance */
++	char                      creator[20];  /* 0369: the process that made it ("kernel": the panel) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
