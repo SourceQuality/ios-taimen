@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c849080..ee6f36b 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1702,6 +1702,39 @@ fence_now(void)
+  * taimengpurecover times a boot (default 4; 0: off until reboot, as before).
+  */
+ static uint64_t g_pm4, g_pfp;           /* the CP microcode (cp_test, service mode) */
++/*
++ * 0374: the microcode's own mappings and a checksum taken when the service starts, compared after a failed
++ * recovery. The GPU sees DRAM 2-8 GB identity-mapped (smmu_identity), the microcode in it: a runaway shader's
++ * stray writes there would leave a CP that no reset brings back (boots 252-254).
++ */
++static uint32_t g_pm4_len, g_pfp_len, g_ucode_sum, g_l1_sum;
++static vm_offset_t g_pm4_va, g_pfp_va;
++
++static uint32_t
++fnv_words(const volatile uint32_t *p, uint32_t bytes, uint32_t h)
++{
++	for (uint32_t i = 0; i < bytes / 4; i++) {
++		h = (h ^ p[i]) * 16777619u;
++	}
++	return h;
++}
++
++static uint32_t
++ucode_sum(void)
++{
++	if (g_pm4_va == 0 || g_pfp_va == 0) {
++		return 0;
++	}
++	uint32_t h = fnv_words((const volatile uint32_t *)(g_pm4_va + (g_pm4 & PAGE_MASK)), g_pm4_len, 2166136261u);
++	return fnv_words((const volatile uint32_t *)(g_pfp_va + (g_pfp & PAGE_MASK)), g_pfp_len, h);
++}
++
++static uint32_t
++l1_sum(void)
++{
++	/* the identity entries (2-7 GB) only: the GVA window's change as its tables are made */
++	return g_l1 != NULL ? fnv_words((const volatile uint32_t *)(g_l1 + 2), 6 * 8, 2166136261u) : 0;
++}
+ static unsigned g_recoveries;
+ static void smmu_report(void);
+ 
+@@ -1926,6 +1959,9 @@ again: __attribute__((unused));        /* 0372: the GX power cycle comes back he
+ 	}
+ 	if (!(cp && landed && secure_left)) {
+ 		cp_state(gpu, "recovery failed:");
++		uint32_t us = ucode_sum(), ls = l1_sum();
++		printf("SWEET GPU: after the failed reset: CP microcode %s (%08x, %08x at the start), CB0 L1 table %s\n",
++		    us == g_ucode_sum ? "intact" : "CHANGED", us, g_ucode_sum, ls == g_l1_sum ? "intact" : "CHANGED");
+ 		printf("SWEET GPU: recovery %u%s FAILED (%s): VBIF %s; RPTR after reset %u, RBBM_STATUS %08x; ring %s, "
+ 		    "marker %08x, zap resume %lld/%llx, secure mode %s\n", g_recoveries, hard ? " (GX power cycle)" : "", why,
+ 		    vbif ? "halted" : "NOT halted", rptr, st, cp ? "read" : "NOT read", mark[0], r, r1,
+@@ -2659,6 +2695,12 @@ cp_test(vm_offset_t gpu, int level)
+ 			g_scratch_va = scratch_va;
+ 			g_pm4 = pm4;
+ 			g_pfp = pfp;
++			g_pm4_len = pm4_len;
++			g_pfp_len = pfp_len;
++			g_pm4_va = ml_io_map(trunc_page_64(pm4), round_page_64((pm4 & PAGE_MASK) + pm4_len));
++			g_pfp_va = ml_io_map(trunc_page_64(pfp), round_page_64((pfp & PAGE_MASK) + pfp_len));
++			g_ucode_sum = ucode_sum();
++			g_l1_sum = l1_sum();
+ 			g_ready = true;
+ 			printf("SWEET GPU: service ready (300 MHz, GPU VA window 8-16 GB)\n");
+ 			api_selftest();
