@@ -1648,3 +1648,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   ("Ghirardelli Square" with its shopping-bag pin on the arch), which boot 240 lacked: the label pass is what used the
   queries. The round overview map is still black. MapKit's SnapshotService ran in boots 170-172 only during boot-up
   (widgets), not for Look Around; boot 242 traces the passes while the overview shows.
+- 2026-10-31 boots 242-244 (r182; SweetMetal of d34f2b6 with SWEETMTL_TRACE=1): the phonectl route into Look Around
+  depends on how Maps restores its sheet. Boot 242: the card came back expanded and the tap at (175,1320) opened a
+  photo (the "Photos from Tripadvisor" gallery, every photo clean); boot 243: dragged down to the lowest detent, the
+  thumbnail moved to y~1960 and the tap closed the card. Robust (boot 244, as boot 234): with no card up, the map's
+  binoculars button (95,1365) opens Look Around at the map's centre, (112,244) expands it. Full screen at Aquatic
+  Park beach draws well; the circle under Done is opaque black (0,0,0), 132 px (44 pt), and no surface of that size
+  exists in any process: not a CAMetalLayer of its own, so most likely MapKit's compass (a material disc with its
+  needle and N) or a layer CA draws itself. Parked; nothing refused, no GPU hang, no crash but the usual two.
