@@ -1,0 +1,119 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ebdd69e..7ee305c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1791,6 +1791,52 @@ me_init(void)
+ 	emit(0);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++static vm_offset_t g_gpucc;
++
++/*
++ * 0372: the GX power domain cycled, for a hang the soft reset cannot clear (boot 252: a Metal Performance
++ * Shaders kernel of PridePosterExtension ran away after reading unmapped memory; after RBBM_SW_RESET the CP
++ * never read the ring, RBBM_STATUS stayed busy, and the GPU service went off with backboardd). As Linux's
++ * adreno_recover powers the GPU down and up: the core's branches off, IO clamped, the GX GDSC collapsed until
++ * PWR_ON drops, then taimen_power_up's GX half again (BCR and GMEM reset pulses, clamp off, GDSC on, branches
++ * on). CX (the RCGs and their rates, the SMMU) stays up. No GPU register is touched while GX is off.
++ */
++static bool
++taimen_gx_cycle(void)
++{
++	vm_offset_t cc = g_gpucc != 0 ? g_gpucc : (g_gpucc = ml_io_map(GPUCC_PA, 0x2000));
++	if (cc == 0) {
++		return false;
++	}
++	wr(cc, 0x10d0, rd(cc, 0x10d0) & ~1u);                           /* rbbmtimer branch off */
++	wr(cc, 0x1098, rd(cc, 0x1098) & ~1u);                           /* gfx3d branch off */
++	bool stopped = poll(cc, 0x1098, 1u << 31, 1u << 31, 1);         /* CLK_OFF */
++	wr(cc, 0x130, rd(cc, 0x130) | 1u);                              /* clamp IO */
++	wr(cc, 0x1094, rd(cc, 0x1094) | 1u);                            /* GX GDSC: SW_COLLAPSE */
++	bool off = poll(cc, 0x1094, 1u << 31, 0, 10);                   /* PWR_ON low */
++	delay(100);
++	wr(cc, 0x1090, 1u);                                             /* GX BCR pulse */
++	delay(1);
++	wr(cc, 0x1090, 0);
++	wr(cc, 0x130, rd(cc, 0x130) | (1u << 4));                       /* GMEM reset pulse */
++	delay(1);
++	wr(cc, 0x130, rd(cc, 0x130) & ~(1u << 4));
++	wr(cc, 0x130, rd(cc, 0x130) & ~1u);                             /* clamp off */
++	wr(cc, 0x1094, rd(cc, 0x1094) & ~1u);                           /* GX GDSC on */
++	bool on = poll(cc, 0x1094, 1u << 31, 1u << 31, 1);
++	delay(10);
++	wr(cc, 0x1098, rd(cc, 0x1098) | 1u);                            /* gfx3d (retain mem/periph kept) */
++	bool b1 = poll(cc, 0x1098, 1u << 31, 0, 1);
++	wr(cc, 0x10d0, rd(cc, 0x10d0) | 1u);                            /* rbbmtimer: after GX */
++	bool b2 = poll(cc, 0x10d0, 1u << 31, 0, 1);
++	printf("SWEET GPU: GX power cycle: clock %s, GDSC %s then %s (%08x), gfx3d %s, rbbm %s\n",
++	    stopped ? "stopped" : "NOT stopped", off ? "off" : "NOT off", on ? "on" : "NOT on", rd(cc, 0x1094),
++	    b1 ? "on" : "OFF", b2 ? "on" : "OFF");
++	return off && on && b1 && b2;
++}
++#endif
++
+ /* VM lock held, g_ready false. */
+ static bool
+ gpu_recover(const char *why)
+@@ -1806,11 +1852,15 @@ gpu_recover(const char *why)
+ 	g_recoveries++;
+ 	uint64_t t0 = mach_absolute_time();
+ 	vm_offset_t gpu = g_gpu;
+-	gw(gpu, R_RBBM_SW_RESET_CMD, 1);
+-	(void)gr(gpu, R_RBBM_SW_RESET_CMD);
+-	delay(100);
+-	gw(gpu, R_RBBM_SW_RESET_CMD, 0);
+-	delay(1000);
++	bool hard = false;
++again: __attribute__((unused));        /* 0372: the GX power cycle comes back here (taimen) */
++	if (!hard) {
++		gw(gpu, R_RBBM_SW_RESET_CMD, 1);
++		(void)gr(gpu, R_RBBM_SW_RESET_CMD);
++		delay(100);
++		gw(gpu, R_RBBM_SW_RESET_CMD, 0);
++		delay(1000);
++	}
+ 	uint32_t rptr = gr(gpu, R_CP_RB_RPTR), st = gr(gpu, R_RBBM_STATUS);
+ 	hw_init_regs(gpu, g_pm4, g_pfp, false);
+ 	rb_n = 0;
+@@ -1849,9 +1899,16 @@ gpu_recover(const char *why)
+ 	}
+ 	if (!(cp && landed && secure_left)) {
+ 		cp_state(gpu, "recovery failed:");
+-		printf("SWEET GPU: recovery %u FAILED (%s): RPTR after reset %u, RBBM_STATUS %08x; ring %s, marker %08x, "
+-		    "zap resume %lld/%llx, secure mode %s\n", g_recoveries, why, rptr, st, cp ? "read" : "NOT read",
+-		    mark[0], r, r1, secure_left ? "left" : "NOT left");
++		printf("SWEET GPU: recovery %u%s FAILED (%s): RPTR after reset %u, RBBM_STATUS %08x; ring %s, marker %08x, "
++		    "zap resume %lld/%llx, secure mode %s\n", g_recoveries, hard ? " (GX power cycle)" : "", why, rptr, st,
++		    cp ? "read" : "NOT read", mark[0], r, r1, secure_left ? "left" : "NOT left");
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++		/* 0372: what the soft reset left running, a power cycle stops */
++		if (!hard && taimen_gx_cycle()) {
++			hard = true;
++			goto again;
++		}
++#endif
+ 		return false;
+ 	}
+ 	/* the hung submits' fences and the kernel quads' as done, by the CPU and then by the CP */
+@@ -1869,9 +1926,9 @@ gpu_recover(const char *why)
+ 	g_fence_when = 0;
+ 	smmu_report();
+ 	g_ready = true;
+-	printf("SWEET GPU: recovered (%s) in %llu ms: soft reset (RPTR %u, RBBM_STATUS %08x), CP restarted, zap resumed, "
++	printf("SWEET GPU: recovered (%s) in %llu ms: %s (RPTR %u, RBBM_STATUS %08x), CP restarted, zap resumed, "
+ 	    "secure mode left, fences done up to %u (recovery %u of %d)\n", why, usecs(mach_absolute_time() - t0) / 1000,
+-	    rptr, st, g_submit_seq, g_recoveries, max);
++	    hard ? "GX power cycle" : "soft reset", rptr, st, g_submit_seq, g_recoveries, max);
+ 	return true;
+ }
+ 
+@@ -2295,8 +2352,6 @@ compute_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t
+  */
+ extern bool sweet_rpm_rail_level(uint32_t type, uint32_t level);
+ 
+-static vm_offset_t g_gpucc;
+-
+ static uint32_t
+ taimen_gfx_measure(vm_offset_t gpu)
+ {
