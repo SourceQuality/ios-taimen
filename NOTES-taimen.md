@@ -1643,3 +1643,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   queries)", not yet. d34f2b6 implements them (Gallium occlusion counters, the words written when the fence
   signals; softpipe counts 144 samples for mtlabitest's 12x12 quad, 0 when culled). The expand button at (112,244)
   toggles back to the half-screen preview.
+- 2026-10-31 boot 241 (r182; SweetMetal of d34f2b6, occlusion queries): nothing refused any more (no
+  setVisibilityResultMode refusal, no other), no GPU hang. Full-screen Look Around now draws the 3D place label
+  ("Ghirardelli Square" with its shopping-bag pin on the arch), which boot 240 lacked: the label pass is what used the
+  queries. The round overview map is still black. MapKit's SnapshotService ran in boots 170-172 only during boot-up
+  (widgets), not for Look Around; boot 242 traces the passes while the overview shows.
