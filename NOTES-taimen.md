@@ -1671,3 +1671,7 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   Ruled out for the gallery so far: CPU cache over GPU writes (0358, 0371), Metal refusals, the poster's own render
   (the clock is black too). Left: the snapshot render itself (backboardd's CA render of the card into the surface,
   through sweetgl) and what PosterBoard does with it (encode/decode, .atx). Parked.
+- 2026-10-31 boot 247 (r183): **the App Switcher works.** A double home press (two `key home`) opens it: Clock's card
+  in front with its live content, Maps's snapshot behind, the home screen blurred underneath; a slow swipe up to the
+  middle (1.5 s) opens it too. CA snapshots in general are fine, so the poster gallery's black card is PosterBoard's
+  own. trustd's 37-68% CPU is boot-time only (~80 s); idle afterwards is 6-10% (kernel_task and backboardd).
