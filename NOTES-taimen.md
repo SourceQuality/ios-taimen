@@ -1610,3 +1610,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   as 45 256x256 '420f' IOSurfaces (Y 256x256 at 0, CbCr 128x128 at 0x10000), probably composited by CA in
   backboardd (sweetgl binds each plane as a texture; freedreno honours the plane offset; SweetMetal refuses planar
   surfaces and was never asked). Boot 236 checks whether the bad tiles heal (coherency) or stay (layout).
+- 2026-10-31 boot 236 (r179; the trace env file removed): Ghirardelli Square's place card again, the same two photos
+  with the same magenta and green blocks along their tops at 12 s, at 27 s and after a scroll (re-composited): the
+  damage is deterministic and stays. An imported surface buffer is cleaned only when its seed moved since its last
+  clean (CPU writers bump it at unlock): a writer that leaves it alone keeps its lines in the CPU cache, and the GPU
+  reads stale memory for good. 0368 adds taimensurfflush=1 (clean every surface buffer at every submit) to test it.
