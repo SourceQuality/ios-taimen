@@ -156,11 +156,22 @@ def launchd(plist, daemons=()):
     removed = [k for k, j in jobs.items() if j.get('Label') in gone]
     for k in removed:
         del jobs[k]
+    capture = []
     for j in jobs.values():
         if j.get('Label') == 'com.apple.backboardd':
             j.setdefault('EnvironmentVariables', {})['CA_BACKDROP_SCALE'] = '1'
+        # No cameras: mediaserverd never serves its capture services here, but launchd holds their ports, so a
+        # client's synchronous call waits forever. Boots 219-220: after a Voice Memos recording SpringBoard's main
+        # thread hung in CMCapture's FigCaptureSourceRemoteCopyCaptureSources and ignored the home button. Without
+        # the ports the connection fails at once and capture clients see no cameras.
+        if j.get('Label') == 'com.apple.mediaserverd':
+            services = j.get('MachServices', {})
+            capture = [s for s in services if 'capture' in s]
+            for s in capture:
+                del services[s]
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed: '
           + ', '.join(sorted(jobs_label for jobs_label in gone)))
+    print(f'launchd.plist: mediaserverd without {len(capture)} capture services: ' + ', '.join(sorted(capture)))
     return plist
 
 
