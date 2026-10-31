@@ -1740,3 +1740,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   the picker shows; only PosterBoard's widget images (174x174, 981x108, 429x174). The previews are stored snapshot
   images made earlier while an extension ran, so catching a black one in the act needs the moment it is taken.
   Parked again (third time) with that.
+- 2026-10-31 boot 259 (r187; SweetMetal 1a97e8f; clients-m4d): the boot 233 soak, four rounds (Settings, Weather,
+  Safari's video, Voice Memos, Compass, Maps with Look Around). Recordings 2-4: ~520,000 frames each, 0 skipped,
+  0 overflows; playback sessions 0 DSP underflows; no lock waited over 1 ms for the GPU (0371); crashes only
+  CacheDeleteExtension and driverkitd; hottest 57.6 C. One GPU hang, in backboardd's submit right after the
+  binoculars tap opened Look Around (the stall of boots 226 and 233): no SMMU fault behind it (FSR 0x400, the
+  format bit only), RPTR 144 of WPTR 306, RBBM_STATUS d30123c3; **recovered in 3 ms** (VBIF halted, soft reset), no
+  app touched. So HUPCF was not that stall's cause; what backboardd's composite does as Look Around opens is still
+  open (an IB dump at hang time would show it).
