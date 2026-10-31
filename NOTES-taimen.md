@@ -1598,3 +1598,8 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   (boot 232's "hang" at the launch was likely such a submit, cut short at 2 s). Boot 226's Look Around stall came
   right after the 168x168 overview-map surface was imported: that small map (black every time) is the suspect.
   0366's slow log also counted idle time between waits; 0367 times each wait instead. The default stays 2 s.
+- 2026-10-31 boot 234 (r179 = +0367; SweetMetal of bc94ebe, SWEETMTL_TRACE logs each render pass): four rounds of
+  Maps and Look Around, no stall this time, no slow wait. Maps's passes: the map at 1125x2436 x4, resolved; 294x216,
+  148x108 and 37x27 single-sample passes; 900x900 sRGB twice at the launch. None is Look Around's round overview map:
+  MapKit draws snapshots in com.apple.MapKit.SnapshotService (seen exec'd in boot 226), which is not a SweetMetal
+  client and gets no Metal device; boot 235 lists it (clients-m4f).
