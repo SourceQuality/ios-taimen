@@ -1615,3 +1615,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   damage is deterministic and stays. An imported surface buffer is cleaned only when its seed moved since its last
   clean (CPU writers bump it at unlock): a writer that leaves it alone keeps its lines in the CPU cache, and the GPU
   reads stale memory for good. 0368 adds taimensurfflush=1 (clean every surface buffer at every submit) to test it.
+- 2026-10-31 boot 237 (r180 = +0368, taimensurfflush=1): the same photos, the same magenta and green blocks: CPU
+  caches are not the cause. Measured on the screenshot, the damage is the same in both photos: the first ~124 of
+  732 rows (chroma rows 0-62 of the 576x732 '420f' surface Maps made for each photo), and in those rows everything
+  but luma columns 84-161, where the colour is right (sky stays blue). The 45 256x256 tiles of boot 235 were map
+  tiles; each photo is one 576x732 surface (Y bpr 576 at 0, CbCr bpr 576 at 0x67800), paired with a 576x736
+  surface mediaserverd makes (bpr 768, Y at 0xd5c0, CbCr at 0xaba00, plane sizes that count padding rows above
+  and below): the HEIC decoder's padded output, which Maps then copies into its own. 0369 lets the PC list live
+  surfaces and fetch one's bytes over the control port, to see whether the bad chroma is in memory.
