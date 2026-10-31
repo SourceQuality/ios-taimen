@@ -71,7 +71,7 @@ if [ "${ROOT:-0}" = 1 ] && [ "${GPU:-1}" = 1 ] && [ -f "$sweetgl_env" ]; then
 		export TAIMEN_ADT_ARGS="${TAIMEN_ADT_ARGS:-} $senv${bb:+,$bb}${rest:+;$rest}"
 		senv=
 	fi
-	args="sweetgpu=8 sweetgpuclk=710 taimengpucopy=1 taimengpuheap=${TAIMEN_GPUHEAP:-384} $senv sweetnull=backboardd ${args}"
+	args="sweetgpu=8 sweetgpuclk=${TAIMEN_GPUCLK:-710} taimengpucopy=1 taimengpuheap=${TAIMEN_GPUHEAP:-384} $senv sweetnull=backboardd ${args}"
 	echo "GPU boot: sweetgl ${SWEETGL_SHA:0:7} ($SWEETGL_LIB), RAM ${TAIMEN_BASE:-0x100000000} + $TAIMEN_MEM"
 fi
 # SHIM_WATCH=1: CPU 7 stays in the shim as a watcher (shim/taimen.c WATCH): XNU gets 7 cores, and
