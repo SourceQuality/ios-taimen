@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
-index 0e8d457..89a077c 100644
+index 0e8d457..72ca03d 100644
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -672,10 +672,24 @@ submitStats(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t ring_wait, uint64_t
+@@ -672,10 +672,26 @@ submitStats(uint64_t t0, uint64_t t1, uint64_t t2, uint64_t ring_wait, uint64_t
  	start = n = cache = ring = wait = pages = dirty = 0;
  }
  
@@ -17,6 +17,7 @@ index 0e8d457..89a077c 100644
  IOReturn
  SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
  {
++#if defined(ARM64_BOARD_CONFIG_TAIMEN)
 +	if (gSurfFlushAll < 0) {
 +		int on = 0;
 +		gSurfFlushAll = PE_parse_boot_argn("taimensurfflush", &on, sizeof(on)) && on != 0;
@@ -24,15 +25,16 @@ index 0e8d457..89a077c 100644
 +			printf("SWEET GPU: every surface buffer cleaned at every submit (taimensurfflush)\n");
 +		}
 +	}
++#endif
  	struct sweet_gpu_submit h;
  	if (len < sizeof(h)) {
  		return kIOReturnBadArgument;
-@@ -711,7 +725,7 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+@@ -711,7 +727,7 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
  			 * CPU writers lock them; the seed moves at each write unlock.
  			 */
  			uint32_t seed = sweet_surface_seed_value(b->surface);
 -			if (seed != b->seed) {
-+			if (seed != b->seed || gSurfFlushAll) {
++			if (seed != b->seed || gSurfFlushAll > 0) {
  				for (uint32_t p = 0; p < b->npages; p++) {
  					flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
  				}
