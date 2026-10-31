@@ -1691,3 +1691,11 @@ port (NWylynko/ios-flame) as the ABL / SM8150-era reference.
   command buffer conformsToProtocol: MTLCommandBuffer (and MPSDevice::GetMPSDevice knows the device). Only the device
   and textures adopted protocols. e86dfce: every frontend class adopts its public Metal protocol. The gallery itself
   has two pages, Collections (drawn in 249, black in 250) and Add New; the Pride poster lives in the picker behind +.
+- 2026-10-31 boot 251 (r183; SweetMetal e86dfce, Metal protocols adopted; clients-m4e): MPS gets past MPSAutoCache, then
+  calls -makeAliasable on its heap texture (unrecognized: uncaught exception; 38 relaunches in the boot), and one MPS
+  kernel's dispatch is refused for a storage_images variant (a formatless half-float write, class HalfTowardZero).
+  1a97e8f: makeAliasable answered (nothing to give back), and code-only storage image choices (no alias view, no RGBX
+  twin; Identity, HalfTowardZero, HalfQuietNan) compile. The gallery's Add New "+" opens the "Add New Wallpaper"
+  picker (Featured, Weather & Astronomy, Unity, Pride, Emoji, Collections, Color): every preview black but for their
+  text (date, weather complications) and one grey Pride card, like the gallery's black card: the poster previews are
+  the same broken snapshot path.
